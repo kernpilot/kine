@@ -559,12 +559,31 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 	}()
 
 	logrus.Tracef("POLL START interval=%s", s.pollInterval)
+
+	// A driver may offer cross-instance revision wake-ups (PostgreSQL
+	// LISTEN/NOTIFY). s.notify below is in-process only, so on a multi-replica
+	// deployment a watcher on the instance that did not receive the write waits
+	// for the ticker above — up to a full second.
+	//
+	// The ticker is NOT replaced by this. Notifications fire on COMMIT and are
+	// not durable, so a listener that reconnects has no way to replay what it
+	// missed. This channel only makes a poll happen sooner; the ticker is what
+	// guarantees it happens at all.
+	var external <-chan int64
+	if n, ok := s.d.(interface{ RevisionNotify() <-chan int64 }); ok {
+		external = n.RevisionNotify()
+	}
+
 	for {
 		if waitForMore {
 			select {
 			case <-s.ctx.Done():
 				return
 			case check := <-s.notify:
+				if check <= pollRevision {
+					continue
+				}
+			case check := <-external:
 				if check <= pollRevision {
 					continue
 				}
