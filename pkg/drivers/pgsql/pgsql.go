@@ -131,8 +131,42 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	}
 
 	dialect.Migrate(context.Background())
-	return true, logstructured.New(sqllog.New(dialect, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+
+	// Wrap the dialect so the poll loop can be woken by another kine instance's
+	// writes. Only PostgreSQL offers this; every other driver keeps the plain
+	// dialect and its ticker, which is why this is an optional interface rather
+	// than a method on server.Dialect.
+	backend := &notifyingDialect{
+		Generic: dialect,
+		revs:    startRevisionListener(ctx, wg, config),
+	}
+	backend.notifier.run(ctx, wg, config)
+	return true, logstructured.New(sqllog.New(backend, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
 }
+
+// notifyingDialect adds cross-instance revision wake-ups to the generic
+// dialect. It changes nothing about how data is read or written — the channel
+// is a hint that a poll is worth doing now rather than at the next tick.
+type notifyingDialect struct {
+	*generic.Generic
+	revs     <-chan int64
+	notifier revisionNotifier
+}
+
+// Insert records the new revision for the coalescing notifier, then returns
+// unchanged. The recording is a single atomic compare-and-swap; the NOTIFY
+// itself happens on another goroutine and another connection, so the write
+// path never pays for it.
+func (n *notifyingDialect) Insert(ctx context.Context, key string, create, delete bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
+	rev, err := n.Generic.Insert(ctx, key, create, delete, createRevision, previousRevision, ttl, value)
+	if err == nil && rev > 0 {
+		n.notifier.record(rev)
+	}
+	return rev, err
+}
+
+// RevisionNotify satisfies the optional interface the poll loop looks for.
+func (n *notifyingDialect) RevisionNotify() <-chan int64 { return n.revs }
 
 func setup(db *sql.DB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")
