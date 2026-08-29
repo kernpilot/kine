@@ -86,6 +86,20 @@ lose and expensive to rediscover.
 3. **`synchronous_commit = off` is then unnecessary.** Worth +124 % on a slow
    WAL and **+3.5 %** on a fast one — it attacks the same bottleneck. Prefer the
    WAL device and keep full commit durability.
+4. **Budget for replication before anything else.** Measured against a real
+   streaming standby (`state = streaming` and `sync_state = sync` both verified
+   before the runs):
+
+   | arm | writes/s | p99 | vs standalone |
+   |---|---|---|---|
+   | standalone | 5 341 | 34.6 ms | — |
+   | async replica | 3 686 | 57.2 ms | −31.0 % |
+   | **synchronous replica** | **1 517** | **128.1 ms** | **−71.6 %** |
+
+   An async replica alone costs 31 % of write throughput; synchronous costs
+   72 %. Every other number in this suite was measured standalone, so a
+   replicated deployment should be planned from these figures rather than from
+   the headline ones — they differ by up to 7x.
 
 ## Open hazards in upstream kine, not yet patched
 
