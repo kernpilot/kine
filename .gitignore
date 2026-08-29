@@ -68,3 +68,10 @@ dist/
 
 # dapper binaries
 .dapper
+
+# built by benchmarks/build.sh
+kine-patched
+kine-upstream
+kine-bench
+kine-e1
+benchmarks/dropprobe/dropprobe
