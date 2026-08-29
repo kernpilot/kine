@@ -25,14 +25,24 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 KINE_BIN="${KINE_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/kine-patched}"
+# Parameterised so the same sweep can run against a primary whose WAL is on
+# fast storage. Synchronous replication and a slow WAL are both commit-path
+# costs, and such costs have SUBSTITUTED rather than added throughout this
+# suite — a fast WAL made synchronous_commit=off worth +3.5% instead of +124%.
+# If that pattern holds, a fast WAL should buy little once synchronous
+# replication is on, and provisioning one for a replicated deployment would be
+# wasted. That is a prediction; this measures it.
 PRIMARY="${PG_CONTAINER:-kine-bench-pg}"
+PRIMARY_PORT="${PRIMARY_PORT:-55432}"      # host-side port kine dials
+PRIMARY_EXEC_PORT="${PRIMARY_EXEC_PORT:-5432}"  # port inside the container
+LABEL_PREFIX="${LABEL_PREFIX:-repl}"
 REPLICA="kine-bench-pg-replica"
 DUR="${DUR:-60s}"; W="${W:-100}"; WATCH="${WATCH:-256}"; REPS="${REPS:-2}"
 RESULTS="results"; LOG="$RESULTS/replication.log"; mkdir -p "$RESULTS"
 export KINE_MAX_OPEN="${KINE_MAX_OPEN:-80}" KINE_MAX_IDLE="${KINE_MAX_IDLE:-80}"
 
 say() { printf '%s | %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
-pexec() { docker exec "$PRIMARY" psql -U kine -d kine -tAqc "$1" 2>/dev/null; }
+pexec() { docker exec "$PRIMARY" psql -U kine -d kine -p "$PRIMARY_EXEC_PORT" -tAqc "$1" 2>/dev/null; }
 
 wait_pg() { for _ in $(seq 1 90); do
     docker exec "$1" pg_isready -U kine -d kine -p "${2:-5432}" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
@@ -41,7 +51,7 @@ die_repl() { say "!! $*"; exit 1; }
 run_arm() { # label reps
   for r in $(seq 1 "$2"); do
     say "  run $1-r${r}"
-    env PG_CONTAINER="$PRIMARY" PG_PORT=55432 PG_EXEC_PORT=5432 \
+    env PG_CONTAINER="$PRIMARY" PG_PORT="$PRIMARY_PORT" PG_EXEC_PORT="$PRIMARY_EXEC_PORT" \
         KINE_BIN="$KINE_BIN" timeout 300 ./run.sh "$1-r${r}" "$DUR" "$W" "$WATCH" \
       >>"$LOG" 2>&1 || say "    !! $1-r${r} FAILED"
   done
@@ -59,7 +69,7 @@ say "=== replication sweep ==="
 # ---- Arm 1: standalone -------------------------------------------------------
 teardown_replica
 say "--- arm: none (standalone) ---"
-run_arm repl-none "$REPS"
+run_arm "${LABEL_PREFIX}-none" "$REPS"
 
 # ---- Build a real streaming standby ------------------------------------------
 say "preparing replication on the primary"
@@ -89,7 +99,7 @@ docker run --rm --network host -e PGPASSWORD=repl \
   -v kine-bench-replica-data:/var/lib/postgresql/data \
   postgres:18.3 bash -c \
   "rm -rf /var/lib/postgresql/data/* && \
-   pg_basebackup -h 127.0.0.1 -p 55432 -U repl -D /var/lib/postgresql/data -Fp -Xs -R -c fast && \
+   pg_basebackup -h 127.0.0.1 -p '"$PRIMARY_PORT"' -U repl -D /var/lib/postgresql/data -Fp -Xs -R -c fast && \
    chown -R postgres:postgres /var/lib/postgresql/data && \
    chmod 0700 /var/lib/postgresql/data" >>"$LOG" 2>&1 \
   || { say "!! base backup failed — see $LOG"; exit 1; }
@@ -113,8 +123,8 @@ say "replica confirmed streaming"
 
 # ---- Arm 2: asynchronous replication ----------------------------------------
 say "--- arm: async replication ---"
-pexec "SHOW synchronous_standby_names" > "$RESULTS/repl-async.replconf.txt"
-run_arm repl-async "$REPS"
+pexec "SHOW synchronous_standby_names" > "$RESULTS/${LABEL_PREFIX}-async.replconf.txt"
+run_arm "${LABEL_PREFIX}-async" "$REPS"
 
 # ---- Arm 3: synchronous replication -----------------------------------------
 say "--- arm: SYNCHRONOUS replication ---"
@@ -126,9 +136,9 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 say "sync_state = ${SYNCSTATE:-unknown}"
-printf 'sync_state=%s\n' "${SYNCSTATE:-unknown}" > "$RESULTS/repl-sync.replconf.txt"
+printf 'sync_state=%s\n' "${SYNCSTATE:-unknown}" > "$RESULTS/${LABEL_PREFIX}-sync.replconf.txt"
 [[ "$SYNCSTATE" == "sync" ]] || say "!! standby did not reach sync — the arm below is NOT synchronous"
-run_arm repl-sync "$REPS"
+run_arm "${LABEL_PREFIX}-sync" "$REPS"
 
 say "tearing the replica down and restoring the primary"
 teardown_replica
