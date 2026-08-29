@@ -101,6 +101,26 @@ lose and expensive to rediscover.
    replicated deployment should be planned from these figures rather than from
    the headline ones — they differ by up to 7x.
 
+   **The WAL device still pays under replication.** Full matrix:
+
+   | WAL | replication | writes/s | tax |
+   |---|---|---|---|
+   | slow | none | 5 341 | — |
+   | slow | async | 3 686 | −31 % |
+   | slow | synchronous | 1 517 | −72 % |
+   | fast | none | 10 946 | — |
+   | fast | async | 9 952 | **−9 %** |
+   | fast | synchronous | **3 020** | −72 % |
+
+   A fast WAL is worth **+99 % under synchronous replication** (+105 %
+   standalone), so the two costs **compose multiplicatively** — synchronous
+   replication is a constant ~72 % tax at either WAL speed, because the standby
+   round trip is a different wait from the local flush. A prediction that they
+   would substitute, by analogy with `synchronous_commit = off`, was measured
+   and refuted: that setting substitutes because it removes *the same* local
+   flush wait. **Provision the fast WAL volume even with replication**, and note
+   it also cuts the asynchronous-replication penalty from −31 % to −9 %.
+
 ## Open hazards in upstream kine, not yet patched
 
 Carried here because they bound how kine can be deployed, not because they are
