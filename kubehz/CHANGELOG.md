@@ -117,6 +117,19 @@ fixed.
   written yet, because the first question is whether kubehz will ever have a
   client that watches from 0, and the client-side discipline is free.
 
+  **This is the only unbounded watch cost.** Two others exist and both are
+  bounded, measured separately at 50 writers on a fresh table:
+
+  | cost | driven by | magnitude | bounded? |
+  |---|---|---|---|
+  | fan-out | watcher count | 8.8x throughput, 52x p99 across 64 → 2048 watchers | yes, degrades smoothly |
+  | steady-state memory | watcher count | ~1.8 MB per watcher (0.16 GB at 64, 3.70 GB at 2048) | yes, roughly linear |
+  | catch-up read | revision-0 watch **on an aged table** | 1.22 → 12.89 GB on 657 k rows | **no** |
+
+  The fan-out figures were re-measured with reflector-like watches to rule out
+  catch-up contamination; every point moved less than the 5-6.5 % noise floor,
+  so fan-out cost is genuine and separable.
+
 - **A dropped watcher would not be told it lost its place — but the drop path
   could not be reached.** `broadcaster.go` unsubscribes a subscriber whose
   buffer is full, and `server/watch.go:243-247` then sends `Canceled: true` with
