@@ -87,15 +87,33 @@ lose and expensive to rediscover.
 Carried here because they bound how kine can be deployed, not because they are
 fixed.
 
-- **Watch buffering is unbounded in bytes.** `broadcaster.go` gives each
-  subscriber 100 batches and `sqllog/sql.go` gives each watcher another 100;
-  each batch holds up to `--poll-batch-size` events, each carrying the full
-  object value. Nothing bounds that in bytes. Measured: kine at **1.02 GB** on a
-  fresh table and **>12 GB within 60 s** once the table held prior data, at 100
-  writers and 256 watchers — reproducible in two arms, and `--compact-interval
-  30s` did not prevent it. An unguarded run took a 124 GB host to 120 GB used
-  with all swap consumed. The failure mode is the host OOM killer rather than
-  kine shedding load.
+- **Memory grows without bound once the table holds history — mechanism
+  UNKNOWN.** Reproducible and serious: kine peaks at **0.86 GB** on a fresh
+  table and **>12 GB within 60 s** once the table holds prior data, at 100
+  writers and 256 watchers, in both compaction arms. An unguarded run took a
+  124 GB host to 120 GB used with all swap consumed; the failure mode is the
+  host OOM killer rather than kine shedding load.
+
+  **An earlier explanation given here was wrong and is withdrawn.** It said the
+  cause was unbounded batch buffering — 100 slots in `broadcaster.go` plus 100
+  in `sqllog/sql.go`, each holding up to `--poll-batch-size` events with full
+  values, so 200 x 500 x value-size per watcher. A patch (`P2`) was written to
+  bound batches by bytes, and **it did nothing**, which is what exposed the
+  error. What the attempt established:
+
+  | test | result | rules out |
+  |---|---|---|
+  | split batches at 1 MiB, then at 64 KiB, with `--debug` | the split **never engaged once** | batches reaching the broadcaster are small, so the 200x500xvalue arithmetic does not describe this |
+  | `GOMEMLIMIT=4GiB` | still peaked at 12.59 GB | not GC headroom or allocator slack — the memory is **live and reachable** |
+  | fresh table vs aged table, everything else identical | 0.86 GB vs 12.30 GB | the trigger is table age, which no proposed mechanism explains |
+
+  So the hazard is real, reproducible and measured, and its cause is not yet
+  known. Remaining suspects, untested: gRPC server-side send buffering across
+  256 concurrent watch streams (~700 MB/s of marshalled responses at this
+  fan-out), and something about a large table changing the poll loop's
+  behaviour. **No patch is carried**, because a patch that does not move the
+  number is worse than none — it adds merge cost and implies a fix that does not
+  exist.
 - **A dropped watcher would not be told it lost its place — but the drop path
   could not be reached.** `broadcaster.go` unsubscribes a subscriber whose
   buffer is full, and `server/watch.go:243-247` then sends `Canceled: true` with
@@ -124,6 +142,11 @@ fixed.
   `wr.CompactRevision` and a reason into the `Cancel` at `watch.go:245` instead
   of the literal zeros.
 
-`P2` (bound the watch buffers) is justified and outstanding — it reproduces at
-1.02 GB on a fresh table and >12 GB once the table holds history. `P3` is not
-justified until the drop path can be demonstrated. Neither has an upstream issue.
+Neither `P2` nor `P3` is being carried. P2 was written, measured, found to
+change nothing, and reverted; P3's trigger could not be demonstrated. Both
+hazards are real and both remain unexplained at the mechanism level. Neither has
+an upstream issue.
+
+**The fork currently carries exactly one patch, P1.** That is the honest state:
+the watch-path hazards that motivated forking turned out to need diagnosis
+before they need code.
