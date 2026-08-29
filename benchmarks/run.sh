@@ -88,6 +88,21 @@ else
   pg -qc 'DROP TABLE IF EXISTS kine CASCADE' >/dev/null
 fi
 
+# WAIT FOR THE PORT TO BE FREE. The RSS watchdog kill -9s kine, and a killed
+# process does not release its listener instantly. Starting the next run too
+# soon produced "bind: address already in use", kine exited, and the run
+# silently produced no result at all — which reads as a low number rather than a
+# failed run. Any run following a cap-abort was exposed to this.
+for _ in $(seq 1 60); do
+  (exec 3<>/dev/tcp/127.0.0.1/2379) 2>/dev/null || break
+  exec 3<&- 3>&-
+  sleep 0.5
+done
+if (exec 3<>/dev/tcp/127.0.0.1/2379) 2>/dev/null; then
+  exec 3<&- 3>&-
+  die "port 2379 is still held by another process — refusing to start"
+fi
+
 log "starting kine (label=$LABEL)"
 # --metrics-bind-address 0 disables the metrics listener: it defaults to
 # :8080, which collides with anything else on the box. kine creates its
@@ -198,6 +213,7 @@ log "running load: $DURATION, $WRITERS writers, $WATCHERS watchers"
   ${KEYSPACE:+-keyspace "$KEYSPACE"} \
   ${VALUE_BYTES:+-value-bytes "$VALUE_BYTES"} \
   ${ZIPF:+-zipf "$ZIPF"} \
+  ${WATCH_FROM_CURRENT:+-watch-from-current} \
   ${WARMUP:+-warmup "$WARMUP"} \
   -out "$RESULTS/$LABEL.json"
 
