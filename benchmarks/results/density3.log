@@ -1,0 +1,8 @@
+13:41:54 | === D4: resource cost per tenant control plane (via PgBouncer) ===
+13:41:54 | --- N=4 ---
+13:43:27 |   up=4/4 kine_rss=0MB kine_cpu=0% pg=546.8MiB per_tenant=0.0MB
+13:43:47 | --- N=16 ---
+13:53:26 |   up=16/16 kine_rss=540MB kine_cpu=12.6% pg=695.8MiB per_tenant=33.8MB
+13:54:47 | --- N=32 ---
+13:57:00 |   up=0/32 kine_rss=0MB kine_cpu=0% pg=821.9MiB per_tenant=0.0MB
+13:59:42 | === D4 complete ===
