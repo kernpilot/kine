@@ -1,0 +1,17 @@
+-- E4 — UNLOGGED table. MEASURED FOR THE NUMBER, DISQUALIFIED FOR OUR USE.
+--
+-- An UNLOGGED table skips the write-ahead log, which is why it is fast. The
+-- consequence is not "data is lost on a crash" — it is worse than that on a
+-- replicated cluster.
+--
+-- UNLOGGED TABLES ARE NOT REPLICATED. Streaming replication ships WAL, and an
+-- UNLOGGED table produces none, so the table exists on the primary only. On our
+-- CNPG cluster, which has replicas and automatic failover, promoting a replica
+-- yields a kine table that is EMPTY. A routine failover — a node drain, a minor
+-- version upgrade, a rolling restart — would therefore discard the tenant's
+-- entire cluster state, not just recent writes. That is a far larger hazard
+-- than the "unsafe after a crash" framing suggests.
+--
+-- Benchmark it to know the size of the prize, then do not ship it on anything
+-- CNPG-backed unless a tier explicitly accepts total loss on failover.
+ALTER TABLE kine SET UNLOGGED;

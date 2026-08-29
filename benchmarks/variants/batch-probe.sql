@@ -1,0 +1,3 @@
+-- Ceiling test for write batching against kine's real table shape.
+-- Compares the four write strategies at the SQL layer, so the answer does not
+-- depend on modifying kine first.

@@ -1,0 +1,22 @@
+{
+  "label": "t2-idle80",
+  "writers": 64,
+  "watchers": 8,
+  "duration_sec": 60.011878283,
+  "objects_per_writer": 25,
+  "value_bytes": 2048,
+  "writes_ok": 261114,
+  "writes_err": 0,
+  "writes_conflict": 0,
+  "write_error_rate_pct": 0,
+  "write_conflict_pct": 0,
+  "write_rate_per_sec": 4351.038618865687,
+  "write_p50_ms": 12.812,
+  "write_p95_ms": 20.907,
+  "write_p99_ms": 26.592,
+  "watch_events": 234723,
+  "watch_latency_samples": 234723,
+  "watch_delivery_p50_ms": 17.486773,
+  "watch_delivery_p95_ms": 25.914812,
+  "watch_delivery_p99_ms": 33.523557
+}

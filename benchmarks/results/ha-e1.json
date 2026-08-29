@@ -1,0 +1,22 @@
+{
+  "label": "ha-e1",
+  "writers": 4,
+  "watchers": 8,
+  "duration_sec": 60.017640478,
+  "objects_per_writer": 25,
+  "value_bytes": 2048,
+  "writes_ok": 480,
+  "writes_err": 0,
+  "writes_conflict": 0,
+  "write_error_rate_pct": 0,
+  "write_conflict_pct": 0,
+  "write_rate_per_sec": 7.997648627588888,
+  "write_p50_ms": 11.971,
+  "write_p95_ms": 17.458,
+  "write_p99_ms": 21.878,
+  "watch_events": 1696,
+  "watch_latency_samples": 1696,
+  "watch_delivery_p50_ms": 15.217901,
+  "watch_delivery_p95_ms": 24.934546,
+  "watch_delivery_p99_ms": 25.300628
+}

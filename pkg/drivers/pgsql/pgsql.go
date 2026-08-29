@@ -132,6 +132,12 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 
 	dialect.Migrate(context.Background())
 
+	// KUBEHZ-PATCH P1 BEGIN — wire the cross-instance notifier
+	//   see kubehz/MERGE-GUIDE.md#p1
+	// CONFLICT if upstream changes what New() returns, keep upstream's return
+	//          value and wrap it here; the only requirement is that the object
+	//          handed to sqllog.New() also satisfies RevisionNotify().
+	//
 	// Wrap the dialect so the poll loop can be woken by another kine instance's
 	// writes. Only PostgreSQL offers this; every other driver keeps the plain
 	// dialect and its ticker, which is why this is an optional interface rather
@@ -144,6 +150,7 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	return true, logstructured.New(sqllog.New(backend, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
 }
 
+// KUBEHZ-PATCH P1 (types) — everything below to the end of the file is ours.
 // notifyingDialect adds cross-instance revision wake-ups to the generic
 // dialect. It changes nothing about how data is read or written — the channel
 // is a hint that a poll is worth doing now rather than at the next tick.
@@ -301,3 +308,5 @@ func init() {
 	drivers.Register("postgres", New)
 	drivers.Register("postgresql", New)
 }
+
+// KUBEHZ-PATCH P1 END

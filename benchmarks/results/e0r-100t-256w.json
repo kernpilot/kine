@@ -1,0 +1,30 @@
+{
+  "label": "e0r-100t-256w",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.17045331,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "puts_ok": 463889,
+  "puts_err": 9856,
+  "put_error_rate_pct": 2.0804441207822775,
+  "put_rate_per_sec": 7709.581272556313,
+  "put_p50_ms": 6.675,
+  "put_p95_ms": 28.615,
+  "put_p99_ms": 55.544,
+  "put_max_ms": 350.564,
+  "watch_events": 5248,
+  "watch_delivery_p50_ms": 0,
+  "watch_delivery_p95_ms": 0,
+  "watch_delivery_p99_ms": 0,
+  "first_errors": [
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)\n\t127.0.0.1:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)\n\t127.0.0.1:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)\n\t127.0.0.1:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)\n\t127.0.0.1:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)\n\t127.0.0.1:55432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)"
+  ],
+  "started_at": "2026-08-28T22:19:41Z"
+}

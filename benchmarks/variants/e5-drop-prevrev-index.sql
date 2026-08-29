@@ -1,0 +1,14 @@
+-- E5 — drop kine_prev_revision_index.
+--
+-- E2 dropped the two indexes that are provably redundant. This one is not
+-- provably redundant and is therefore a genuine question rather than a
+-- cleanup: kine_name_prev_revision_uindex covers (name, prev_revision), so a
+-- lookup that supplies BOTH is already served, but a lookup by prev_revision
+-- ALONE cannot use it — a composite index cannot be searched on its second
+-- column. If nothing queries prev_revision without a name, this index is pure
+-- write amplification. If something does, dropping it turns that query into a
+-- sequential scan, which is why it is measured rather than assumed.
+--
+-- kine_name_prev_revision_uindex is NOT touched: it is UNIQUE and enforces
+-- correctness.
+DROP INDEX IF EXISTS kine_prev_revision_index;

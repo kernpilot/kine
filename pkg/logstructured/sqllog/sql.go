@@ -487,6 +487,18 @@ func (s *SQLLog) poll(result chan server.Events, pollStart int64) {
 	defer wait.Stop()
 	defer close(result)
 
+	// KUBEHZ-PATCH P1 BEGIN — cross-instance watch wake-up
+	//   see kubehz/MERGE-GUIDE.md#p1 · justified by benchmarks/README.md (E1)
+	// INTENT   the poll loop must also wake on a revision announced by ANOTHER
+	//          kine process, not only on its own in-process notify.
+	// INVARIANT the 1 s fallback ticker MUST remain. NOTIFY is not durable: a
+	//          reconnecting listener cannot replay what it missed, so the
+	//          channel may only make a poll happen sooner, never replace it.
+	// CONFLICT  keep upstream's select{} shape and re-add the `case <-external:`
+	//          arm. If a driver no longer exposes RevisionNotify, DROP this
+	//          patch — it is an optimisation, not a correctness fix — and note
+	//          the removal in kubehz/CHANGELOG.md.
+	//
 	// A driver may offer cross-instance revision wake-ups (PostgreSQL
 	// LISTEN/NOTIFY). s.notify below is in-process only, so on a multi-replica
 	// deployment a watcher on the instance that did not receive the write waits
@@ -500,6 +512,7 @@ func (s *SQLLog) poll(result chan server.Events, pollStart int64) {
 	if n, ok := s.d.(interface{ RevisionNotify() <-chan int64 }); ok {
 		external = n.RevisionNotify()
 	}
+	// KUBEHZ-PATCH P1 END (declaration; the select arm below is part of it)
 
 	for {
 		if waitForMore {
@@ -510,6 +523,7 @@ func (s *SQLLog) poll(result chan server.Events, pollStart int64) {
 				if check <= pollRevision {
 					continue
 				}
+			// KUBEHZ-PATCH P1 (select arm) — see the block above.
 			case check := <-external:
 				if check <= pollRevision {
 					continue
