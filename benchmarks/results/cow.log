@@ -1,0 +1,291 @@
+12:11:41 | machine idle; starting
+12:11:41 | === COW vs NOCOW ===
+12:11:41 |   [kine-bench-pg] cow-yes-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-yes-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-yes-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.021066991,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 208160,
+  "puts_ok": 325452,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 5422.296142266193,
+  "put_p50_ms": 17.771,
+  "put_p95_ms": 29.267,
+  "put_p99_ms": 33.819,
+  "put_max_ms": 155.873,
+  "watch_events": 10414464,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.161884796,
+  "watch_last_event_max_sec": 62.162475099,
+  "watch_delivery_p50_ms": 21.567807,
+  "watch_delivery_p95_ms": 33.555293,
+  "watch_delivery_p99_ms": 42.478314,
+  "started_at": "2026-08-29T12:11:43Z"
+}
+[36m»[0m sizes: 1633 MB table, 100 MB indexes
+[36m»[0m kine peak RSS: 0.3 GB
+[36m»[0m done -> results/cow-yes-r1.json
+12:12:47 |   [kine-bench-nocow] cow-no-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-no-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-no-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.01367504,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 207232,
+  "puts_ok": 323948,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 5397.903057662838,
+  "put_p50_ms": 17.664,
+  "put_p95_ms": 29.395,
+  "put_p99_ms": 33.856,
+  "put_max_ms": 108.695,
+  "watch_events": 10366336,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.150653019,
+  "watch_last_event_max_sec": 62.151225952,
+  "watch_delivery_p50_ms": 21.499889,
+  "watch_delivery_p95_ms": 33.105052,
+  "watch_delivery_p99_ms": 41.0882,
+  "started_at": "2026-08-29T12:12:49Z"
+}
+[36m»[0m sizes: 1625 MB table, 99 MB indexes
+[36m»[0m kine peak RSS: 0.2 GB
+[36m»[0m done -> results/cow-no-r1.json
+12:13:52 |   [kine-bench-pg] cow-yes-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-yes-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-yes-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.024915528,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 177856,
+  "puts_ok": 278083,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 4632.79285866353,
+  "put_p50_ms": 19.83,
+  "put_p95_ms": 35.657,
+  "put_p99_ms": 54.576,
+  "put_max_ms": 341.023,
+  "watch_events": 8898656,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.157613473,
+  "watch_last_event_max_sec": 62.158324627,
+  "watch_delivery_p50_ms": 23.546209,
+  "watch_delivery_p95_ms": 41.052612,
+  "watch_delivery_p99_ms": 59.583447,
+  "started_at": "2026-08-29T12:13:55Z"
+}
+[36m»[0m sizes: 1378 MB table, 92 MB indexes
+[36m»[0m kine peak RSS: 0.2 GB
+[36m»[0m done -> results/cow-yes-r2.json
+12:14:58 |   [kine-bench-nocow] cow-no-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-no-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-no-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.02481948,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 119808,
+  "puts_ok": 187399,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3122.025215959883,
+  "put_p50_ms": 28.682,
+  "put_p95_ms": 52.698,
+  "put_p99_ms": 72.25,
+  "put_max_ms": 296.094,
+  "watch_events": 5996768,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.161223144,
+  "watch_last_event_max_sec": 62.161942327,
+  "watch_delivery_p50_ms": 32.533623,
+  "watch_delivery_p95_ms": 56.677886,
+  "watch_delivery_p99_ms": 77.133173,
+  "started_at": "2026-08-29T12:15:01Z"
+}
+[36m»[0m sizes: 884 MB table, 69 MB indexes
+[36m»[0m kine peak RSS: 0.3 GB
+[36m»[0m done -> results/cow-no-r2.json
+12:16:04 |   [kine-bench-pg] cow-yes-r3
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-yes-r3)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-yes-r3",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.026441071,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 121440,
+  "puts_ok": 189902,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3163.6391665363203,
+  "put_p50_ms": 28.893,
+  "put_p95_ms": 52.579,
+  "put_p99_ms": 71.064,
+  "put_max_ms": 283.663,
+  "watch_events": 6076864,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.161374728,
+  "watch_last_event_max_sec": 62.162043911,
+  "watch_delivery_p50_ms": 32.246373,
+  "watch_delivery_p95_ms": 55.506454,
+  "watch_delivery_p99_ms": 77.633128,
+  "started_at": "2026-08-29T12:16:07Z"
+}
+[36m»[0m sizes: 898 MB table, 71 MB indexes
+[36m»[0m kine peak RSS: 0.2 GB
+[36m»[0m done -> results/cow-yes-r3.json
+12:17:11 |   [kine-bench-nocow] cow-no-r3
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-no-r3)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-no-r3",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.021057583,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 119520,
+  "puts_ok": 186934,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3114.473611890272,
+  "put_p50_ms": 28.862,
+  "put_p95_ms": 52.535,
+  "put_p99_ms": 71.752,
+  "put_max_ms": 329.733,
+  "watch_events": 5981888,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.152860572,
+  "watch_last_event_max_sec": 62.154066728,
+  "watch_delivery_p50_ms": 32.961498,
+  "watch_delivery_p95_ms": 56.199929,
+  "watch_delivery_p99_ms": 74.752728,
+  "started_at": "2026-08-29T12:17:13Z"
+}
+[36m»[0m sizes: 882 MB table, 69 MB indexes
+[36m»[0m kine peak RSS: 0.2 GB
+[36m»[0m done -> results/cow-no-r3.json
+12:18:17 |   [kine-bench-pg] cow-yes-r4
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-yes-r4)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-yes-r4",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.047092873,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 121184,
+  "puts_ok": 189553,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3156.739001518456,
+  "put_p50_ms": 28.874,
+  "put_p95_ms": 50.734,
+  "put_p99_ms": 63.098,
+  "put_max_ms": 468.37,
+  "watch_events": 6065696,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.185902954,
+  "watch_last_event_max_sec": 62.186465317,
+  "watch_delivery_p50_ms": 32.534917,
+  "watch_delivery_p95_ms": 54.07704,
+  "watch_delivery_p99_ms": 66.421011,
+  "started_at": "2026-08-29T12:18:19Z"
+}
+[36m»[0m sizes: 896 MB table, 71 MB indexes
+[36m»[0m kine peak RSS: 0.2 GB
+[36m»[0m done -> results/cow-yes-r4.json
+12:19:23 |   [kine-bench-nocow] cow-no-r4
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=cow-no-r4)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "cow-no-r4",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.023317375,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 119392,
+  "puts_ok": 186710,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3110.6244733778344,
+  "put_p50_ms": 28.567,
+  "put_p95_ms": 52,
+  "put_p99_ms": 66.403,
+  "put_max_ms": 467.646,
+  "watch_events": 5974720,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.158839401,
+  "watch_last_event_max_sec": 62.159466064,
+  "watch_delivery_p50_ms": 34.392786,
+  "watch_delivery_p95_ms": 57.627209,
+  "watch_delivery_p99_ms": 73.631556,
+  "started_at": "2026-08-29T12:19:26Z"
+}
+[36m»[0m sizes: 881 MB table, 68 MB indexes
+[36m»[0m kine peak RSS: 0.3 GB
+[36m»[0m done -> results/cow-no-r4.json
+12:20:29 | === COW sweep complete ===

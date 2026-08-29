@@ -1,0 +1,1 @@
+1633 MB table, 100 MB indexes

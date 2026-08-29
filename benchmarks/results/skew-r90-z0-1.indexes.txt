@@ -1,0 +1,7 @@
+kine_id_deleted_index
+kine_list_query_index
+kine_name_id_index
+kine_name_index
+kine_name_prev_revision_uindex
+kine_pkey
+kine_prev_revision_index
