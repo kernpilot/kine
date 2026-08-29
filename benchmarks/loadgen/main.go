@@ -97,6 +97,13 @@ func main() {
 		rateCap  = flag.Int("write-rate", 0, "per-writer puts/sec cap (0 = unthrottled)")
 		label    = flag.String("label", "baseline", "run label")
 		out      = flag.String("out", "", "write JSON result here")
+		// A clientv3 watch with no WithRev sends StartRevision 0. kine passes
+		// that straight to logstructured.Watch, which calls After(key, end, 0, 0)
+		// — an UNLIMITED read of the whole table before the watch streams. On an
+		// aged table that materialises every row through RowsToEvents/bytes.Clone.
+		// This flag starts watches at the CURRENT revision instead, which is what
+		// a Kubernetes reflector does after its initial LIST.
+		fromCurrent = flag.Bool("watch-from-current", false, "start watches at the current revision instead of 0")
 		// Watchers can be pointed at a SECOND kine instance sharing the same
 		// Postgres. kine signals its poll loop in-process on every insert
 		// (sql.go:660), so a single instance wakes its watchers in
@@ -129,6 +136,26 @@ func main() {
 	if *watchEndpoint != "" {
 		wEndpoint = *watchEndpoint
 	}
+	// ONE revision lookup shared by every watcher. Doing it per watcher issued
+	// 256 LIST queries against the aged table at startup, each logged by kine as
+	// Slow SQL, and the run never completed — which then read as a flatteringly
+	// low memory figure rather than as the failure it was.
+	var startRev int64
+	if *fromCurrent {
+		rc, rerr := clientv3.New(clientv3.Config{Endpoints: []string{wEndpoint}, DialTimeout: 10 * time.Second})
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "revision lookup dial: %v\n", rerr)
+			os.Exit(1)
+		}
+		gr, gerr := rc.Get(ctx, "/registry/bench/", clientv3.WithPrefix(), clientv3.WithLimit(1), clientv3.WithKeysOnly())
+		rc.Close()
+		if gerr != nil {
+			fmt.Fprintf(os.Stderr, "revision lookup: %v\n", gerr)
+			os.Exit(1)
+		}
+		startRev = gr.Header.Revision
+		fmt.Fprintf(os.Stderr, "watching from revision %d\n", startRev)
+	}
 	watchClients := make([]*clientv3.Client, 0, *watchers)
 	for i := 0; i < *watchers; i++ {
 		c, err := clientv3.New(clientv3.Config{Endpoints: []string{wEndpoint}, DialTimeout: 10 * time.Second})
@@ -141,7 +168,11 @@ func main() {
 		// watchers over the same resource space, which is what makes the
 		// poll loop expensive.
 		prefix := fmt.Sprintf("/registry/bench/w%d/", i%8)
-		wch := c.Watch(ctx, prefix, clientv3.WithPrefix())
+		wopts := []clientv3.OpOption{clientv3.WithPrefix()}
+		if *fromCurrent {
+			wopts = append(wopts, clientv3.WithRev(startRev))
+		}
+		wch := c.Watch(ctx, prefix, wopts...)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

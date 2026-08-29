@@ -87,33 +87,36 @@ lose and expensive to rediscover.
 Carried here because they bound how kine can be deployed, not because they are
 fixed.
 
-- **Memory grows without bound once the table holds history — mechanism
-  UNKNOWN.** Reproducible and serious: kine peaks at **0.86 GB** on a fresh
-  table and **>12 GB within 60 s** once the table holds prior data, at 100
-  writers and 256 watchers, in both compaction arms. An unguarded run took a
-  124 GB host to 120 GB used with all swap consumed; the failure mode is the
-  host OOM killer rather than kine shedding load.
+- **A watch starting at revision 0 reads the entire table into memory, per
+  watcher, unbounded.** `logstructured.go:239` calls
+  `l.log.After(ctx, key, end, revision, 0)` — **limit zero** — and
+  `watch.go:145` passes the client's `StartRevision` through unsubstituted, so a
+  `clientv3` watch with no `WithRev()` sends 0 and gets the whole history
+  materialised through `RowsToEvents`/`bytes.Clone`.
 
-  **An earlier explanation given here was wrong and is withdrawn.** It said the
-  cause was unbounded batch buffering — 100 slots in `broadcaster.go` plus 100
-  in `sqllog/sql.go`, each holding up to `--poll-batch-size` events with full
-  values, so 200 x 500 x value-size per watcher. A patch (`P2`) was written to
-  bound batches by bytes, and **it did nothing**, which is what exposed the
-  error. What the attempt established:
+  Diagnosed by heap profile (99.3 % of live heap in `RowsToEvents`, `-peek`
+  attributing **100 % to `SQLLog.After`**) and confirmed by changing one
+  variable. Same 657 043-row table, 100 writers, 256 watchers:
 
-  | test | result | rules out |
-  |---|---|---|
-  | split batches at 1 MiB, then at 64 KiB, with `--debug` | the split **never engaged once** | batches reaching the broadcaster are small, so the 200x500xvalue arithmetic does not describe this |
-  | `GOMEMLIMIT=4GiB` | still peaked at 12.59 GB | not GC headroom or allocator slack — the memory is **live and reachable** |
-  | fresh table vs aged table, everything else identical | 0.86 GB vs 12.30 GB | the trigger is table age, which no proposed mechanism explains |
+  | watch start revision | writes/s | peak RSS | |
+  |---|---|---|---|
+  | 0 (etcd default) | — | **12.89 GB** | aborted at the 12 GB cap |
+  | current revision | 10 082 | **1.22 GB** | completed |
 
-  So the hazard is real, reproducible and measured, and its cause is not yet
-  known. Remaining suspects, untested: gRPC server-side send buffering across
-  256 concurrent watch streams (~700 MB/s of marshalled responses at this
-  fan-out), and something about a large table changing the poll loop's
-  behaviour. **No patch is carried**, because a patch that does not move the
-  number is worse than none — it adds merge cost and implies a fix that does not
-  exist.
+  `--poll-batch-size` does not bound it (500/50/10 → 12.51/12.42/12.98 GB;
+  this call bypasses that limit) and `GOMEMLIMIT=4GiB` does not contain it
+  (12.59 GB; the memory is live).
+
+  **Relevance is narrower than the raw number suggests.** A Kubernetes reflector
+  does LIST-then-WATCH from a specific `resourceVersion`, so an apiserver in
+  steady state does not trigger this. Clients that do: anything watching without
+  a revision — `etcdctl watch`, monitoring agents, hand-written controllers —
+  and this suite's own load generator, which used the etcd default.
+
+  A server-side bound on the catch-up read would be a genuine patch. It is not
+  written yet, because the first question is whether kubehz will ever have a
+  client that watches from 0, and the client-side discipline is free.
+
 - **A dropped watcher would not be told it lost its place — but the drop path
   could not be reached.** `broadcaster.go` unsubscribes a subscriber whose
   buffer is full, and `server/watch.go:243-247` then sends `Canceled: true` with
