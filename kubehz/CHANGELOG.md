@@ -121,6 +121,35 @@ lose and expensive to rediscover.
    flush wait. **Provision the fast WAL volume even with replication**, and note
    it also cuts the asynchronous-replication penalty from −31 % to −9 %.
 
+## Density model — for anyone deploying kine per tenant
+
+Measured on this fork's binaries. **Connections are the only binding resource.**
+
+| resource | per tenant control plane | at 500 tenants |
+|---|---|---|
+| **connections** | **7.0 direct, 2.25 behind PgBouncer** | ~3 500 / ~1 125 |
+| kine memory | 56 MB | ~28 GB |
+| kine CPU | ~1 % of a core | ~5 cores |
+
+**Tenants per PostgreSQL ≈ `max_connections / 7`.** Measured dead linear to the
+wall: 4/8/16/24 tenants used 29/57/113/169 connections at 0.00 % errors; 32
+tenants exhausted `max_connections=200` and produced **15.65 % write errors**
+with `FATAL: sorry, too many clients already`.
+
+**P1 costs exactly 2 of those 7 connections** — its LISTEN and its notifier,
+both standing. Dropping P1 raises tenants-per-PostgreSQL by roughly 30 %.
+
+**PgBouncer roughly triples density and silently defeats P1.** kine works
+through transaction-mode pooling with 0.00 % errors, and per-tenant connections
+fall from 7.06 to 2.25 (pooling is per user+database, and each tenant has its
+own database, so `default_pool_size` becomes the per-tenant cost). But
+cross-instance watch p99 goes from 21 ms to **1001 ms** — the fallback ticker —
+because NOTIFY reaches a different backend than LISTEN. **kine logs no error.**
+This only matters where a tenant runs multiple kine replicas.
+
+Re-measure with `benchmarks/sweep-density.sh`, `sweep-density2.sh` and
+`sweep-density3.sh`.
+
 ## Open hazards in upstream kine, not yet patched
 
 Carried here because they bound how kine can be deployed, not because they are

@@ -1,0 +1,4 @@
+N kine_rss_mb kine_cpu_pct pg_rss_mb per_tenant_mb
+4 0 0 546.8MiB 0.0
+16 540 12.6 695.8MiB 33.8
+32 0 0 821.9MiB 0.0
