@@ -1,0 +1,29 @@
+{
+  "label": "t2-pool-default",
+  "writers": 64,
+  "watchers": 8,
+  "duration_sec": 60.10331836,
+  "objects_per_writer": 25,
+  "value_bytes": 2048,
+  "writes_ok": 136627,
+  "writes_err": 8718,
+  "writes_conflict": 0,
+  "write_error_rate_pct": 5.998142350958066,
+  "write_conflict_pct": 0,
+  "write_rate_per_sec": 2273.2022744842,
+  "write_p50_ms": 18.369,
+  "write_p95_ms": 36.083,
+  "write_p99_ms": 45.156,
+  "watch_events": 280071,
+  "watch_latency_samples": 280071,
+  "watch_delivery_p50_ms": 24.316584,
+  "watch_delivery_p95_ms": 42.013958,
+  "watch_delivery_p99_ms": 52.524347,
+  "first_errors": [
+    "HTTP 500: {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\\",
+    "HTTP 500: {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\\",
+    "HTTP 500: {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\\",
+    "HTTP 500: {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\\",
+    "HTTP 500: {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\\"
+  ]
+}

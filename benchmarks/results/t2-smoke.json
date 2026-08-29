@@ -1,0 +1,22 @@
+{
+  "label": "t2-smoke",
+  "writers": 8,
+  "watchers": 4,
+  "duration_sec": 20.005885292,
+  "objects_per_writer": 10,
+  "value_bytes": 2048,
+  "writes_ok": 12724,
+  "writes_err": 0,
+  "writes_conflict": 0,
+  "write_error_rate_pct": 0,
+  "write_conflict_pct": 0,
+  "write_rate_per_sec": 636.0128439348847,
+  "write_p50_ms": 10.459,
+  "write_p95_ms": 19.984,
+  "write_p99_ms": 22.501,
+  "watch_events": 50896,
+  "watch_latency_samples": 50896,
+  "watch_delivery_p50_ms": 11.107112,
+  "watch_delivery_p95_ms": 20.533956,
+  "watch_delivery_p99_ms": 22.822178
+}

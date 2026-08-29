@@ -1,0 +1,22 @@
+{
+  "label": "e0-w16-watch64",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 16,
+  "watchers": 64,
+  "duration_sec": 60.000514738,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "puts_ok": 862189,
+  "puts_err": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 14369.693389546068,
+  "put_p50_ms": 0.912,
+  "put_p95_ms": 1.729,
+  "put_p99_ms": 2.947,
+  "put_max_ms": 39.835,
+  "watch_events": 32504,
+  "watch_delivery_p50_ms": 23788.433363,
+  "watch_delivery_p95_ms": 43920.025494,
+  "watch_delivery_p99_ms": 45093.794424,
+  "started_at": "2026-08-28T22:15:07Z"
+}

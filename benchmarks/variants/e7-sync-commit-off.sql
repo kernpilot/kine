@@ -1,0 +1,18 @@
+-- E7 — synchronous_commit = off.
+--
+-- The largest write-side lever PostgreSQL offers, and the one with the sharpest
+-- trade. It does NOT risk corruption and it does NOT skip the WAL: the database
+-- stays consistent and crash-recoverable. It stops waiting for the WAL flush to
+-- reach disk before acknowledging a commit, so a crash can lose the most recent
+-- transactions — those inside one wal_writer_delay window, typically a few
+-- hundred milliseconds.
+--
+-- For a Kubernetes datastore that window means losing the last few writes an
+-- apiserver acknowledged. Controllers are level-triggered and would reconcile
+-- most of it back, but an acknowledged-then-vanished write is exactly the class
+-- of failure that produces "the object I created is gone" bug reports.
+--
+-- ALTER DATABASE, not ALTER SYSTEM: this applies to new connections without a
+-- server restart and is reverted by e7-revert.sql. Measure it, then decide with
+-- the number in hand rather than the intuition.
+ALTER DATABASE kine SET synchronous_commit = off;

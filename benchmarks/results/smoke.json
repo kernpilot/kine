@@ -1,0 +1,22 @@
+{
+  "label": "smoke",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 8,
+  "watchers": 16,
+  "duration_sec": 20.000497051,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "puts_ok": 191972,
+  "puts_err": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 9598.36145624199,
+  "put_p50_ms": 0.565,
+  "put_p95_ms": 0.907,
+  "put_p99_ms": 10.383,
+  "put_max_ms": 28.895,
+  "watch_events": 8092,
+  "watch_delivery_p50_ms": 10.761688,
+  "watch_delivery_p95_ms": 20.22754,
+  "watch_delivery_p99_ms": 20.635752,
+  "started_at": "2026-08-28T22:14:27Z"
+}

@@ -1,0 +1,29 @@
+{
+  "label": "e0-w64-watch256",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 64,
+  "watchers": 256,
+  "duration_sec": 60.083428282,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "puts_ok": 680346,
+  "puts_err": 321,
+  "put_error_rate_pct": 0.04715962430968447,
+  "put_rate_per_sec": 11323.355198821442,
+  "put_p50_ms": 4.006,
+  "put_p95_ms": 16.331,
+  "put_p99_ms": 32.252,
+  "put_max_ms": 123.999,
+  "watch_events": 12768,
+  "watch_delivery_p50_ms": 29069.03304,
+  "watch_delivery_p95_ms": 61075.222832,
+  "watch_delivery_p99_ms": 61998.977111,
+  "first_errors": [
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): failed to receive message: read tcp [::1]:34188-\u003e[::1]:55432: read: connection reset by peer\n\t127.0.0.1:55432 (localhost): failed to receive message: read tcp 127.0.0.1:37990-\u003e127.0.0.1:55432: read: connection reset by peer",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): failed to receive message: read tcp [::1]:34208-\u003e[::1]:55432: read: connection reset by peer\n\t127.0.0.1:55432 (localhost): failed to receive message: read tcp 127.0.0.1:37966-\u003e127.0.0.1:55432: read: connection reset by peer",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): failed to receive message: read tcp [::1]:34210-\u003e[::1]:55432: read: connection reset by peer\n\t127.0.0.1:55432 (localhost): failed to receive message: read tcp 127.0.0.1:37980-\u003e127.0.0.1:55432: read: connection reset by peer",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): failed to receive message: read tcp [::1]:34198-\u003e[::1]:55432: read: connection reset by peer\n\t127.0.0.1:55432 (localhost): failed to receive message: read tcp 127.0.0.1:37960-\u003e127.0.0.1:55432: read: connection reset by peer",
+    "rpc error: code = Unknown desc = failed to connect to `user=kine database=kine`:\n\t[::1]:55432 (localhost): failed to receive message: read tcp [::1]:34134-\u003e[::1]:55432: read: connection reset by peer\n\t127.0.0.1:55432 (localhost): failed to receive message: read tcp 127.0.0.1:38006-\u003e127.0.0.1:55432: read: connection reset by peer"
+  ],
+  "started_at": "2026-08-28T22:17:18Z"
+}

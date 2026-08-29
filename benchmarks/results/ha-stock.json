@@ -1,0 +1,22 @@
+{
+  "label": "ha-stock",
+  "writers": 4,
+  "watchers": 8,
+  "duration_sec": 60.012700841,
+  "objects_per_writer": 25,
+  "value_bytes": 2048,
+  "writes_ok": 480,
+  "writes_err": 0,
+  "writes_conflict": 0,
+  "write_error_rate_pct": 0,
+  "write_conflict_pct": 0,
+  "write_rate_per_sec": 7.998306912927162,
+  "write_p50_ms": 11.965,
+  "write_p95_ms": 17.583,
+  "write_p99_ms": 20.757,
+  "watch_events": 1695,
+  "watch_latency_samples": 1695,
+  "watch_delivery_p50_ms": 499.641797,
+  "watch_delivery_p95_ms": 1000.078628,
+  "watch_delivery_p99_ms": 1000.921332
+}

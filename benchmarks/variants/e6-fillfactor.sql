@@ -1,0 +1,13 @@
+-- E6 — lower the table fillfactor.
+--
+-- Included as a NEGATIVE control as much as a candidate. Fillfactor leaves free
+-- space in each page so an UPDATE can place the new row version in the same
+-- page (a HOT update) and skip updating every index. kine's write path is
+-- INSERT-only plus DELETE on compaction — it does not UPDATE rows — so the HOT
+-- mechanism has nothing to act on and the expected result is "no change, at the
+-- cost of a larger table".
+--
+-- A sweep that only tests changes expected to win cannot distinguish a real
+-- effect from a hopeful one. This is here to confirm the harness reports a null
+-- result when the mechanism does not apply.
+ALTER TABLE kine SET (fillfactor = 70);
