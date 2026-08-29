@@ -38,7 +38,12 @@ noise floor.
 durable. Verified by killing the LISTEN backend mid-run: **0 events lost**, p99
 degraded to 712.9 ms during reconnect, then recovered.
 
-**Re-check** `benchmarks/run-cross.sh`
+**Re-check** `benchmarks/verify-patches.sh` (or `run-cross.sh` directly).
+
+**Independently reproduced 2026-08-29** on freshly built binaries, upstream
+anchor versus patched: stock p99 **718.3 ms** → patched **25.3 ms**, 28.4x. The
+verifier was itself mutation-checked by pointing it at an unpatched binary,
+where it correctly reported 1.0x and failed.
 
 **Rejected implementation.** A per-row `AFTER INSERT` trigger calling
 `pg_notify` cut write throughput 96.8 % (5076 → 163 writes/s) and pushed put p99
