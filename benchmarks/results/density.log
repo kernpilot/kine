@@ -1,0 +1,7 @@
+13:08:10 | === density sweep · backend kine-dens-pg, max_connections=200 ===
+13:08:10 | --- D1: connection floor for a quiet tenant (4 writers @ 10 /s each, 8 watchers) ---
+pool=2   conns_in_use=5    achieved=40     err=0.00%  kine_rss=44MB
+pool=5   conns_in_use=8    achieved=40     err=0.00%  kine_rss=45MB
+pool=10  conns_in_use=8    achieved=40     err=0.00%  kine_rss=44MB
+pool=20  conns_in_use=8    achieved=40     err=0.00%  kine_rss=45MB
+13:11:39 | === D1 complete — see results/d1-floor.txt ===
