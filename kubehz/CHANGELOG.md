@@ -96,8 +96,14 @@ fixed.
   30s` did not prevent it. An unguarded run took a 124 GB host to 120 GB used
   with all swap consumed. The failure mode is the host OOM killer rather than
   kine shedding load.
-- **A slow watcher is dropped silently.** `broadcaster.go` unsubscribes a
-  subscriber whose buffer is full and tells the client nothing; the gRPC stream
-  stays open and mute. A controller stops receiving updates and never relists.
+- **A dropped watcher is not told it lost its place.** `broadcaster.go`
+  unsubscribes a subscriber whose buffer is full. `server/watch.go:243-247` then
+  does send `Canceled: true` — so the client is not left mute, as an earlier
+  reading of this claimed. But the cancel carries **`CompactRevision: 0` and an
+  empty reason**, where kine's own signal for an invalid position
+  (`watch.go:177`) is `Cancel(id, currentRev, compactRev, ErrCompacted)`. A
+  Kubernetes reflector receiving a bare cancel re-establishes from its last seen
+  resourceVersion, which kine serves — so it resumes past the events it never
+  received. The watch ends; the data loss does not surface.
 
 Both are candidates for `P2` and `P3`. Neither has an upstream issue.
