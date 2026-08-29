@@ -20,7 +20,6 @@ say() { printf '» %s\n' "$*"; }
 
 start() { # name port extra-args...
   docker rm -f "$1" >/dev/null 2>&1 || true
-  shift_name=$1
   docker run -d --name "$1" --network host \
     -e POSTGRES_USER=kine -e POSTGRES_PASSWORD=kine -e POSTGRES_DB=kine \
     "${@:3}" "$PG_IMAGE" -c port="$2" >/dev/null
