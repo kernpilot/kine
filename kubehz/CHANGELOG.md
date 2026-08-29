@@ -96,14 +96,34 @@ fixed.
   30s` did not prevent it. An unguarded run took a 124 GB host to 120 GB used
   with all swap consumed. The failure mode is the host OOM killer rather than
   kine shedding load.
-- **A dropped watcher is not told it lost its place.** `broadcaster.go`
-  unsubscribes a subscriber whose buffer is full. `server/watch.go:243-247` then
-  does send `Canceled: true` — so the client is not left mute, as an earlier
-  reading of this claimed. But the cancel carries **`CompactRevision: 0` and an
-  empty reason**, where kine's own signal for an invalid position
-  (`watch.go:177`) is `Cancel(id, currentRev, compactRev, ErrCompacted)`. A
-  Kubernetes reflector receiving a bare cancel re-establishes from its last seen
-  resourceVersion, which kine serves — so it resumes past the events it never
-  received. The watch ends; the data loss does not surface.
+- **A dropped watcher would not be told it lost its place — but the drop path
+  could not be reached.** `broadcaster.go` unsubscribes a subscriber whose
+  buffer is full, and `server/watch.go:243-247` then sends `Canceled: true` with
+  **`CompactRevision: 0` and an empty reason**, where kine's own signal for an
+  invalid position (`watch.go:177`) is `Cancel(id, currentRev, compactRev,
+  ErrCompacted)`. On that reading a reflector reconnects from its last
+  resourceVersion and silently skips the lost events.
 
-Both are candidates for `P2` and `P3`. Neither has an upstream issue.
+  **Three attempts failed to trigger the drop**, using `benchmarks/dropprobe/`:
+
+  | attempt | result |
+  |---|---|
+  | watcher stops reading its channel, 40 000 matching events written | all 40 000 delivered, no gap, no cancel |
+  | watcher `SIGSTOP`ped, flood on a *different* prefix | no drop — and the test was wrong: kine filters per watcher *after* the broadcaster, so non-matching events are drained by the filtering goroutine and never pressure the buffer |
+  | watcher `SIGSTOP`ped, flood on the matching prefix | inconclusive; the watcher still observed only its warmup event |
+
+  The first failure is the instructive one: **`clientv3` drains the gRPC stream
+  into its own unbounded buffer whether or not the application reads the
+  channel**, so an application-level slow consumer creates no server-side
+  backpressure at all. Reaching the drop needs real transport stalling, and
+  even freezing the client process did not produce it here.
+
+  **So this is a code-visible hazard with no demonstrated trigger, and no patch
+  is justified on present evidence.** The probe is committed so the attempt is
+  cheap to repeat; the fix, if anyone reaches the path, is to pass
+  `wr.CompactRevision` and a reason into the `Cancel` at `watch.go:245` instead
+  of the literal zeros.
+
+`P2` (bound the watch buffers) is justified and outstanding — it reproduces at
+1.02 GB on a fresh table and >12 GB once the table holds history. `P3` is not
+justified until the drop path can be demonstrated. Neither has an upstream issue.
