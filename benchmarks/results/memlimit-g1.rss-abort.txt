@@ -1,0 +1,1 @@
+ABORTED: kine RSS 13206060 kB exceeded cap 12582912 kB (12 GB)

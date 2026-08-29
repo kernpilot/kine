@@ -1,0 +1,458 @@
+11:31:49 | === replication sweep ===
+11:31:49 | --- arm: none (standalone) ---
+11:31:49 |   run repl-none-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=repl-none-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "repl-none-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.013978987,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 207328,
+  "puts_ok": 324179,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 5401.724822648776,
+  "put_p50_ms": 17.871,
+  "put_p95_ms": 29.064,
+  "put_p99_ms": 33.042,
+  "put_max_ms": 114.652,
+  "watch_events": 10373728,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.146532314,
+  "watch_last_event_max_sec": 62.147209077,
+  "watch_delivery_p50_ms": 21.880575,
+  "watch_delivery_p95_ms": 33.435911,
+  "watch_delivery_p99_ms": 40.162998,
+  "started_at": "2026-08-29T11:31:51Z"
+}
+[36m»[0m sizes: 1627 MB table, 99 MB indexes
+[36m»[0m kine peak RSS: 0.2 GB
+[36m»[0m done -> results/repl-none-r1.json
+11:32:54 |   run repl-none-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=repl-none-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "repl-none-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.02327281,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 202752,
+  "puts_ok": 316981,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 5280.968283808582,
+  "put_p50_ms": 18.088,
+  "put_p95_ms": 29.748,
+  "put_p99_ms": 36.154,
+  "put_max_ms": 119.139,
+  "watch_events": 10143392,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.157697689,
+  "watch_last_event_max_sec": 62.158549914,
+  "watch_delivery_p50_ms": 22.096565,
+  "watch_delivery_p95_ms": 34.648036,
+  "watch_delivery_p99_ms": 43.733087,
+  "started_at": "2026-08-29T11:32:57Z"
+}
+[36m»[0m sizes: 1587 MB table, 97 MB indexes
+[36m»[0m kine peak RSS: 0.3 GB
+[36m»[0m done -> results/repl-none-r2.json
+11:34:00 | preparing replication on the primary
+11:34:01 | primary hba_file: /var/lib/postgresql/18/docker/pg_hba.conf
+11:34:01 | replication rule present and config reloaded
+11:34:01 | taking a base backup into the replica volume
+11:34:04 | starting the replica on 55433
+11:34:05 | replica confirmed streaming
+11:34:05 | --- arm: async replication ---
+11:34:05 |   run repl-async-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=repl-async-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "repl-async-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.025850058,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 148064,
+  "puts_ok": 231590,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3858.171100887802,
+  "put_p50_ms": 27.225,
+  "put_p95_ms": 35.019,
+  "put_p99_ms": 43.197,
+  "put_max_ms": 275.978,
+  "watch_events": 7410880,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.163996805,
+  "watch_last_event_max_sec": 62.164522038,
+  "watch_delivery_p50_ms": 30.458151,
+  "watch_delivery_p95_ms": 40.299486,
+  "watch_delivery_p99_ms": 52.028422,
+  "started_at": "2026-08-29T11:34:08Z"
+}
+[36m»[0m sizes: 1124 MB table, 82 MB indexes
+[36m»[0m kine peak RSS: 0.4 GB
+[36m»[0m done -> results/repl-async-r1.json
+11:35:12 |   run repl-async-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=repl-async-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "repl-async-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.057872026,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 134912,
+  "puts_ok": 211035,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3513.8607626430658,
+  "put_p50_ms": 28.568,
+  "put_p95_ms": 49.64,
+  "put_p99_ms": 71.195,
+  "put_max_ms": 469.622,
+  "watch_events": 6753120,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.190789617,
+  "watch_last_event_max_sec": 62.19127801,
+  "watch_delivery_p50_ms": 31.311075,
+  "watch_delivery_p95_ms": 54.631414,
+  "watch_delivery_p99_ms": 79.442564,
+  "started_at": "2026-08-29T11:35:15Z"
+}
+[36m»[0m sizes: 1013 MB table, 78 MB indexes
+[36m»[0m kine peak RSS: 0.4 GB
+[36m»[0m done -> results/repl-async-r2.json
+11:36:19 | --- arm: SYNCHRONOUS replication ---
+11:36:19 | sync_state = sync
+11:36:19 |   run repl-sync-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=repl-sync-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "repl-sync-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.056441923,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 57696,
+  "puts_ok": 90379,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 1504.901008219524,
+  "put_p50_ms": 54.563,
+  "put_p95_ms": 106.038,
+  "put_p99_ms": 130.3,
+  "put_max_ms": 344.621,
+  "watch_events": 2892128,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.193924483,
+  "watch_last_event_max_sec": 62.194468247,
+  "watch_delivery_p50_ms": 65.711756,
+  "watch_delivery_p95_ms": 113.886784,
+  "watch_delivery_p99_ms": 147.780941,
+  "started_at": "2026-08-29T11:36:23Z"
+}
+[36m»[0m sizes: 359 MB table, 35 MB indexes
+[36m»[0m kine peak RSS: 0.3 GB
+[36m»[0m done -> results/repl-sync-r1.json
+11:37:26 |   run repl-sync-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=repl-sync-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "repl-sync-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.060656383,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 58624,
+  "puts_ok": 91809,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 1528.6046728251588,
+  "put_p50_ms": 53.925,
+  "put_p95_ms": 104.576,
+  "put_p99_ms": 125.936,
+  "put_max_ms": 267.373,
+  "watch_events": 2937888,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.209031625,
+  "watch_last_event_max_sec": 62.209722139,
+  "watch_delivery_p50_ms": 61.103467,
+  "watch_delivery_p95_ms": 112.574364,
+  "watch_delivery_p99_ms": 140.264105,
+  "started_at": "2026-08-29T11:37:29Z"
+}
+[36m»[0m sizes: 368 MB table, 36 MB indexes
+[36m»[0m kine peak RSS: 0.4 GB
+[36m»[0m done -> results/repl-sync-r2.json
+11:38:32 | tearing the replica down and restoring the primary
+11:38:33 | === replication sweep complete ===
+11:52:09 | === replication sweep ===
+11:52:09 | --- arm: none (standalone) ---
+11:52:09 |   run wrepl-none-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=wrepl-none-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "wrepl-none-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.043471343,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 419424,
+  "puts_ok": 655582,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 10918.456000902572,
+  "put_p50_ms": 6.309,
+  "put_p95_ms": 27.845,
+  "put_p99_ms": 41.897,
+  "put_max_ms": 101.943,
+  "watch_events": 20978624,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.176742406,
+  "watch_last_event_max_sec": 62.180433566,
+  "watch_delivery_p50_ms": 34.975168,
+  "watch_delivery_p95_ms": 73.161413,
+  "watch_delivery_p99_ms": 95.864886,
+  "started_at": "2026-08-29T11:52:11Z"
+}
+[36m»[0m sizes: 3439 MB table, 196 MB indexes
+[36m»[0m kine peak RSS: 0.7 GB
+[36m»[0m done -> results/wrepl-none-r1.json
+11:53:14 |   run wrepl-none-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=wrepl-none-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "wrepl-none-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.022668553,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 421440,
+  "puts_ok": 658706,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 10974.287146503037,
+  "put_p50_ms": 5.941,
+  "put_p95_ms": 28.844,
+  "put_p99_ms": 43.972,
+  "put_max_ms": 119.213,
+  "watch_events": 21078592,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.157464034,
+  "watch_last_event_max_sec": 62.158856202,
+  "watch_delivery_p50_ms": 38.813489,
+  "watch_delivery_p95_ms": 78.758073,
+  "watch_delivery_p99_ms": 102.798603,
+  "started_at": "2026-08-29T11:53:19Z"
+}
+[36m»[0m sizes: 3451 MB table, 197 MB indexes
+[36m»[0m kine peak RSS: 0.8 GB
+[36m»[0m done -> results/wrepl-none-r2.json
+11:54:22 | preparing replication on the primary
+11:54:22 | primary hba_file: /var/lib/postgresql/data/pg_hba.conf
+11:54:22 | replication rule present and config reloaded
+11:54:22 | taking a base backup into the replica volume
+11:54:26 | starting the replica on 55433
+11:54:28 | replica confirmed streaming
+11:54:28 | --- arm: async replication ---
+11:54:28 |   run wrepl-async-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=wrepl-async-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "wrepl-async-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.004204382,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 389632,
+  "puts_ok": 608959,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 10148.60552309356,
+  "put_p50_ms": 6.405,
+  "put_p95_ms": 31.25,
+  "put_p99_ms": 48.04,
+  "put_max_ms": 139.184,
+  "watch_events": 19486688,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.14374076,
+  "watch_last_event_max_sec": 62.14739621,
+  "watch_delivery_p50_ms": 43.597074,
+  "watch_delivery_p95_ms": 86.850597,
+  "watch_delivery_p99_ms": 115.103598,
+  "started_at": "2026-08-29T11:54:32Z"
+}
+[36m»[0m sizes: 3181 MB table, 190 MB indexes
+[36m»[0m kine peak RSS: 0.9 GB
+[36m»[0m done -> results/wrepl-async-r1.json
+11:55:35 |   run wrepl-async-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=wrepl-async-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "wrepl-async-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.015730811,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 374560,
+  "puts_ok": 585451,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 9754.959109698877,
+  "put_p50_ms": 6.45,
+  "put_p95_ms": 32.781,
+  "put_p99_ms": 52.344,
+  "put_max_ms": 333.349,
+  "watch_events": 18734432,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.153571532,
+  "watch_last_event_max_sec": 62.155611413,
+  "watch_delivery_p50_ms": 44.59003,
+  "watch_delivery_p95_ms": 96.564379,
+  "watch_delivery_p99_ms": 128.290389,
+  "started_at": "2026-08-29T11:55:38Z"
+}
+[36m»[0m sizes: 3057 MB table, 186 MB indexes
+[36m»[0m kine peak RSS: 1.0 GB
+[36m»[0m done -> results/wrepl-async-r2.json
+11:56:42 | --- arm: SYNCHRONOUS replication ---
+11:56:42 | sync_state = sync
+11:56:42 |   run wrepl-sync-r1
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=wrepl-sync-r1)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "wrepl-sync-r1",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.054233559,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 117440,
+  "puts_ok": 183724,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 3059.301386629158,
+  "put_p50_ms": 28.359,
+  "put_p95_ms": 63.11,
+  "put_p99_ms": 91.347,
+  "put_max_ms": 344.063,
+  "watch_events": 5879168,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.191313351,
+  "watch_last_event_max_sec": 62.191828564,
+  "watch_delivery_p50_ms": 40.426467,
+  "watch_delivery_p95_ms": 76.791362,
+  "watch_delivery_p99_ms": 107.277595,
+  "started_at": "2026-08-29T11:56:45Z"
+}
+[36m»[0m sizes: 866 MB table, 66 MB indexes
+[36m»[0m kine peak RSS: 0.4 GB
+[36m»[0m done -> results/wrepl-sync-r1.json
+11:57:48 |   run wrepl-sync-r2
+[36m»[0m resetting kine table
+[36m»[0m starting kine (label=wrepl-sync-r2)
+[36m»[0m running load: 60s, 100 writers, 256 watchers
+{
+  "label": "wrepl-sync-r2",
+  "endpoint": "127.0.0.1:2379",
+  "writers": 100,
+  "watchers": 256,
+  "duration_sec": 60.043545082,
+  "value_bytes": 2048,
+  "keyspace": 500,
+  "write_rate_cap_per_writer": 0,
+  "watch_latency_samples": 114432,
+  "puts_ok": 179029,
+  "puts_err": 0,
+  "puts_conflict": 0,
+  "put_error_rate_pct": 0,
+  "put_rate_per_sec": 2981.652728124305,
+  "put_p50_ms": 28.936,
+  "put_p95_ms": 65.073,
+  "put_p99_ms": 99.92,
+  "put_max_ms": 467.636,
+  "watch_events": 5728928,
+  "watch_closed_early": 0,
+  "watch_cancels": 0,
+  "watch_last_event_p50_sec": 62.177556089,
+  "watch_last_event_max_sec": 62.17819796,
+  "watch_delivery_p50_ms": 41.121416,
+  "watch_delivery_p95_ms": 79.685694,
+  "watch_delivery_p99_ms": 116.594863,
+  "started_at": "2026-08-29T11:57:52Z"
+}
+[36m»[0m sizes: 841 MB table, 63 MB indexes
+[36m»[0m kine peak RSS: 0.3 GB
+[36m»[0m done -> results/wrepl-sync-r2.json
+11:58:55 | tearing the replica down and restoring the primary
+11:58:56 | === replication sweep complete ===
