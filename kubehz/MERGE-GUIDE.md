@@ -138,8 +138,7 @@ even after capping max-open alone**.
 ## Image releases (GHCR)
 
 The patched image ships as a PUBLIC package at `ghcr.io/kernpilot/kine` —
-tenant extCP control planes pull it from THEIR machines with no credentials
-(the repo itself stays private; GHCR package visibility is independent).
+tenant extCP control planes pull it from THEIR machines with no credentials.
 
 Version scheme: `v<upstream>-kubehz.<n>`
 

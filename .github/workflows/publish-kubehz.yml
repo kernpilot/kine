@@ -2,9 +2,10 @@
 #
 # The consumers are EXTERNALIZED tenant control planes (kubehz extCP rung):
 # the kine container runs on the TENANT's machines and must be pullable with
-# NO credentials — the package is public (repo stays private; GHCR package
-# visibility is independent). Nothing secret is in the image by design: the
-# DSN arrives at runtime from a per-tenant Secret.
+# NO credentials — the package is public, like the repo itself (code that
+# runs on customer hardware is inspectable, same posture as kubehz-agent).
+# Nothing secret is in the image by design: the DSN arrives at runtime from
+# a per-tenant Secret.
 #
 # Versioning (documented in kubehz/MERGE-GUIDE.md):
 #   v<upstream>-kubehz.<n>   e.g. v0.17.0-kubehz.1
