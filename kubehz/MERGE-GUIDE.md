@@ -134,3 +134,22 @@ problem and they need no patch at all.** Set
 against an unbounded max-open produces connection churn that presented as
 **7.80 % write errors** on kine's defaults and **6 % against a real apiserver
 even after capping max-open alone**.
+
+## Image releases (GHCR)
+
+The patched image ships as a PUBLIC package at `ghcr.io/kernpilot/kine` —
+tenant extCP control planes pull it from THEIR machines with no credentials
+(the repo itself stays private; GHCR package visibility is independent).
+
+Version scheme: `v<upstream>-kubehz.<n>`
+
+- `<upstream>` — the k3s-io/kine tag `main` is currently rebased onto
+  (`git describe --tags upstream-master`).
+- `<n>` — the patchset release counter on that base. Bump it for any release
+  from the same base; a rebase onto a newer upstream resets it to 1.
+
+Release = push the tag; `.github/workflows/publish-kubehz.yml` builds
+linux/amd64 + linux/arm64 (CGO_ENABLED=0 — drops only sqlite/dqlite; the
+extCP rung is postgres-only) and pushes the immutable version tag plus the
+moving `kubehz` tag. Consumers PIN the immutable tag
+(`KUBEHZ_EXTCP_KINE_IMAGE`); `kubehz` exists for humans.
