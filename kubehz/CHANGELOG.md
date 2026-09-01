@@ -150,6 +150,38 @@ This only matters where a tenant runs multiple kine replicas.
 Re-measure with `benchmarks/sweep-density.sh`, `sweep-density2.sh` and
 `sweep-density3.sh`.
 
+**D5 (2026-09-01): the wall holds off past 500 tenants on direct
+connections.** `sweep-density-wall.sh` laddered the two levers with full
+production shape (postgres 18.4, per-tenant roles with `CONNECTION LIMIT
+12` owning their own databases, kine pool 8/8, quiet-CP load of 2 writers
+@ 5/s + 4 watchers each):
+
+| max_connections | pool | tenants | conns used | err % | worst-tenant put p99 | pg RSS |
+|---|---|---|---|---|---|---|
+| 300 | 8 | 40 | 204 | 0.00 | 47 ms | 1.0 GB |
+| 800 | 8 | 100 | 514 | 0.00 | 56 ms | 2.3 GB |
+| 2000 | 8 | 250 | 1 289 | 0.00 | 72 ms | 5.6 GB |
+| 4000 | 8 | **500** | 3 006 | **0.00** | 224 ms | 12.3 GB |
+| 2600 | **4** | 500 | 2 592 | **4.17** | 1 701 ms | 11.1 GB |
+
+- Quiet tenants hold **~5–6 connections**, under the loaded-tenant 7 —
+  the `max_connections / 7` rule is the safe sizing bound, not the floor.
+- **Halving the pool to 4/4 is refuted**: 4.17 % write errors and 1.7 s
+  p99 at 500 tenants — pool starvation, the equal-flags scar again. The
+  per-role `CONNECTION LIMIT` contained the damage to the starved tenants
+  (the shared pool never drained), which is why the roles must carry it.
+- The 224 ms p99 at 500 is instrument-contaminated (one 24-core host ran
+  postgres AND all 500 kine AND all 500 load generators); in a real
+  deployment the kine fleet runs elsewhere and postgres carries only
+  ~12 GB RSS + ~3 000 backends. Confirm latency on target hardware.
+- No pooler needed for 500. PgBouncer (~2.25 conns/tenant) remains the
+  next 3× if a deployment ever needs >max_connections/7 — with the
+  cross-instance watch caveat above.
+
+Summary table: `benchmarks/results/d5-wall.txt` (per-tenant JSONs are
+local artifacts, not committed — 1 400 files say nothing the table does
+not).
+
 ## Open hazards in upstream kine, not yet patched
 
 Carried here because they bound how kine can be deployed, not because they are
