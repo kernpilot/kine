@@ -164,8 +164,8 @@ type notifyingDialect struct {
 // unchanged. The recording is a single atomic compare-and-swap; the NOTIFY
 // itself happens on another goroutine and another connection, so the write
 // path never pays for it.
-func (n *notifyingDialect) Insert(ctx context.Context, key string, create, delete bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
-	rev, err := n.Generic.Insert(ctx, key, create, delete, createRevision, previousRevision, ttl, value)
+func (n *notifyingDialect) Insert(ctx context.Context, key string, create, del bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
+	rev, err := n.Generic.Insert(ctx, key, create, del, createRevision, previousRevision, ttl, value)
 	if err == nil && rev > 0 {
 		n.notifier.record(rev)
 	}

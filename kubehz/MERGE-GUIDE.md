@@ -8,19 +8,28 @@ patches exist.
 
 | branch | what it is |
 |---|---|
-| `upstream-master` | a pristine mirror of `k3s-io/kine` master. Never edit it. |
+| `upstream-master` | a pristine mirror of `k3s-io/kine` master, kept on `origin`. Never edit it. |
 | `main` | `upstream-master` plus the patches below, plus `kubehz/` and `benchmarks/`. |
 
-Updating to a newer upstream:
+A clone has only `origin` (this fork). The recipe below works from a fresh
+clone; skip the lines you already have.
 
 ```bash
-git fetch upstream                       # k3s-io/kine
+git clone https://github.com/kernpilot/kine.git && cd kine
+git remote add upstream https://github.com/k3s-io/kine.git
+git fetch upstream --tags                       # k3s-io/kine
+git fetch origin upstream-master:upstream-master # the mirror branch, from origin
 git checkout upstream-master && git merge --ff-only upstream/master
 git push origin upstream-master
 git checkout main && git rebase upstream-master
 # resolve using the rules below, then:
+go test ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/   # P1 unit tests, hermetic
 cd benchmarks && ./verify-patches.sh     # re-measures every claim in CHANGELOG.md
 ```
+
+Dependabot branches on `origin` (`dependabot/...`) come from upstream's
+`.github/dependabot.yml` and track upstream's dependencies. Close them
+unmerged: upstream owns those bumps and they arrive with the next rebase.
 
 ## Rules for resolving a conflict here
 
@@ -62,7 +71,16 @@ nothing on another. Re-run, do not assume.
 ### P1 — cross-instance watch wake-up
 
 **Files** `pkg/drivers/pgsql/notify.go` (new, conflict-free),
-`pkg/drivers/pgsql/pgsql.go`, `pkg/logstructured/sqllog/sql.go`.
+`pkg/drivers/pgsql/pgsql.go` (the `notifyingDialect` wrapper at the end of
+`New`), `pkg/logstructured/sqllog/sql.go` (the `external` channel and its
+`select` arm in `SQLLog.poll`).
+
+**Tests** `pkg/drivers/pgsql/kubehz_notify_test.go` (`record`, payload
+parsing, the non-blocking forward, the reconnect backoff) and
+`pkg/logstructured/sqllog/kubehz_notify_test.go` (a fake dialect proving the
+`case <-external:` arm wakes `poll`). Both are hermetic; `unit.yml` fails
+when a `TestKubehzP1*` test is missing from either package, so dropping the
+patch means deleting the tests in the same commit.
 
 **Problem.** kine signals its own poll loop in-process on every insert, so a
 single instance wakes its watchers in milliseconds. That signal does not cross a
@@ -149,6 +167,22 @@ Version scheme: `v<upstream>-kubehz.<n>`
 
 Release = push the tag; `.github/workflows/publish-kubehz.yml` builds
 linux/amd64 + linux/arm64 (CGO_ENABLED=0 — drops only sqlite/dqlite; the
-extCP rung is postgres-only) and pushes the immutable version tag plus the
-moving `kubehz` tag. Consumers PIN the immutable tag
-(`KUBEHZ_EXTCP_KINE_IMAGE`); `kubehz` exists for humans.
+extCP rung is postgres-only), pushes the version tag plus the moving
+`kubehz` tag, signs the digest keyless with cosign, attaches buildkit
+provenance and SBOM, attests a standalone SPDX SBOM, and verifies all of it
+before the run goes green. The run's summary prints the digest; copy it into
+the "Released" section of `CHANGELOG.md`.
+
+GHCR does not enforce tag immutability, so consumers pin the DIGEST
+(`KUBEHZ_EXTCP_KINE_IMAGE`), never the tag; `kubehz` exists for humans. To
+verify a release (no key, no account):
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/kernpilot/kine/\.github/workflows/publish-kubehz\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/kernpilot/kine@sha256:<digest>
+```
+
+`v0.17.0-kubehz.1` predates the signing lane and is unsigned; see the
+CHANGELOG release section.

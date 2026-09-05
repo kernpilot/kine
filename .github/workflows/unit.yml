@@ -36,3 +36,15 @@ jobs:
       run: go test -cover -tags=test ./...
       env:
         CGO_ENABLED: "0"
+
+    # kubehz fork: the P1 tests (kubehz/MERGE-GUIDE.md#p1) are hermetic and
+    # already ran above. This step makes their ABSENCE a failure: a rebase
+    # that drops a test file would otherwise pass on an empty -run.
+    - name: kubehz P1 tests exist and pass
+      run: |
+        set -euo pipefail
+        for pkg in ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/; do
+          go test -tags=test -list 'TestKubehzP1' "$pkg" | grep -q '^TestKubehzP1' \
+            || { echo "::error::no TestKubehzP1* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
+        done
+        go test -tags=test -count=1 -race -run 'TestKubehzP1' ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/
