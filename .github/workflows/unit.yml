@@ -44,7 +44,10 @@ jobs:
       run: |
         set -euo pipefail
         for pkg in ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/; do
-          go test -tags=test -list 'TestKubehzP1' "$pkg" | grep -q '^TestKubehzP1' \
+          # Capture first: `grep -q` in a pipe can exit before `go` finishes
+          # writing, and pipefail would then report a false failure.
+          names=$(go test -tags=test -list 'TestKubehzP1' "$pkg")
+          grep -q '^TestKubehzP1' <<<"$names" \
             || { echo "::error::no TestKubehzP1* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
         done
         go test -tags=test -count=1 -race -run 'TestKubehzP1' ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/

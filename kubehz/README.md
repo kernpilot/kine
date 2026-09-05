@@ -23,10 +23,18 @@ three files: `pkg/drivers/pgsql/notify.go` is new and cannot conflict;
 `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go` carry
 small marker-wrapped edits. `sqllog/sql.go` is a file upstream churns (~21
 commits a year), so that edit is written to be dropped cheaply, and is a
-candidate for upstreaming rather than indefinite carrying. Nothing outside
-those three files and the `kubehz/` and `benchmarks/` directories differs
-from upstream: `git diff --stat upstream-master..main -- . ':!benchmarks'
-':!kubehz'` is the check.
+candidate for upstreaming rather than indefinite carrying. Beside the three
+source files, the fork carries its own tests (`pkg/drivers/pgsql/
+kubehz_notify_test.go`, `pkg/logstructured/sqllog/kubehz_notify_test.go`),
+two workflow files (`unit.yml` gains a P1 step, `publish-kubehz.yml` is
+ours), a few `.gitignore` lines, and the `kubehz/` and `benchmarks/`
+directories. Nothing else differs from upstream; the check is
+
+```bash
+git diff --stat upstream-master..main -- . ':!benchmarks' ':!kubehz' ':!.github' ':!.gitignore' ':!**/kubehz_*_test.go'
+```
+
+which must list exactly `notify.go`, `pgsql.go` and `sqllog/sql.go`.
 
 ## Principles
 

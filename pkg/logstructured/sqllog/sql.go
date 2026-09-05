@@ -523,8 +523,14 @@ func (s *SQLLog) poll(result chan server.Events, pollStart int64) {
 				if check <= pollRevision {
 					continue
 				}
-			// KUBEHZ-PATCH P1 (select arm) — see the block above.
-			case check := <-external:
+			// KUBEHZ-PATCH P1 (select arm) — see the block above. The
+			// driver closes the channel on shutdown; a closed channel is
+			// always ready, so drop it instead of spinning on it.
+			case check, ok := <-external:
+				if !ok {
+					external = nil
+					continue
+				}
 				if check <= pollRevision {
 					continue
 				}

@@ -15,10 +15,18 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 ### P1 hardening (no behaviour change on the happy path)
 
 - The notifier backs off on a failed `pg_notify` the same way the listener
-  backs off on a lost `LISTEN`: 1 s, doubling to 30 s, reset after a session
-  that stayed up for 30 s (`reconnectBackoff`). Before, an `Exec` error
-  reconnected immediately, so a role or permission error opened a new
-  connection every 10 ms against a tenant role with `CONNECTION LIMIT 12`.
+  backs off on a lost `LISTEN`: 1 s, doubling to 30 s (`reconnectBackoff`).
+  Before, an `Exec` error closed the connection and reconnected at once, so
+  a role or permission error reconnected every 10 ms: about 100 backend
+  forks and authentications per second per kine, forever.
+- The reset rule changed for both connections: the delay drops back to 1 s
+  only after a session that stayed **connected** for 30 s, measured from a
+  successful connect. Before, the listener reset after any session that
+  failed post-connect, so a connection that connected and failed at once
+  retried every second; and time spent in a hanging dial cannot count as
+  a healthy session.
+- `SQLLog.poll` drops the external channel once the driver closes it on
+  shutdown instead of spinning on the always-ready closed channel.
 - A notification payload must be a positive revision; `0` and negatives are
   dropped like malformed text (they were forwarded and ignored by the poll).
 - Hermetic unit tests for `record`, payload parsing, the non-blocking
@@ -29,11 +37,12 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 - `publish-kubehz.yml` signs keyless with cosign, attaches buildkit
   provenance (`mode=max`) and SBOM, attests a standalone SPDX SBOM and
   verifies all of it before the run goes green. The next tag is the first
-  signed release.
+  signed release and the first real run of that lane: expect the verify
+  gate, not a consumer, to find any cosign/registry mismatch.
 
 ---
 
-## Released `v0.17.0-kubehz.1` — on upstream `v0.17.0` (tag at `e1778aa`)
+## Released `v0.17.0-kubehz.1` — on upstream `v0.17.0` (`6fb95f5`); release commit `e1778aa`
 
 Image `ghcr.io/kernpilot/kine:v0.17.0-kubehz.1`, index digest
 

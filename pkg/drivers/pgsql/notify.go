@@ -40,9 +40,9 @@ const (
 
 // reconnectBackoff is the retry delay the two background connections share:
 // 1 s, doubling to 30 s. The notifier's 10 ms ticker must never become its
-// reconnect interval: a role or permission error on pg_notify would then open
-// a new connection every 10 ms against a tenant role with CONNECTION LIMIT 12,
-// the wall kubehz/CHANGELOG.md measures.
+// reconnect interval: a role or permission error on pg_notify would then
+// reconnect every 10 ms, about 100 backend forks and authentications per
+// second per kine, forever.
 type reconnectBackoff struct {
 	next time.Duration
 }
@@ -58,9 +58,11 @@ func (b *reconnectBackoff) delay() time.Duration {
 	return d
 }
 
-// settle resets the delay after a session that stayed up for at least
-// reconnectCap. A shorter session counts as part of the same outage, so a
-// connection that connects and fails at once keeps backing off.
+// settle resets the delay after a session that stayed connected for at
+// least reconnectCap. A shorter session counts as part of the same outage, so
+// a connection that connects and fails at once keeps backing off. Time spent
+// connecting does not count: healthyFor is measured from a successful
+// connect, so a dial that hangs and then fails cannot reset the delay.
 func (b *reconnectBackoff) settle(healthyFor time.Duration) {
 	if healthyFor >= reconnectCap {
 		b.next = 0
@@ -95,14 +97,13 @@ func (r *revisionNotifier) run(ctx context.Context, wg *sync.WaitGroup, config *
 			backoff reconnectBackoff
 		)
 		for ctx.Err() == nil {
-			started := time.Now()
-			err := r.notifyOnce(ctx, config, &sent)
+			healthyFor, err := r.notifyOnce(ctx, config, &sent)
 			if ctx.Err() != nil {
 				return
 			}
 			// Losing the notifier is not fatal: peers fall back to their
 			// poll ticker. Log at info, back off, retry.
-			backoff.settle(time.Since(started))
+			backoff.settle(healthyFor)
 			d := backoff.delay()
 			logrus.Infof("kine revision notifier disconnected, retrying in %s: %v", d, err)
 			if !sleepCtx(ctx, d) {
@@ -115,11 +116,13 @@ func (r *revisionNotifier) run(ctx context.Context, wg *sync.WaitGroup, config *
 // notifyOnce holds one connection and announces the highest recorded revision
 // at most once per notifyInterval, until the connection fails. sent outlives
 // the connection so a reconnect announces only what is still unannounced.
-func (r *revisionNotifier) notifyOnce(ctx context.Context, config *pgx.ConnConfig, sent *int64) error {
+// healthyFor is the time the connection was up, zero when the connect failed.
+func (r *revisionNotifier) notifyOnce(ctx context.Context, config *pgx.ConnConfig, sent *int64) (healthyFor time.Duration, err error) {
 	conn, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	connected := time.Now()
 	defer func() { _ = conn.Close(context.Background()) }()
 
 	tick := time.NewTicker(notifyInterval)
@@ -127,7 +130,7 @@ func (r *revisionNotifier) notifyOnce(ctx context.Context, config *pgx.ConnConfi
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return time.Since(connected), ctx.Err()
 		case <-tick.C:
 		}
 		rev := r.latest.Load()
@@ -135,7 +138,7 @@ func (r *revisionNotifier) notifyOnce(ctx context.Context, config *pgx.ConnConfi
 			continue
 		}
 		if _, err := conn.Exec(ctx, "SELECT pg_notify($1, $2)", RevisionChannel, strconv.FormatInt(rev, 10)); err != nil {
-			return err // reconnect; the peer's ticker still covers us
+			return time.Since(connected), err // reconnect; the peer's ticker still covers us
 		}
 		*sent = rev
 	}
@@ -172,15 +175,14 @@ func startRevisionListener(ctx context.Context, wg *sync.WaitGroup, config *pgx.
 
 		var backoff reconnectBackoff
 		for ctx.Err() == nil {
-			started := time.Now()
-			err := listenOnce(ctx, config, revs)
+			healthyFor, err := listenOnce(ctx, config, revs)
 			if ctx.Err() != nil {
 				return
 			}
 			// Losing the listener is not fatal: the poll loop's ticker
 			// still delivers every event, just later. Log at info so an
 			// operator can correlate a latency change with it, and retry.
-			backoff.settle(time.Since(started))
+			backoff.settle(healthyFor)
 			d := backoff.delay()
 			logrus.Infof("kine revision listener disconnected, retrying in %s: %v", d, err)
 			if !sleepCtx(ctx, d) {
@@ -193,23 +195,25 @@ func startRevisionListener(ctx context.Context, wg *sync.WaitGroup, config *pgx.
 }
 
 // listenOnce holds one connection for as long as it stays healthy. It returns
-// on the first error so the caller can reconnect.
-func listenOnce(ctx context.Context, config *pgx.ConnConfig, revs chan<- int64) error {
+// on the first error so the caller can reconnect. healthyFor is the time the
+// connection was up, zero when the connect failed.
+func listenOnce(ctx context.Context, config *pgx.ConnConfig, revs chan<- int64) (healthyFor time.Duration, err error) {
 	conn, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	connected := time.Now()
 	defer func() { _ = conn.Close(context.Background()) }()
 
 	if _, err := conn.Exec(ctx, "LISTEN "+RevisionChannel); err != nil {
-		return err
+		return time.Since(connected), err
 	}
 	logrus.Debugf("kine listening for revision notifications on %s", RevisionChannel)
 
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return err
+			return time.Since(connected), err
 		}
 		forwardRevision(n.Payload, revs)
 	}

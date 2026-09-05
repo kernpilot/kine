@@ -21,7 +21,7 @@ git fetch upstream --tags                       # k3s-io/kine
 git fetch origin upstream-master:upstream-master # the mirror branch, from origin
 git checkout upstream-master && git merge --ff-only upstream/master
 git push origin upstream-master
-git checkout main && git rebase upstream-master
+git checkout main && git rebase upstream-master   # replays every fork commit (P1, docs, benchmarks)
 # resolve using the rules below, then:
 go test ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/   # P1 unit tests, hermetic
 cd benchmarks && ./verify-patches.sh     # re-measures every claim in CHANGELOG.md
@@ -179,10 +179,14 @@ verify a release (no key, no account):
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github\.com/kernpilot/kine/\.github/workflows/publish-kubehz\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/kernpilot/kine/\.github/workflows/publish-kubehz\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-kubehz\.[0-9]+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/kernpilot/kine@sha256:<digest>
 ```
+
+The ref anchor matters: the workflow also runs on `workflow_dispatch` from
+any branch (edge builds, tagged by sha), and those images are signed too.
+Only a `v*-kubehz.*` tag ref passes the command above.
 
 `v0.17.0-kubehz.1` predates the signing lane and is unsigned; see the
 CHANGELOG release section.

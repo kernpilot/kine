@@ -85,11 +85,14 @@ func TestKubehzP1ExternalRevisionWakesPoll(t *testing.T) {
 		for range result { //nolint:revive // drain until poll closes it
 		}
 	}()
+	start := time.Now()
 	go s.poll(result, 1)
 
 	// Every window below is well under the 1 s fallback ticker, so a poll
-	// inside one can only come from the external channel.
-	const quiet, wake = 150 * time.Millisecond, 300 * time.Millisecond
+	// inside one can only come from the external channel. A wake takes
+	// microseconds; the negative windows are short so the whole run stays
+	// far from the ticker even on a slow runner.
+	const quiet, wake = 50 * time.Millisecond, 300 * time.Millisecond
 
 	select {
 	case <-d.after:
@@ -110,5 +113,10 @@ func TestKubehzP1ExternalRevisionWakesPoll(t *testing.T) {
 	case <-d.after:
 	case <-time.After(wake):
 		t.Fatalf("an external revision did not wake poll within %s; only the 1 s ticker would", wake)
+	}
+	// Guard the assertion itself: past 1 s the ticker could have produced
+	// that poll, and a pass would say nothing.
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("run took %s; the 1 s ticker could have produced the poll, rerun on a quieter machine", elapsed)
 	}
 }

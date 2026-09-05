@@ -129,16 +129,22 @@ jobs:
             --predicate kine.spdx.json \
             "${IMAGE}@${DIGEST}"
 
-      # The gate that makes "signed" more than a word: the EXACT commands
-      # kubehz/MERGE-GUIDE.md hands to a consumer, against the public image,
-      # with no registry credentials in play. The identity regexp is anchored
-      # on this repo and this workflow file.
+      # The gate that makes "signed" more than a word: the commands
+      # kubehz/MERGE-GUIDE.md hands to a consumer, against the public image.
+      # The runner logs out of GHCR first, so this also proves the image is
+      # readable with no credentials, which is how tenant machines pull it.
+      # The identity is anchored on this repo, this workflow file AND the
+      # exact ref that produced the digest: the consumer recipe anchors on
+      # refs/tags/v*-kubehz.*, so a workflow_dispatch edge build from a
+      # branch signs, verifies here, and still fails the consumer's check.
       - name: Verify the signature and the SBOM attestation (as a consumer would)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          identity='^https://github\.com/kernpilot/kine/\.github/workflows/publish-kubehz\.yml@'
+          docker logout ghcr.io
+          identity="^https://github\.com/kernpilot/kine/\.github/workflows/publish-kubehz\.yml@${REF}$"
           cosign verify \
             --certificate-identity-regexp "${identity}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -147,7 +153,7 @@ jobs:
             --certificate-identity-regexp "${identity}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${IMAGE}@${DIGEST}" > /dev/null
-          echo "verified: ${IMAGE}@${DIGEST}"
+          echo "verified: ${IMAGE}@${DIGEST} signed from ${REF}"
 
       # Both architectures must be in the published index; a single-arch index
       # would only surface as CrashLoopBackOff on a tenant's arm64 node.
