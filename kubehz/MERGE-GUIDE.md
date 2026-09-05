@@ -186,7 +186,10 @@ cosign verify \
 
 The ref anchor matters: the workflow also runs on `workflow_dispatch` from
 any branch (edge builds, tagged by sha), and those images are signed too.
-Only a `v*-kubehz.*` tag ref passes the command above.
+Only a `v*-kubehz.*` tag ref passes the command above. A `workflow_dispatch`
+on an EXISTING tag ref rebuilds and re-pushes that version tag and moves
+`kubehz` to the new digest; the old digest stays valid and signed, which is
+why consumers pin the digest, not the tag.
 
 `v0.17.0-kubehz.1` predates the signing lane and is unsigned; see the
 CHANGELOG release section.

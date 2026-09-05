@@ -1,3 +1,6 @@
+// KUBEHZ-PATCH P1 — this whole file is ours (new file, conflict-free).
+//   see kubehz/MERGE-GUIDE.md#p1
+
 package pgsql
 
 import (
