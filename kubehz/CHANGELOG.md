@@ -10,7 +10,51 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ---
 
-## Unreleased — forked from `6fb95f5` (go1.26 / etcd 3.7 / kubernetes 1.37)
+## Unreleased
+
+### P1 hardening (no behaviour change on the happy path)
+
+- The notifier backs off on a failed `pg_notify` the same way the listener
+  backs off on a lost `LISTEN`: 1 s, doubling to 30 s (`reconnectBackoff`).
+  Before, an `Exec` error closed the connection and reconnected at once, so
+  a role or permission error reconnected every 10 ms: about 100 backend
+  forks and authentications per second per kine, forever.
+- The reset rule changed for both connections: the delay drops back to 1 s
+  only after a session that stayed **connected** for 30 s, measured from a
+  successful connect. Before, the listener reset after any session that
+  failed post-connect, so a connection that connected and failed at once
+  retried every second; and time spent in a hanging dial cannot count as
+  a healthy session.
+- `SQLLog.poll` drops the external channel once the driver closes it on
+  shutdown instead of spinning on the always-ready closed channel.
+- A notification payload must be a positive revision; `0` and negatives are
+  dropped like malformed text (they were forwarded and ignored by the poll).
+- Hermetic unit tests for `record`, payload parsing, the non-blocking
+  forward, the backoff, and the `case <-external:` arm waking `poll` on a
+  fake dialect (`pkg/drivers/pgsql/kubehz_notify_test.go`,
+  `pkg/logstructured/sqllog/kubehz_notify_test.go`). `unit.yml` fails when
+  they are missing, not only when they fail.
+- `publish-kubehz.yml` signs keyless with cosign, attaches buildkit
+  provenance (`mode=max`) and SBOM, attests a standalone SPDX SBOM and
+  verifies all of it before the run goes green. The next tag is the first
+  signed release and the first real run of that lane: expect the verify
+  gate, not a consumer, to find any cosign/registry mismatch.
+
+---
+
+## Released `v0.17.0-kubehz.1` — on upstream `v0.17.0` (`6fb95f5`); release commit `e1778aa`
+
+Image `ghcr.io/kernpilot/kine:v0.17.0-kubehz.1`, index digest
+
+```
+sha256:1f5ac8562e0b2a7b100f7be3c0d9cb572da3989859da581f255587a5515ea69a
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-09-05). Built by
+the pre-signing `publish-kubehz.yml`: **no cosign signature, SBOM or
+provenance on this image.** Consumers pin the tag today
+(`KUBEHZ_EXTCP_KINE_IMAGE`); pin the digest above instead, and move to the
+first signed release when it exists. Carries P1 only.
 
 ### P1 — cross-instance watch wake-up via coalesced LISTEN/NOTIFY
 
@@ -188,9 +232,9 @@ Carried here because they bound how kine can be deployed, not because they are
 fixed.
 
 - **A watch starting at revision 0 reads the entire table into memory, per
-  watcher, unbounded.** `logstructured.go:239` calls
+  watcher, unbounded.** `LogStructured.Watch` (`pkg/logstructured/logstructured.go`) calls
   `l.log.After(ctx, key, end, revision, 0)` — **limit zero** — and
-  `watch.go:145` passes the client's `StartRevision` through unsubstituted, so a
+  `watcher.Create` (`pkg/server/watch.go`) passes the client's `StartRevision` through unsubstituted, so a
   `clientv3` watch with no `WithRev()` sends 0 and gets the whole history
   materialised through `RowsToEvents`/`bytes.Clone`.
 
@@ -232,9 +276,9 @@ fixed.
 
 - **A dropped watcher would not be told it lost its place — but the drop path
   could not be reached.** `broadcaster.go` unsubscribes a subscriber whose
-  buffer is full, and `server/watch.go:243-247` then sends `Canceled: true` with
+  buffer is full, and the tail of `watcher.watch` (`pkg/server/watch.go`) then sends `Canceled: true` with
   **`CompactRevision: 0` and an empty reason**, where kine's own signal for an
-  invalid position (`watch.go:177`) is `Cancel(id, currentRev, compactRev,
+  invalid position (the compacted branch of the same function) is `Cancel(id, currentRev, compactRev,
   ErrCompacted)`. On that reading a reflector reconnects from its last
   resourceVersion and silently skips the lost events.
 
@@ -255,8 +299,8 @@ fixed.
   **So this is a code-visible hazard with no demonstrated trigger, and no patch
   is justified on present evidence.** The probe is committed so the attempt is
   cheap to repeat; the fix, if anyone reaches the path, is to pass
-  `wr.CompactRevision` and a reason into the `Cancel` at `watch.go:245` instead
-  of the literal zeros.
+  `wr.CompactRevision` and a reason into the final `Cancel` of `watcher.watch`
+  instead of the literal zeros.
 
 Neither `P2` nor `P3` is being carried. P2 was written, measured, found to
 change nothing, and reverted; P3's trigger could not be demonstrated. Both

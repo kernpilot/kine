@@ -12,12 +12,23 @@
 #     <upstream> = the k3s-io/kine tag the fork is rebased onto
 #     <n>        = patchset release counter on that base; a rebase onto a
 #                  newer upstream resets it to 1
-#   Releases are IMMUTABLE tags; `kubehz` is the moving latest-release tag.
+#   Release tags are immutable by convention only: GHCR does not enforce it.
+#   The digest is what consumers pin (KUBEHZ_EXTCP_KINE_IMAGE) and what
+#   kubehz/CHANGELOG.md records per release. `kubehz` is the moving
+#   latest-release tag, for humans.
+#
+# Supply chain, same lane as kubehz-agent's release.yaml: buildkit provenance
+# (mode=max) and SBOM inside the index, keyless cosign signature, a
+# cosign-attested SPDX SBOM, and a VERIFY gate that runs the exact commands a
+# consumer runs. If they cannot pass here, the image does not ship.
 #
 # Build: CGO_ENABLED=0 on purpose — nocgo drops only the sqlite/dqlite
 # drivers (cgo); postgres (the ONLY backend the extCP rung uses), mysql and
 # nats are pure Go. It also makes the multi-arch build trivial (no per-arch
 # musl toolchains) — tenant machines can be Hetzner ARM (cax).
+#
+# Actions are pinned by commit SHA; the trailing comment records the release
+# tag each SHA was resolved from (GitHub API, 2026-09-05). Bump both together.
 name: Publish kubehz image
 
 on:
@@ -25,23 +36,35 @@ on:
     tags: ['v*-kubehz.*']
   workflow_dispatch: # edge build from the current ref, tagged by sha only
 
+# Never cancel a publish mid-flight: a half-signed digest is worse than a
+# slow queue.
+concurrency:
+  group: publish-kubehz-${{ github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
-  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # keyless cosign via the Actions OIDC identity
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0 # scripts/version derives the binary version from git describe
 
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to GHCR
-        uses: docker/login-action@3d100841f68d4548bf57e52eb27bd33ec5069f55 # v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -49,21 +72,26 @@ jobs:
 
       - name: Image tags
         id: meta
-        uses: docker/metadata-action@318604b99e75e41977312d83839a89be02ca4893 # v5
+        uses: docker/metadata-action@318604b99e75e41977312d83839a89be02ca4893 # v5.9.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=tag
             type=raw,value=kubehz,enable=${{ startsWith(github.ref, 'refs/tags/') }}
             type=sha,format=long
 
+      # provenance=mode=max attaches the full SLSA build provenance; sbom=true
+      # attaches buildkit's own SPDX. Both ride INSIDE the image index.
       - name: Build and push (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           target: package
           push: true
           platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          sbom: true
           build-args: |
             CGO_ENABLED=0
             NOCGO=-nocgo
@@ -71,3 +99,93 @@ jobs:
             SKIP_VALIDATE=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless: the signing identity is this workflow's OIDC token, so there is
+      # no long-lived key to leak and the certificate names the exact workflow
+      # file + repo + ref that produced the digest.
+      - name: Sign the image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # A standalone, cosign-attested SPDX SBOM on top of buildkit's in-index
+      # one: the copy a consumer can fetch and diff without pulling the image.
+      - name: Generate the SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          artifact-name: kine.spdx.json
+          output-file: kine.spdx.json
+
+      - name: Attest the SBOM
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign attest --yes --type spdxjson \
+            --predicate kine.spdx.json \
+            "${IMAGE}@${DIGEST}"
+
+      # The gate that makes "signed" more than a word: the commands
+      # kubehz/MERGE-GUIDE.md hands to a consumer, against the public image.
+      # The runner logs out of GHCR first, so this also proves the image is
+      # readable with no credentials, which is how tenant machines pull it.
+      # The identity is anchored on this repo, this workflow file AND the
+      # exact ref that produced the digest: the consumer recipe anchors on
+      # refs/tags/v*-kubehz.*, so a workflow_dispatch edge build from a
+      # branch signs, verifies here, and still fails the consumer's check.
+      - name: Verify the signature and the SBOM attestation (as a consumer would)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          # REF goes into a regexp: escape its dots so "v0.17.0" cannot match "v0x17y0".
+          ref_re=$(printf '%s' "${REF}" | sed 's/\./\\./g')
+          identity="^https://github\.com/kernpilot/kine/\.github/workflows/publish-kubehz\.yml@${ref_re}$"
+          cosign verify \
+            --certificate-identity-regexp "${identity}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}" > /dev/null
+          cosign verify-attestation --type spdxjson \
+            --certificate-identity-regexp "${identity}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}" > /dev/null
+          echo "verified: ${IMAGE}@${DIGEST} signed from ${REF}"
+
+      # Both architectures must be in the published index; a single-arch index
+      # would only surface as CrashLoopBackOff on a tenant's arm64 node.
+      - name: Assert the index carries amd64 + arm64
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          platforms=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}" \
+            | jq -r '.manifests[] | select(.platform.os != "unknown")
+                     | "\(.platform.os)/\(.platform.architecture)"' | sort -u)
+          echo "${platforms}"
+          for want in linux/amd64 linux/arm64; do
+            printf '%s\n' "${platforms}" | grep -qx "${want}" \
+              || { echo "::error::published index is missing ${want}"; exit 1; }
+          done
+
+      # The digest is the release record: copy it into the "Released" section
+      # of kubehz/CHANGELOG.md and into KUBEHZ_EXTCP_KINE_IMAGE.
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## ${REF}"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Record this digest in kubehz/CHANGELOG.md (Released section) and pin it in the operator."
+          } >> "$GITHUB_STEP_SUMMARY"

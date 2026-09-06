@@ -150,7 +150,10 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	return true, logstructured.New(sqllog.New(backend, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
 }
 
-// KUBEHZ-PATCH P1 (types) — everything below to the end of the file is ours.
+// KUBEHZ-PATCH P1 (types) BEGIN — the notifyingDialect type and its methods,
+// down to the END marker after RevisionNotify. setup, createDBIfNotExist,
+// prepareConfig and init below that marker are upstream's; take upstream's
+// side there.
 // notifyingDialect adds cross-instance revision wake-ups to the generic
 // dialect. It changes nothing about how data is read or written — the channel
 // is a hint that a poll is worth doing now rather than at the next tick.
@@ -164,8 +167,8 @@ type notifyingDialect struct {
 // unchanged. The recording is a single atomic compare-and-swap; the NOTIFY
 // itself happens on another goroutine and another connection, so the write
 // path never pays for it.
-func (n *notifyingDialect) Insert(ctx context.Context, key string, create, delete bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
-	rev, err := n.Generic.Insert(ctx, key, create, delete, createRevision, previousRevision, ttl, value)
+func (n *notifyingDialect) Insert(ctx context.Context, key string, create, del bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
+	rev, err := n.Generic.Insert(ctx, key, create, del, createRevision, previousRevision, ttl, value)
 	if err == nil && rev > 0 {
 		n.notifier.record(rev)
 	}
@@ -174,6 +177,8 @@ func (n *notifyingDialect) Insert(ctx context.Context, key string, create, delet
 
 // RevisionNotify satisfies the optional interface the poll loop looks for.
 func (n *notifyingDialect) RevisionNotify() <-chan int64 { return n.revs }
+
+// KUBEHZ-PATCH P1 END
 
 func setup(db *sql.DB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")
@@ -308,5 +313,3 @@ func init() {
 	drivers.Register("postgres", New)
 	drivers.Register("postgresql", New)
 }
-
-// KUBEHZ-PATCH P1 END
