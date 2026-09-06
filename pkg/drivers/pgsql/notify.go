@@ -1,3 +1,6 @@
+// KUBEHZ-PATCH P1 — this whole file is ours (new file, conflict-free).
+//   see kubehz/MERGE-GUIDE.md#p1
+
 package pgsql
 
 import (
@@ -33,13 +36,49 @@ const RevisionChannel = "kine_revision"
 // instance watcher waits ~10 ms instead of up to a second.
 const notifyInterval = 10 * time.Millisecond
 
+const (
+	reconnectFloor = time.Second
+	reconnectCap   = 30 * time.Second
+)
+
+// reconnectBackoff is the retry delay the two background connections share:
+// 1 s, doubling to 30 s. The notifier's 10 ms ticker must never become its
+// reconnect interval: a role or permission error on pg_notify would then
+// reconnect every 10 ms, about 100 backend forks and authentications per
+// second per kine, forever.
+type reconnectBackoff struct {
+	next time.Duration
+}
+
+// delay returns the wait before the next connection attempt and doubles it
+// for the attempt after, up to reconnectCap.
+func (b *reconnectBackoff) delay() time.Duration {
+	if b.next < reconnectFloor {
+		b.next = reconnectFloor
+	}
+	d := b.next
+	b.next = min(d*2, reconnectCap)
+	return d
+}
+
+// settle resets the delay after a session that stayed connected for at
+// least reconnectCap. A shorter session counts as part of the same outage, so
+// a connection that connects and fails at once keeps backing off. Time spent
+// connecting does not count: healthyFor is measured from a successful
+// connect, so a dial that hangs and then fails cannot reset the delay.
+func (b *reconnectBackoff) settle(healthyFor time.Duration) {
+	if healthyFor >= reconnectCap {
+		b.next = 0
+	}
+}
+
 // revisionNotifier coalesces revision announcements onto one connection.
 type revisionNotifier struct {
 	latest atomic.Int64 // highest revision inserted by THIS kine instance
 }
 
 // record marks a revision as worth announcing. Called on the write path, so it
-// must stay this cheap — no locks, no I/O.
+// must stay this cheap — no locks, no I/O. Never moves latest backwards.
 func (r *revisionNotifier) record(rev int64) {
 	for {
 		cur := r.latest.Load()
@@ -56,37 +95,56 @@ func (r *revisionNotifier) run(ctx context.Context, wg *sync.WaitGroup, config *
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var sent int64
+		var (
+			sent    int64
+			backoff reconnectBackoff
+		)
 		for ctx.Err() == nil {
-			conn, err := pgx.ConnectConfig(ctx, config)
-			if err != nil {
-				if !sleepCtx(ctx, time.Second) {
-					return
-				}
-				continue
+			healthyFor, err := r.notifyOnce(ctx, config, &sent)
+			if ctx.Err() != nil {
+				return
 			}
-			tick := time.NewTicker(notifyInterval)
-			for ctx.Err() == nil {
-				select {
-				case <-ctx.Done():
-					tick.Stop()
-					conn.Close(context.Background())
-					return
-				case <-tick.C:
-				}
-				rev := r.latest.Load()
-				if rev <= sent {
-					continue
-				}
-				if _, err := conn.Exec(ctx, "SELECT pg_notify($1, $2)", RevisionChannel, strconv.FormatInt(rev, 10)); err != nil {
-					break // reconnect; the peer's ticker still covers us
-				}
-				sent = rev
+			// Losing the notifier is not fatal: peers fall back to their
+			// poll ticker. Log at info, back off, retry.
+			backoff.settle(healthyFor)
+			d := backoff.delay()
+			logrus.Infof("kine revision notifier disconnected, retrying in %s: %v", d, err)
+			if !sleepCtx(ctx, d) {
+				return
 			}
-			tick.Stop()
-			conn.Close(context.Background())
 		}
 	}()
+}
+
+// notifyOnce holds one connection and announces the highest recorded revision
+// at most once per notifyInterval, until the connection fails. sent outlives
+// the connection so a reconnect announces only what is still unannounced.
+// healthyFor is the time the connection was up, zero when the connect failed.
+func (r *revisionNotifier) notifyOnce(ctx context.Context, config *pgx.ConnConfig, sent *int64) (healthyFor time.Duration, err error) {
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		return 0, err
+	}
+	connected := time.Now()
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	tick := time.NewTicker(notifyInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return time.Since(connected), ctx.Err()
+		case <-tick.C:
+		}
+		rev := r.latest.Load()
+		if rev <= *sent {
+			continue
+		}
+		if _, err := conn.Exec(ctx, "SELECT pg_notify($1, $2)", RevisionChannel, strconv.FormatInt(rev, 10)); err != nil {
+			return time.Since(connected), err // reconnect; the peer's ticker still covers us
+		}
+		*sent = rev
+	}
 }
 
 // startRevisionListener opens a DEDICATED connection, LISTENs on
@@ -99,10 +157,11 @@ func (r *revisionNotifier) run(ctx context.Context, wg *sync.WaitGroup, config *
 // already the largest failure mode kine has.
 //
 // WHY THIS EXISTS AT ALL: kine signals its own poll loop in-process on every
-// insert (sqllog/sql.go:660), so a SINGLE kine wakes its watchers in
-// milliseconds. That signal does not cross a process boundary. With two kine
-// instances on one database, a watcher on the instance that did not receive the
-// write waits for its 1 s fallback ticker — measured at p50 715 ms.
+// insert (SQLLog.Append sends on s.notify, sqllog/sql.go), so a SINGLE kine
+// wakes its watchers in milliseconds. That signal does not cross a process
+// boundary. With two kine instances on one database, a watcher on the instance
+// that did not receive the write waits for its 1 s fallback ticker — measured
+// at p50 715 ms.
 //
 // THIS IS A WAKE-UP HINT, NEVER A SOURCE OF TRUTH. Notifications fire on COMMIT
 // and are not durable: a disconnected listener loses everything sent while it
@@ -117,25 +176,21 @@ func startRevisionListener(ctx context.Context, wg *sync.WaitGroup, config *pgx.
 		defer wg.Done()
 		defer close(revs)
 
-		backoff := time.Second
+		var backoff reconnectBackoff
 		for ctx.Err() == nil {
-			if err := listenOnce(ctx, config, revs); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				// Losing the listener is not fatal: the poll loop's ticker
-				// still delivers every event, just later. Log at info so an
-				// operator can correlate a latency change with it, and retry.
-				logrus.Infof("kine revision listener disconnected, retrying in %s: %v", backoff, err)
-				if !sleepCtx(ctx, backoff) {
-					return
-				}
-				if backoff < 30*time.Second {
-					backoff *= 2
-				}
-				continue
+			healthyFor, err := listenOnce(ctx, config, revs)
+			if ctx.Err() != nil {
+				return
 			}
-			backoff = time.Second
+			// Losing the listener is not fatal: the poll loop's ticker
+			// still delivers every event, just later. Log at info so an
+			// operator can correlate a latency change with it, and retry.
+			backoff.settle(healthyFor)
+			d := backoff.delay()
+			logrus.Infof("kine revision listener disconnected, retrying in %s: %v", d, err)
+			if !sleepCtx(ctx, d) {
+				return
+			}
 		}
 	}()
 
@@ -143,35 +198,55 @@ func startRevisionListener(ctx context.Context, wg *sync.WaitGroup, config *pgx.
 }
 
 // listenOnce holds one connection for as long as it stays healthy. It returns
-// on the first error so the caller can reconnect.
-func listenOnce(ctx context.Context, config *pgx.ConnConfig, revs chan<- int64) error {
+// on the first error so the caller can reconnect. healthyFor is the time the
+// connection was up, zero when the connect failed.
+func listenOnce(ctx context.Context, config *pgx.ConnConfig, revs chan<- int64) (healthyFor time.Duration, err error) {
 	conn, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer conn.Close(context.Background())
+	connected := time.Now()
+	defer func() { _ = conn.Close(context.Background()) }()
 
 	if _, err := conn.Exec(ctx, "LISTEN "+RevisionChannel); err != nil {
-		return err
+		return time.Since(connected), err
 	}
 	logrus.Debugf("kine listening for revision notifications on %s", RevisionChannel)
 
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return err
+			return time.Since(connected), err
 		}
-		rev, err := strconv.ParseInt(n.Payload, 10, 64)
-		if err != nil {
-			continue // not ours, or malformed; the poll loop still covers it
-		}
-		// Non-blocking on purpose. If the consumer is behind, the revisions
-		// already queued wake it just as well, and blocking here would stall
-		// the listener behind a slow poll loop.
-		select {
-		case revs <- rev:
-		default:
-		}
+		forwardRevision(n.Payload, revs)
+	}
+}
+
+// parseRevision reads a notification payload: a positive revision id in
+// decimal and nothing else. Anything else is not ours or malformed and is
+// dropped; the poll ticker still covers whatever it meant to announce.
+func parseRevision(payload string) (int64, bool) {
+	rev, err := strconv.ParseInt(payload, 10, 64)
+	if err != nil || rev <= 0 {
+		return 0, false
+	}
+	return rev, true
+}
+
+// forwardRevision hands a parsed payload to the poll loop without blocking and
+// reports whether it was queued. If the consumer is behind, the revisions
+// already queued wake it just as well, and blocking here would stall the
+// listener behind a slow poll loop.
+func forwardRevision(payload string, revs chan<- int64) bool {
+	rev, ok := parseRevision(payload)
+	if !ok {
+		return false
+	}
+	select {
+	case revs <- rev:
+		return true
+	default:
+		return false
 	}
 }
 

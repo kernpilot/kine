@@ -18,12 +18,23 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. The file our changes concentrate in,
-`pkg/broadcaster/broadcaster.go`, has had **one commit in twelve months**, so
-carrying a patch there costs almost nothing to maintain. Where a change would
-land in a file upstream churns — `sqllog/sql.go` sees ~21 commits a year — the
-patch is written to be dropped cheaply, and is a candidate for upstreaming
-rather than indefinite carrying.
+The fork is deliberately narrow. It carries one patch, P1, which touches
+three files: `pkg/drivers/pgsql/notify.go` is new and cannot conflict;
+`pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go` carry
+small marker-wrapped edits. `sqllog/sql.go` is a file upstream churns (~21
+commits a year), so that edit is written to be dropped cheaply, and is a
+candidate for upstreaming rather than indefinite carrying. Beside the three
+source files, the fork carries its own tests (`pkg/drivers/pgsql/
+kubehz_notify_test.go`, `pkg/logstructured/sqllog/kubehz_notify_test.go`),
+two workflow files (`unit.yml` gains a P1 step, `publish-kubehz.yml` is
+ours), a few `.gitignore` lines, and the `kubehz/` and `benchmarks/`
+directories. Nothing else differs from upstream; the check is
+
+```bash
+git diff --stat upstream-master..main -- . ':!benchmarks' ':!kubehz' ':!.github' ':!.gitignore' ':!**/kubehz_*_test.go'
+```
+
+which must list exactly `notify.go`, `pgsql.go` and `sqllog/sql.go`.
 
 ## Principles
 

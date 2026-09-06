@@ -75,3 +75,8 @@ kine-upstream
 kine-bench
 kine-e1
 benchmarks/dropprobe/dropprobe
+
+# density-wall sweeps (kubehz/CHANGELOG.md, D5): one JSON per tenant per
+# arm, ~1 400 files that say nothing benchmarks/results/d5-wall.txt does not.
+# Summary files in benchmarks/results/ stay tracked.
+benchmarks/results/d5-*-n*-t*.json
