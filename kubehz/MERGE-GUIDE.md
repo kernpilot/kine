@@ -191,5 +191,6 @@ on an EXISTING tag ref rebuilds and re-pushes that version tag and moves
 `kubehz` to the new digest; the old digest stays valid and signed, which is
 why consumers pin the digest, not the tag.
 
+`v0.17.0-kubehz.2` is the first signed release.
 `v0.17.0-kubehz.1` predates the signing lane and is unsigned; see the
 CHANGELOG release section.
