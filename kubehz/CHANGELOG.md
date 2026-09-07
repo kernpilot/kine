@@ -12,6 +12,27 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+Nothing yet.
+
+---
+
+## Released `v0.17.0-kubehz.2` — on upstream `v0.17.0` (`6fb95f5`); release commit `14e6b9d`
+
+Image `ghcr.io/kernpilot/kine:v0.17.0-kubehz.2`, index digest
+
+```
+sha256:cec411fcd1dd8b778b4aae637dc479b31661bbe8d04dd7beed326a061308d0f8
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-09-07). The first
+release built by the signed `publish-kubehz.yml`: keyless cosign signature,
+buildkit provenance and SBOM in the index, and an attested SPDX SBOM.
+Verified with the MERGE-GUIDE command (`cosign verify`, identity
+`publish-kubehz.yml@refs/tags/v0.17.0-kubehz.2`) and
+`cosign verify-attestation --type spdxjson`; both pass, and the run's own
+verify gate passed first. Consumers pin the digest above
+(`KUBEHZ_EXTCP_KINE_IMAGE`). Carries P1 with the hardening below.
+
 ### P1 hardening (no behaviour change on the happy path)
 
 - The notifier backs off on a failed `pg_notify` the same way the listener
@@ -36,9 +57,9 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
   they are missing, not only when they fail.
 - `publish-kubehz.yml` signs keyless with cosign, attaches buildkit
   provenance (`mode=max`) and SBOM, attests a standalone SPDX SBOM and
-  verifies all of it before the run goes green. The next tag is the first
-  signed release and the first real run of that lane: expect the verify
-  gate, not a consumer, to find any cosign/registry mismatch.
+  verifies all of it before the run goes green. This tag is the first
+  signed release and the first real run of that lane; the verify gate
+  passed on the first run.
 
 ---
 
