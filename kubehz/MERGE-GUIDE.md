@@ -195,6 +195,46 @@ calls must be refused. If upstream adds its own size limit, drop P2 and map
 
 **Re-verify** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`.
 
+### P3 — storage parameters on the kine table
+
+**Files** `pkg/drivers/pgsql/kubehz_reloptions.go` (new, conflict-free).
+`pkg/drivers/pgsql/pgsql.go`: the `WITH (...)` clause on the `CREATE TABLE`
+statement in `schema[0]`, and one call in `New()` after `setup()`. Test
+`pkg/drivers/pgsql/kubehz_reloptions_test.go`. `unit.yml` fails when it is
+missing.
+
+**Problem.** With PostgreSQL's defaults, autovacuum runs after 20 % of the
+table changed and autoanalyze after 10 %. On a per-tenant kine table that
+means the file carries up to a fifth of dead rows above live data, and
+P2's `avg_width` can be a tenth of the table stale.
+
+**Approach.** The table carries `autovacuum_vacuum_scale_factor = 0.05`
+and `autovacuum_analyze_scale_factor = 0.02`. A new table gets them from
+the `CREATE TABLE ... WITH (...)` clause. An existing table gets an
+idempotent `ALTER TABLE kine SET (...)` at startup for the parameters that
+differ in `pg_class.reloptions` (read as one string through
+`array_to_string`), with one INFO line. Only the pgsql driver has this.
+
+**Invariant.** The parameters live in one map, `kineRelOptions`. The
+`ALTER` statement renders from it, and the test pins the `CREATE TABLE`
+clause to the same rendering, so the two cannot drift apart. A failed
+`ALTER` is a warning, never a failed start.
+
+**If it conflicts.** Upstream edits the `CREATE TABLE` statement rarely but
+does. Keep upstream's column list and re-append the `WITH` clause after
+the closing parenthesis. `TestKubehzP3CreateTableCarriesRelOptions` fails
+if the clause is missing or lands before the column list. If upstream adds
+its own storage parameters, merge them and keep the lower value for these
+two. If upstream restructures `New()`, the only requirement is that
+`ensureRelOptions` runs after the table exists and before serving.
+
+**Re-verify after an upstream merge.** The `CREATE TABLE IF NOT EXISTS
+kine` statement in `pgsql.go` ends with the clause
+`TestKubehzP3CreateTableCarriesRelOptions` expects, and
+`go test -tags=test -race -run TestKubehzP3 ./pkg/drivers/pgsql/` passes.
+Against a real PostgreSQL: `SELECT reloptions FROM pg_class WHERE relname =
+'kine'` lists both parameters after one start.
+
 ## Patches considered and deliberately NOT taken
 
 Recorded so nobody spends the effort twice. Each was measured.

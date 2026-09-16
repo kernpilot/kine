@@ -33,6 +33,10 @@ carries marker-wrapped edits in `pkg/app/app.go` (the flag),
 `pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
 and `pkg/logstructured/sqllog/sql.go` (one forwarding method each).
 
+P3 (storage parameters on the kine table) adds
+`pkg/drivers/pgsql/kubehz_reloptions.go` and touches the `CREATE TABLE`
+statement and `New()` in `pkg/drivers/pgsql/pgsql.go`.
+
 Beside those source files, the fork carries its own tests (every
 `kubehz_*_test.go`), two workflow files (`unit.yml` gains a step per patch,
 `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the `kubehz/`
@@ -44,7 +48,8 @@ git diff --stat upstream-master..main -- . ':!benchmarks' ':!kubehz' ':!.github'
 ```
 
 which must list exactly `pgsql/notify.go`, `pgsql/pgsql.go`,
-`pgsql/kubehz_quota.go`, `sqllog/sql.go`, `logstructured.go`,
+`pgsql/kubehz_quota.go`, `pgsql/kubehz_reloptions.go`, `sqllog/sql.go`,
+`logstructured.go`,
 `server/kubehz_quota.go`, `metrics/kubehz_quota.go`, `app/app.go`,
 `endpoint/endpoint.go` and `server/kv.go`.
 

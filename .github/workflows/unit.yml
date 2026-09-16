@@ -64,3 +64,12 @@ jobs:
         done
         # shellcheck disable=SC2086 # $pkgs is a space-separated list on purpose
         go test -tags=test -count=1 -race -run 'TestKubehzP2' $pkgs
+
+    # kubehz fork: same guard for the P3 tests (kubehz/MERGE-GUIDE.md#p3).
+    - name: kubehz P3 tests exist and pass
+      run: |
+        set -euo pipefail
+        names=$(go test -tags=test -list 'TestKubehzP3' ./pkg/drivers/pgsql/)
+        grep -q '^TestKubehzP3' <<<"$names" \
+          || { echo "::error::no TestKubehzP3* test in ./pkg/drivers/pgsql/ (see kubehz/MERGE-GUIDE.md)"; exit 1; }
+        go test -tags=test -count=1 -race -run 'TestKubehzP3' ./pkg/drivers/pgsql/

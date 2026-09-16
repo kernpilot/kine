@@ -12,6 +12,37 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+### P3 — storage parameters on the kine table
+
+Adds `pkg/drivers/pgsql/kubehz_reloptions.go`. Touches the `CREATE TABLE`
+statement and `New()` in `pkg/drivers/pgsql/pgsql.go`.
+
+**What.** The kine table carries `autovacuum_vacuum_scale_factor = 0.05`
+and `autovacuum_analyze_scale_factor = 0.02` (PostgreSQL's defaults are 0.2
+and 0.1). A new table gets them from `CREATE TABLE ... WITH (...)`. An
+existing table (a fork upgrade) gets one `ALTER TABLE kine SET (...)` at
+startup for the parameters that differ in `pg_class.reloptions`, with one
+INFO line. A table that already carries them causes no statement and no
+line. Only the pgsql driver has this. sqlite and the others are untouched.
+
+**Why.** Two reasons, both about P2. A lower vacuum threshold shrinks the
+plateau slack the file carries above live data, the slack
+`kine_db_size_bytes` shows. And P2's compared figure, `n_live_tup ×
+avg_width`, takes the width from the last `ANALYZE`, so a low analyze
+threshold keeps the limit honest after the row shape changes (larger
+objects, a new CRD).
+
+**Not a correctness patch.** If the `ALTER` fails (a role without `ALTER`
+on the table), kine logs a warning and starts. CockroachDB, which upstream
+tolerates through a collation switch in `setup()`, rejects table storage
+parameters; this fork is PostgreSQL-only (see the image release notes) and
+does not carry that case.
+
+**Re-check** `go test -tags=test -race -run TestKubehzP3 ./pkg/drivers/pgsql/`:
+the `CREATE TABLE` statement carries the clause, and the `ALTER` path is
+chosen exactly when the reloptions differ. The database round trip is not
+run in CI.
+
 ### P2 — per-database size limit (`--quota-bytes`)
 
 Adds `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go` and
