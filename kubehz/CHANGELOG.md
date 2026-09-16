@@ -12,7 +12,46 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
-Nothing yet.
+### P2 — per-database size limit (`--quota-bytes`)
+
+Adds `pkg/server/kubehz_quota.go` and `pkg/metrics/kubehz_quota.go`.
+Touches `pkg/app/app.go`, `pkg/endpoint/endpoint.go` and `pkg/server/kv.go`.
+
+**Why.** kine has no size limit: `Alarm` is unsupported, there is no quota
+flag, and PostgreSQL has no per-database quota. A kine per tenant on a
+shared PostgreSQL therefore lets one tenant fill the shard. etcd has
+`--quota-backend-bytes`. Above it the capped applier refuses puts with
+`ErrGRPCNoSpace` and keeps reads, deletes and compaction working, so the
+client can free space. The apiserver already handles that error.
+
+**What.** `--quota-bytes <n>` (`KINE_QUOTA_BYTES`), default 0 = no limit,
+so an existing deployment changes nothing. With a limit, the size the
+`Status` RPC already reports (`pg_total_relation_size('kine')` on
+PostgreSQL) is sampled once at start and then every 30 s. At or above the
+limit, `Put` and every `Txn` that puts return etcd's error, same gRPC code
+(`ResourceExhausted`) and message (`etcdserver: mvcc: database space
+exceeded`). Range, Watch, delete transactions, `Compact` and the
+apiserver's compaction bookkeeping key keep working. One INFO line when the
+limit is first reached, one when the size is below it again. Two gauges,
+registered only with a limit: `kine_quota_bytes`, `kine_db_size_bytes`.
+A refused write is not logged per request (upstream logs every write error
+with the full request). The transition lines are the signal.
+
+**One difference from etcd, on purpose.** etcd refuses every transaction
+with a put, the apiserver's compaction bookkeeping included. On kine a
+delete is an insert (a tombstone row), so above the limit only compaction
+makes the table smaller, and the apiserver compacts only after it wrote
+that key. The key stays writable, so a full database has a way out that is
+not a bigger limit.
+
+**Not a benchmark patch.** This is a safety bound, not an optimisation, so
+there is no number to re-measure. The write path pays one atomic load, and
+the sampler one catalog query per 30 s.
+
+**Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/`
+(`unit.yml` fails when the tests are missing, not only when they fail).
+Mutation-checked: with the `Full()` check removed from the wrapper's
+`Create`, `TestKubehzP2Limit` fails on `Put above the limit`.
 
 ---
 

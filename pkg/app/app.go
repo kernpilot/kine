@@ -209,6 +209,15 @@ func New() *cli.App {
 			Value:       500,
 			EnvVars:     []string{"KINE_POLL_BATCH_SIZE"},
 		},
+		// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+		&cli.Int64Flag{
+			Name:        "quota-bytes",
+			Usage:       "Maximum database size in bytes. At or above it, puts return the etcd no-space error until the database is smaller again; reads, deletes, watches and compaction continue. 0 means no limit. Default is 0.",
+			Destination: &config.QuotaBytes,
+			Value:       0,
+			EnvVars:     []string{"KINE_QUOTA_BYTES"},
+		},
+		// KUBEHZ-PATCH P2 END
 		&cli.StringFlag{
 			Name:        "peer-bind-address",
 			Usage:       "gRPC listen address (host:port) for the t4 peer WAL-streaming server. Empty means single-node mode. Example: 0.0.0.0:3380.",

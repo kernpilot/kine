@@ -56,6 +56,10 @@ type Config struct {
 	LogFormat             string
 	PeerConfig            drivers.PeerConfig
 	S3Config              drivers.S3Config
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// QuotaBytes is the database size limit in bytes. 0 means no limit.
+	QuotaBytes int64
+	// KUBEHZ-PATCH P2 END
 }
 
 type ETCDConfig struct {
@@ -134,6 +138,26 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 	if err := backend.Start(bctx); err != nil {
 		return ETCDConfig{}, fmt.Errorf("starting kine backend: %w", err)
 	}
+
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: with --quota-bytes > 0 the backend handed to server.New is
+	//   wrapped by server.WithQuota, the size is sampled once here (so a
+	//   database already over the limit refuses from the first write) and then
+	//   every QuotaSampleInterval on bctx, which ends with the gRPC server.
+	// CONFLICT: keep upstream's order (Start, then New). The sampler must read
+	//   the size from the unwrapped backend; the wrapped one is what serves.
+	if config.QuotaBytes > 0 {
+		quota := server.NewQuota(config.QuotaBytes)
+		sizeOf := backend.DbSize
+		_ = quota.Sample(bctx, sizeOf)
+		go quota.Run(bctx, server.QuotaSampleInterval, sizeOf)
+		backend = server.WithQuota(backend, quota)
+		if config.MetricsRegisterer != nil {
+			config.MetricsRegisterer.MustRegister(metrics.QuotaBytes, metrics.DBSizeBytes)
+		}
+		logrus.Infof("quota: database size limit is %d bytes, sampled every %s", config.QuotaBytes, server.QuotaSampleInterval)
+	}
+	// KUBEHZ-PATCH P2 END
 
 	// set up GRPC server and register services
 	b := server.New(backend, endpointScheme(config), config.NotifyInterval, config.EmulatedETCDVersion)

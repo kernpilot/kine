@@ -122,6 +122,58 @@ a correctness fix.
 
 **Re-verify** `benchmarks/run-cross.sh` (two kine instances, one database).
 
+### P2 — per-database size limit (`--quota-bytes`)
+
+**Files** `pkg/server/kubehz_quota.go` (new, conflict-free),
+`pkg/metrics/kubehz_quota.go` (new, conflict-free), `pkg/app/app.go` (the
+flag), `pkg/endpoint/endpoint.go` (the config field and the wiring),
+`pkg/server/kv.go` (two log conditions). Tests
+`pkg/server/kubehz_quota_test.go` and `pkg/app/kubehz_quota_test.go`.
+`unit.yml` fails when they are missing.
+
+**Problem.** Upstream kine has no size limit: `Alarm` is unsupported, there
+is no quota flag, and PostgreSQL has no per-database quota. One kine per
+tenant on a shared PostgreSQL lets one tenant fill the shard. etcd caps the
+store with `--quota-backend-bytes`: above it the capped applier refuses
+puts with `ErrGRPCNoSpace` and keeps reads, deletes and compaction working,
+and the apiserver already handles that error.
+
+**Approach.** `--quota-bytes <n>`, default 0 = no limit. With a limit,
+`endpoint.Listen` wraps the backend in `server.WithQuota` and samples the
+size the `Status` RPC already reports (`Backend.DbSize`,
+`pg_total_relation_size('kine')` on PostgreSQL) once at start and then
+every `server.QuotaSampleInterval` (30 s). The wrapper returns
+`rpctypes.ErrGRPCNoSpace` from `Create` and `Update` while the last sample
+is at or above the limit. Everything else passes through. So `Put` and
+every `Txn` that puts are refused, while Range, Watch, delete transactions,
+`Compact` and the apiserver's compaction bookkeeping key (`compactRevAPI`)
+keep working. One INFO line on each transition. Two gauges,
+`kine_quota_bytes` and `kine_db_size_bytes`, registered only with a limit. `kv.go` skips the
+per-request error log for this one error, because the apiserver retries
+every refused write and that line prints the full request.
+
+**Invariant.** The size is sampled, never queried on the write path: a
+write costs one atomic load. A failed sample keeps the last value and never
+clears the limit. The compaction bookkeeping key stays writable above the
+limit: on kine a delete is an insert (a tombstone row), so compaction is the
+only thing that makes a full table smaller, and the apiserver compacts only
+after writing that key.
+
+**Not an optimisation.** This is a safety bound. There is no benchmark to
+re-measure. The test suite is the check.
+
+**If it conflicts.** The two new files never conflict. If upstream changes
+the flag table, re-add the one `Int64Flag`. If `endpoint.Listen` is
+restructured, keep upstream's order (backend `Start`, then `server.New`) and
+re-express the block: sample from the unwrapped backend, hand the wrapped
+one to `server.New`. If upstream changes `Backend` so that puts no longer
+go through `Create`/`Update`, move the check to whatever the new write
+methods are. The test on a fake backend shows which calls must be refused.
+If upstream adds its own size limit, drop P2 and map `--quota-bytes` onto
+it.
+
+**Re-verify** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/`.
+
 ## Patches considered and deliberately NOT taken
 
 Recorded so nobody spends the effort twice. Each was measured.

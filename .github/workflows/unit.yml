@@ -51,3 +51,14 @@ jobs:
             || { echo "::error::no TestKubehzP1* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
         done
         go test -tags=test -count=1 -race -run 'TestKubehzP1' ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/
+
+    # kubehz fork: same guard for the P2 tests (kubehz/MERGE-GUIDE.md#p2).
+    - name: kubehz P2 tests exist and pass
+      run: |
+        set -euo pipefail
+        for pkg in ./pkg/server/ ./pkg/app/; do
+          names=$(go test -tags=test -list 'TestKubehzP2' "$pkg")
+          grep -q '^TestKubehzP2' <<<"$names" \
+            || { echo "::error::no TestKubehzP2* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
+        done
+        go test -tags=test -count=1 -race -run 'TestKubehzP2' ./pkg/server/ ./pkg/app/
