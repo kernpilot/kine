@@ -124,11 +124,15 @@ a correctness fix.
 
 ### P2 — per-database size limit (`--quota-bytes`)
 
-**Files** `pkg/server/kubehz_quota.go` (new, conflict-free),
-`pkg/metrics/kubehz_quota.go` (new, conflict-free), `pkg/app/app.go` (the
-flag), `pkg/endpoint/endpoint.go` (the config field and the wiring),
-`pkg/server/kv.go` (two log conditions). Tests
-`pkg/server/kubehz_quota_test.go` and `pkg/app/kubehz_quota_test.go`.
+**Files** `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go` and
+`pkg/drivers/pgsql/kubehz_quota.go` (new, conflict-free). Edits: `pkg/app/app.go`
+(the flag), `pkg/endpoint/endpoint.go` (the config field and the wiring),
+`pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
+and `pkg/logstructured/sqllog/sql.go` (one forwarding method each). Tests
+`pkg/server/kubehz_quota_test.go`, `pkg/app/kubehz_quota_test.go`,
+`pkg/endpoint/kubehz_quota_test.go` (a real kine on sqlite through
+`Listen`), `pkg/drivers/pgsql/kubehz_quota_test.go` and
+`pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain).
 `unit.yml` fails when they are missing.
 
 **Problem.** Upstream kine has no size limit: `Alarm` is unsupported, there
@@ -139,40 +143,57 @@ puts with `ErrGRPCNoSpace` and keeps reads, deletes and compaction working,
 and the apiserver already handles that error.
 
 **Approach.** `--quota-bytes <n>`, default 0 = no limit. With a limit,
-`endpoint.Listen` wraps the backend in `server.WithQuota` and samples the
-size the `Status` RPC already reports (`Backend.DbSize`,
-`pg_total_relation_size('kine')` on PostgreSQL) once at start and then
-every `server.QuotaSampleInterval` (30 s). The wrapper returns
-`rpctypes.ErrGRPCNoSpace` from `Create` and `Update` while the last sample
-is at or above the limit. Everything else passes through. So `Put` and
-every `Txn` that puts are refused, while Range, Watch, delete transactions,
-`Compact` and the apiserver's compaction bookkeeping key (`compactRevAPI`)
-keep working. One INFO line on each transition. Two gauges,
-`kine_quota_bytes` and `kine_db_size_bytes`, registered only with a limit. `kv.go` skips the
-per-request error log for this one error, because the apiserver retries
-every refused write and that line prints the full request.
+`endpoint.Listen` wraps the backend in `server.WithQuota` and samples two
+figures once at start and then every `server.QuotaSampleInterval` (30 s):
+live data, which the limit compares, and the physical size the `Status`
+RPC already reports (`Backend.DbSize`), which only feeds a gauge. The
+wrapper returns `rpctypes.ErrGRPCNoSpace` from `Create` and `Update` while
+the last live sample is at or above the limit. Everything else passes
+through. So `Put` and every `Txn` that puts are refused (the apiserver's
+compaction bookkeeping key included, as in etcd), while Range, Watch,
+delete transactions and `Compact` keep working. One INFO line on each
+transition. Three gauges, `kine_quota_bytes`, `kine_live_bytes` and
+`kine_db_size_bytes`, registered only with a limit. `kv.go` skips the
+per-request error log for this one error: the apiserver answers 500, its
+clients and controllers retry, and that line prints the full request each
+time.
 
-**Invariant.** The size is sampled, never queried on the write path: a
+**Which bytes, and why.** On PostgreSQL the relation plateaus under
+autovacuum (kine's compaction deletes old revisions, autovacuum makes the
+space reusable), and after a write-then-delete spike the file stays large
+while live data is small. A limit on `pg_total_relation_size` would then
+refuse a customer who holds almost nothing, so the file is a capacity
+figure for whoever runs the PostgreSQL, and the limit is on live data. The
+pgsql driver estimates it as `n_live_tup × Σ avg_width` from
+`pg_stat_user_tables` and `pg_stats` (two catalog lookups, no scan, heap
+tuples only, 0 before the first `ANALYZE`). `pgstattuple_approx` would be
+closer but needs an extension the tenant role cannot create. The source travels as the
+optional interface `server.LiveSizer`, asserted at the call site like
+`RevisionNotify` in P1: the pgsql `notifyingDialect` offers it, `SQLLog`
+and `LogStructured` forward it, `endpoint.Listen` asks for it and falls
+back to `DbSize` when it gets nil (sqlite, the others).
+
+**Invariant.** The sizes are sampled, never queried on the write path: a
 write costs one atomic load. A failed sample keeps the last value and never
-clears the limit. The compaction bookkeeping key stays writable above the
-limit: on kine a delete is an insert (a tombstone row), so compaction is the
-only thing that makes a full table smaller, and the apiserver compacts only
-after writing that key.
+clears the limit. On PostgreSQL the compared figure is live data: if a
+rebase loses a forwarding method the limit silently becomes a file-size
+limit, which is why `TestKubehzP2LiveSizeChain` exists.
 
 **Not an optimisation.** This is a safety bound. There is no benchmark to
 re-measure. The test suite is the check.
 
-**If it conflicts.** The two new files never conflict. If upstream changes
+**If it conflicts.** The three new files never conflict. If upstream changes
 the flag table, re-add the one `Int64Flag`. If `endpoint.Listen` is
 restructured, keep upstream's order (backend `Start`, then `server.New`) and
 re-express the block: sample from the unwrapped backend, hand the wrapped
-one to `server.New`. If upstream changes `Backend` so that puts no longer
-go through `Create`/`Update`, move the check to whatever the new write
-methods are. The test on a fake backend shows which calls must be refused.
-If upstream adds its own size limit, drop P2 and map `--quota-bytes` onto
-it.
+one to `server.New`. The two forwarding methods are additions next to
+`DbSize`. Re-add them wherever `DbSize` lands. If upstream changes `Backend`
+so that puts no longer go through `Create`/`Update`, move the check to
+whatever the new write methods are. The test on a fake backend shows which
+calls must be refused. If upstream adds its own size limit, drop P2 and map
+`--quota-bytes` onto it.
 
-**Re-verify** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/`.
+**Re-verify** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`.
 
 ## Patches considered and deliberately NOT taken
 

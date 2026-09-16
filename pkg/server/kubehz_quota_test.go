@@ -25,11 +25,12 @@ var errNotUsed = errors.New("not used by this test")
 // quotaFake records which writes reached the backend. Every write succeeds,
 // so a refused write can only have been refused by the quota wrapper.
 type quotaFake struct {
-	creates []string
-	updates []string
-	deletes []string
-	size    atomic.Int64
-	sizeErr atomic.Pointer[error]
+	creates   []string
+	updates   []string
+	deletes   []string
+	size      atomic.Int64
+	sizeErr   atomic.Pointer[error]
+	sizeReads atomic.Int64
 }
 
 func (f *quotaFake) Start(context.Context) error { return nil }
@@ -64,6 +65,7 @@ func (f *quotaFake) Update(_ context.Context, key string, _ []byte, _, _ int64) 
 func (f *quotaFake) Watch(context.Context, string, string, int64) WatchResult { return WatchResult{} }
 
 func (f *quotaFake) DbSize(context.Context) (int64, error) {
+	f.sizeReads.Add(1)
 	if err := f.sizeErr.Load(); err != nil {
 		return 0, *err
 	}
@@ -77,6 +79,43 @@ func (f *quotaFake) WaitForSyncTo(int64)                            {}
 // compile-time check: the fake is a full Backend, so the wrapper's embedding
 // forwards every method it does not override.
 var _ Backend = (*quotaFake)(nil)
+
+// liveFake is a backend that reports live bytes apart from its size.
+type liveFake struct {
+	quotaFake
+	live atomic.Int64
+}
+
+func (f *liveFake) LiveSize() SizeSource {
+	return func(context.Context) (int64, error) { return f.live.Load(), nil }
+}
+
+// TestKubehzP2LiveSizeOf: a backend that offers LiveSizer yields its live
+// source; one that does not yields nil, so Listen falls back to DbSize.
+func TestKubehzP2LiveSizeOf(t *testing.T) {
+	if src := LiveSizeOf(&quotaFake{}); src != nil {
+		t.Fatal("a backend without LiveSizer yielded a source")
+	}
+	f := &liveFake{}
+	f.live.Store(42)
+	f.size.Store(4096)
+	src := LiveSizeOf(f)
+	if src == nil {
+		t.Fatal("a backend with LiveSizer yielded no source")
+	}
+	if n, err := src(context.Background()); err != nil || n != 42 {
+		t.Fatalf("live source: %d, %v; want 42", n, err)
+	}
+
+	// the limit compares the live figure, the physical one only feeds the gauge
+	quota := NewQuota(100)
+	if err := quota.Sample(context.Background(), src, f.DbSize); err != nil {
+		t.Fatal(err)
+	}
+	if quota.Full() || quota.Live() != 42 || quota.Physical() != 4096 {
+		t.Fatalf("live %d, physical %d, full %v; want 42, 4096, false", quota.Live(), quota.Physical(), quota.Full())
+	}
+}
 
 func putTxn(key string, modRev int64) *etcdserverpb.TxnRequest {
 	// the apiserver's create (modRev 0) and update (modRev > 0) transactions
@@ -144,9 +183,10 @@ func isNoSpace(err error) bool {
 }
 
 // TestKubehzP2Limit: below the limit every write reaches the backend; at and
-// above it, puts (Put, create and update transactions) get ErrNoSpace and
-// never reach the backend, while deletes, compaction and the compaction
-// bookkeeping key still do.
+// above it, every put (Put, the create and update transactions) gets
+// ErrNoSpace and never reaches the backend, the compaction-bookkeeping
+// transaction fails its compare instead of writing, while deletes, Compact
+// and Range still reach the backend. That is etcd's capped applier.
 func TestKubehzP2Limit(t *testing.T) {
 	const limit = 1000
 	ctx := context.Background()
@@ -175,12 +215,19 @@ func TestKubehzP2Limit(t *testing.T) {
 			checkWrite(t, "Txn create", err, tc.full)
 			_, err = l.Txn(ctx, putTxn("/c", 1))
 			checkWrite(t, "Txn update", err, tc.full)
+			// the bookkeeping put is refused too, but kine's compact path
+			// swallows backend errors and answers a failed compare, so the
+			// apiserver sees "someone else moved the key", not no-space
+			compact, err := l.Txn(ctx, compactTxn())
+			if err != nil {
+				t.Fatalf("Txn compact bookkeeping: %v", err)
+			}
+			if compact.Succeeded == tc.full {
+				t.Fatalf("Txn compact bookkeeping succeeded=%v with full=%v", compact.Succeeded, tc.full)
+			}
 
 			if _, err := l.Txn(ctx, deleteTxn("/a")); err != nil {
 				t.Fatalf("Txn delete: %v", err)
-			}
-			if _, err := l.Txn(ctx, compactTxn()); err != nil {
-				t.Fatalf("Txn compact: %v", err)
 			}
 			if _, err := l.Compact(ctx, &etcdserverpb.CompactionRequest{Revision: 1}); err != nil {
 				t.Fatalf("Compact: %v", err)
@@ -191,7 +238,7 @@ func TestKubehzP2Limit(t *testing.T) {
 
 			wantCreates := []string{"/a", "/b", string(compactRevAPI)}
 			if tc.full {
-				wantCreates = []string{string(compactRevAPI)}
+				wantCreates = nil
 			}
 			if strings.Join(fake.creates, ",") != strings.Join(wantCreates, ",") {
 				t.Fatalf("creates that reached the backend: %v, want %v", fake.creates, wantCreates)
@@ -240,6 +287,8 @@ func TestKubehzP2ZeroIsUnlimited(t *testing.T) {
 func TestKubehzP2LogLines(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
+	level := logrus.GetLevel()
+	t.Cleanup(func() { logrus.SetLevel(level) })
 	logrus.SetLevel(logrus.InfoLevel)
 
 	quota := NewQuota(100)
@@ -259,10 +308,10 @@ func TestKubehzP2LogLines(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("got %d log lines, want 2:\n%s", len(lines), strings.Join(lines, "\n"))
 	}
-	if !strings.Contains(lines[0], "100 bytes, the limit is 100 bytes") || !strings.Contains(lines[0], "refused") {
+	if !strings.Contains(lines[0], "live data is 100 bytes, the limit is 100 bytes") || !strings.Contains(lines[0], "refused") {
 		t.Fatalf("first line: %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "99 bytes, below the limit of 100 bytes") || !strings.Contains(lines[1], "accepted again") {
+	if !strings.Contains(lines[1], "live data is 99 bytes, below the limit of 100 bytes") || !strings.Contains(lines[1], "accepted again") {
 		t.Fatalf("second line: %q", lines[1])
 	}
 }
@@ -275,14 +324,16 @@ func TestKubehzP2Sampler(t *testing.T) {
 	logrus.SetOutput(io.Discard)
 	t.Cleanup(func() { logrus.SetOutput(out) })
 
+	// the driver has no live figure here, so DbSize serves as both sources,
+	// as Listen does on sqlite
 	fake := &quotaFake{}
 	fake.size.Store(10)
 	quota := NewQuota(100)
-	if err := quota.Sample(context.Background(), fake.DbSize); err != nil {
+	if err := quota.Sample(context.Background(), fake.DbSize, fake.DbSize); err != nil {
 		t.Fatal(err)
 	}
-	if quota.Size() != 10 || quota.Full() {
-		t.Fatalf("after the first sample: size %d, full %v", quota.Size(), quota.Full())
+	if quota.Live() != 10 || quota.Physical() != 10 || quota.Full() {
+		t.Fatalf("after the first sample: live %d, physical %d, full %v", quota.Live(), quota.Physical(), quota.Full())
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -290,22 +341,23 @@ func TestKubehzP2Sampler(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		quota.Run(ctx, time.Millisecond, fake.DbSize)
+		quota.Run(ctx, time.Millisecond, fake.DbSize, fake.DbSize)
 	}()
 
 	fake.size.Store(200)
-	waitFor(t, "size 200 sampled", func() bool { return quota.Size() == 200 && quota.Full() })
+	waitFor(t, "size 200 sampled", func() bool { return quota.Live() == 200 && quota.Full() })
 
 	sizeErr := errors.New("connection refused")
 	fake.sizeErr.Store(&sizeErr)
 	fake.size.Store(1) // would clear the limit if a failed sample were recorded
-	time.Sleep(20 * time.Millisecond)
-	if quota.Size() != 200 || !quota.Full() {
-		t.Fatalf("after failed samples: size %d, full %v; want the last good value 200, full", quota.Size(), quota.Full())
+	reads := fake.sizeReads.Load()
+	waitFor(t, "three failed samples", func() bool { return fake.sizeReads.Load() >= reads+3 })
+	if quota.Live() != 200 || !quota.Full() {
+		t.Fatalf("after failed samples: live %d, full %v; want the last good value 200, full", quota.Live(), quota.Full())
 	}
 
 	fake.sizeErr.Store(nil)
-	waitFor(t, "size 1 sampled", func() bool { return quota.Size() == 1 && !quota.Full() })
+	waitFor(t, "size 1 sampled", func() bool { return quota.Live() == 1 && !quota.Full() })
 
 	cancel()
 	select {

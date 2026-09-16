@@ -56,9 +56,11 @@ jobs:
     - name: kubehz P2 tests exist and pass
       run: |
         set -euo pipefail
-        for pkg in ./pkg/server/ ./pkg/app/; do
+        pkgs="./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/"
+        for pkg in $pkgs; do
           names=$(go test -tags=test -list 'TestKubehzP2' "$pkg")
           grep -q '^TestKubehzP2' <<<"$names" \
             || { echo "::error::no TestKubehzP2* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
         done
-        go test -tags=test -count=1 -race -run 'TestKubehzP2' ./pkg/server/ ./pkg/app/
+        # shellcheck disable=SC2086 # $pkgs is a space-separated list on purpose
+        go test -tags=test -count=1 -race -run 'TestKubehzP2' $pkgs

@@ -141,21 +141,27 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 
 	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
 	// INTENT: with --quota-bytes > 0 the backend handed to server.New is
-	//   wrapped by server.WithQuota, the size is sampled once here (so a
-	//   database already over the limit refuses from the first write) and then
-	//   every QuotaSampleInterval on bctx, which ends with the gRPC server.
+	//   wrapped by server.WithQuota. The limit compares live data when the
+	//   driver reports it (server.LiveSizer, pgsql), else the physical DbSize.
+	//   Both are sampled once here (so a database already over the limit
+	//   refuses from the first write) and then every QuotaSampleInterval on
+	//   bctx, which ends with the gRPC server.
 	// CONFLICT: keep upstream's order (Start, then New). The sampler must read
-	//   the size from the unwrapped backend; the wrapped one is what serves.
+	//   from the unwrapped backend; the wrapped one is what serves.
 	if config.QuotaBytes > 0 {
 		quota := server.NewQuota(config.QuotaBytes)
-		sizeOf := backend.DbSize
-		_ = quota.Sample(bctx, sizeOf)
-		go quota.Run(bctx, server.QuotaSampleInterval, sizeOf)
+		physical := backend.DbSize
+		live, figure := server.LiveSizeOf(backend), "live data"
+		if live == nil {
+			live, figure = physical, "database size (this driver reports no live figure)"
+		}
+		_ = quota.Sample(bctx, live, physical)
+		go quota.Run(bctx, server.QuotaSampleInterval, live, physical)
 		backend = server.WithQuota(backend, quota)
 		if config.MetricsRegisterer != nil {
-			config.MetricsRegisterer.MustRegister(metrics.QuotaBytes, metrics.DBSizeBytes)
+			config.MetricsRegisterer.MustRegister(metrics.QuotaBytes, metrics.LiveBytes, metrics.DBSizeBytes)
 		}
-		logrus.Infof("quota: database size limit is %d bytes, sampled every %s", config.QuotaBytes, server.QuotaSampleInterval)
+		logrus.Infof("quota: the limit is %d bytes of %s, sampled every %s", config.QuotaBytes, figure, server.QuotaSampleInterval)
 	}
 	// KUBEHZ-PATCH P2 END
 

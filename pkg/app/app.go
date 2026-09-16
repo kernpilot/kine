@@ -212,7 +212,7 @@ func New() *cli.App {
 		// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
 		&cli.Int64Flag{
 			Name:        "quota-bytes",
-			Usage:       "Maximum database size in bytes. At or above it, puts return the etcd no-space error until the database is smaller again; reads, deletes, watches and compaction continue. 0 means no limit. Default is 0.",
+			Usage:       "Maximum live data in bytes. At or above it, puts return the etcd no-space error until live data is smaller again; reads, deletes, watches and compaction continue. On PostgreSQL live data is estimated from the table statistics; other drivers use their database size. 0 means no limit. Default is 0.",
 			Destination: &config.QuotaBytes,
 			Value:       0,
 			EnvVars:     []string{"KINE_QUOTA_BYTES"},

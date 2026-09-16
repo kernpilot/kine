@@ -14,8 +14,12 @@ func TestKubehzP2QuotaFlag(t *testing.T) {
 	app := New()
 	var quotaFlag *cli.Int64Flag
 	for _, f := range app.Flags {
-		if f.Names()[0] == "quota-bytes" {
-			quotaFlag = f.(*cli.Int64Flag)
+		if f.Names()[0] != "quota-bytes" {
+			continue
+		}
+		var ok bool
+		if quotaFlag, ok = f.(*cli.Int64Flag); !ok {
+			t.Fatalf("--quota-bytes is a %T, want *cli.Int64Flag", f)
 		}
 	}
 	if quotaFlag == nil {

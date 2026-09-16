@@ -14,8 +14,10 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ### P2 — per-database size limit (`--quota-bytes`)
 
-Adds `pkg/server/kubehz_quota.go` and `pkg/metrics/kubehz_quota.go`.
-Touches `pkg/app/app.go`, `pkg/endpoint/endpoint.go` and `pkg/server/kv.go`.
+Adds `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go` and
+`pkg/drivers/pgsql/kubehz_quota.go`. Touches `pkg/app/app.go`,
+`pkg/endpoint/endpoint.go`, `pkg/server/kv.go`,
+`pkg/logstructured/logstructured.go` and `pkg/logstructured/sqllog/sql.go`.
 
 **Why.** kine has no size limit: `Alarm` is unsupported, there is no quota
 flag, and PostgreSQL has no per-database quota. A kine per tenant on a
@@ -25,33 +27,53 @@ shared PostgreSQL therefore lets one tenant fill the shard. etcd has
 client can free space. The apiserver already handles that error.
 
 **What.** `--quota-bytes <n>` (`KINE_QUOTA_BYTES`), default 0 = no limit,
-so an existing deployment changes nothing. With a limit, the size the
-`Status` RPC already reports (`pg_total_relation_size('kine')` on
-PostgreSQL) is sampled once at start and then every 30 s. At or above the
-limit, `Put` and every `Txn` that puts return etcd's error, same gRPC code
-(`ResourceExhausted`) and message (`etcdserver: mvcc: database space
-exceeded`). Range, Watch, delete transactions, `Compact` and the
-apiserver's compaction bookkeeping key keep working. One INFO line when the
-limit is first reached, one when the size is below it again. Two gauges,
-registered only with a limit: `kine_quota_bytes`, `kine_db_size_bytes`.
-A refused write is not logged per request (upstream logs every write error
-with the full request). The transition lines are the signal.
+so an existing deployment changes nothing. With a limit, live data and the
+physical size are sampled once at start and then every 30 s. At or above
+the limit on live data, `Put` and every `Txn` that puts return etcd's
+error, same gRPC code (`ResourceExhausted`) and message (`etcdserver:
+mvcc: database space exceeded`). Range, Watch, delete transactions and
+`Compact` keep working. One INFO line when the limit is first reached, one
+when live data is below it again. Three gauges, registered only with a
+limit: `kine_quota_bytes`, `kine_live_bytes` (the compared figure) and
+`kine_db_size_bytes` (the physical size). A refused write is not logged
+per request (upstream logs every write error with the full request). The
+transition lines are the signal.
 
-**One difference from etcd, on purpose.** etcd refuses every transaction
-with a put, the apiserver's compaction bookkeeping included. On kine a
-delete is an insert (a tombstone row), so above the limit only compaction
-makes the table smaller, and the apiserver compacts only after it wrote
-that key. The key stays writable, so a full database has a way out that is
-not a bigger limit.
+**Which bytes.** The limit compares live data, not the file. On PostgreSQL
+the relation plateaus under autovacuum: kine's compaction deletes old
+revisions and autovacuum makes the space reusable. After a write-then-
+delete spike the file stays large while live data is small, and a limit on
+`pg_total_relation_size` would then refuse a customer who holds almost
+nothing. So the pgsql driver reports `n_live_tup × Σ avg_width` from
+`pg_stat_user_tables` and `pg_stats`: a planner-statistics estimate, two
+catalog lookups and no scan, heap tuples only (indexes and page overhead
+are not counted), 0 until the first `ANALYZE`. `pgstattuple_approx` would
+be closer but needs an extension the tenant role cannot create. The
+physical size stays what `Status` reports and what `kine_db_size_bytes`
+shows: a capacity figure for whoever runs the PostgreSQL, not the
+customer's. The source travels as an optional interface
+(`server.LiveSizer`) from the pgsql dialect through `SQLLog` and
+`LogStructured`. A driver without one (sqlite) falls back to its `DbSize`.
+
+**Exactly etcd's rule.** A first draft kept the apiserver's compaction
+bookkeeping key writable above the limit. On the live figure that changes
+nothing worth a rule of its own, so the exemption was dropped: every put
+is refused, as in etcd.
 
 **Not a benchmark patch.** This is a safety bound, not an optimisation, so
 there is no number to re-measure. The write path pays one atomic load, and
 the sampler one catalog query per 30 s.
 
-**Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/`
+**Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`
 (`unit.yml` fails when the tests are missing, not only when they fail).
-Mutation-checked: with the `Full()` check removed from the wrapper's
-`Create`, `TestKubehzP2Limit` fails on `Put above the limit`.
+`TestKubehzP2Listen` runs a real kine on sqlite through `endpoint.Listen`
+and a client `Put`, so the wiring block is covered too.
+`TestKubehzP2LiveSizeChain` pins the forwarding of the live figure. The
+PostgreSQL query itself is not run in CI (no database). Mutation-checked:
+with the `Full()` check removed from the wrapper's `Create`,
+`TestKubehzP2Limit` fails on `Put above the limit`. With the P2 block
+removed from `endpoint.Listen`, `TestKubehzP2Listen` fails. With
+`SQLLog.LiveSize` returning nil, `TestKubehzP2LiveSizeChain` fails.
 
 ---
 

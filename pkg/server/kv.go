@@ -106,8 +106,9 @@ func (k *KVServerBridge) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*
 	res, err := k.limited.Put(ctx, r)
 	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
 	// INTENT: a write refused for lack of space is not logged here. The
-	//   apiserver retries every refused write, and this line prints the full
-	//   request, value included. The quota logs one line per transition.
+	//   apiserver answers 500 and its clients and controllers retry, so every
+	//   retry would print this line with the full request, value included.
+	//   The quota logs one line per transition instead.
 	// CONFLICT: keep upstream's condition and add the ErrNoSpace clause.
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNoSpace) {
 		// KUBEHZ-PATCH P2 END
