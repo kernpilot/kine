@@ -19,6 +19,22 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # kubehz fork: a real PostgreSQL for the P2/P3 integration test
+    # (pkg/drivers/pgsql/kubehz_pgsql_test.go, gated on KINE_TEST_PGSQL_DSN).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      KINE_TEST_PGSQL_DSN: postgres://postgres:postgres@localhost:5432/kine_kubehz_test?sslmode=disable
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 

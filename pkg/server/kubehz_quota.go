@@ -127,10 +127,14 @@ func (q *Quota) ObservePhysical(size int64) {
 
 // Sample reads both figures once and records them. physical may be nil. A
 // failed read keeps the last value and is logged; it never clears the limit.
-// The returned error is the live read's.
+// The returned error is the live read's. A read that failed because ctx
+// ended (shutdown) is returned without a warning.
 func (q *Quota) Sample(ctx context.Context, live, physical SizeSource) error {
 	if physical != nil {
 		if size, err := physical(ctx); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
 			logrus.Warnf("quota: cannot read the database size: %v. The last value, %d bytes, stays in use.", err, q.Physical())
 		} else {
 			q.ObservePhysical(size)
@@ -138,7 +142,9 @@ func (q *Quota) Sample(ctx context.Context, live, physical SizeSource) error {
 	}
 	size, err := live(ctx)
 	if err != nil {
-		logrus.Warnf("quota: cannot read the live data size: %v. The last value, %d bytes, stays in use.", err, q.Live())
+		if ctx.Err() == nil {
+			logrus.Warnf("quota: cannot read the live data size: %v. The last value, %d bytes, stays in use.", err, q.Live())
+		}
 		return err
 	}
 	q.Observe(size)

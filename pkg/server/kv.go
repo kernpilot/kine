@@ -111,9 +111,9 @@ func (k *KVServerBridge) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*
 	//   The quota logs one line per transition instead.
 	// CONFLICT: keep upstream's condition and add the ErrNoSpace clause.
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNoSpace) {
-		// KUBEHZ-PATCH P2 END
 		logrus.Errorf("error in put %s: %v", r, err)
 	}
+	// KUBEHZ-PATCH P2 END
 	return res, err
 }
 
@@ -125,9 +125,9 @@ func (k *KVServerBridge) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*
 	res, err := k.limited.Txn(ctx, r)
 	// KUBEHZ-PATCH P2 BEGIN — same as in Put above.
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNoSpace) {
-		// KUBEHZ-PATCH P2 END
 		logrus.Errorf("error in txn %s: %v", r, err)
 	}
+	// KUBEHZ-PATCH P2 END
 	return res, err
 }
 

@@ -18,7 +18,7 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. It carries two patches.
+The fork is deliberately narrow. It carries three patches.
 
 P1 touches three files. `pkg/drivers/pgsql/notify.go` is new and cannot
 conflict. `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`
@@ -34,24 +34,36 @@ carries marker-wrapped edits in `pkg/app/app.go` (the flag),
 and `pkg/logstructured/sqllog/sql.go` (one forwarding method each).
 
 P3 (storage parameters on the kine table) adds
-`pkg/drivers/pgsql/kubehz_reloptions.go` and touches the `CREATE TABLE`
-statement and `New()` in `pkg/drivers/pgsql/pgsql.go`.
+`pkg/drivers/pgsql/kubehz_reloptions.go` and touches `setup()` (one flag from
+its CockroachDB probe) and `New()` in `pkg/drivers/pgsql/pgsql.go`. The
+`CREATE TABLE` statement stays upstream's.
 
 Beside those source files, the fork carries its own tests (every
-`kubehz_*_test.go`), two workflow files (`unit.yml` gains a step per patch,
-`publish-kubehz.yml` is ours), a few `.gitignore` lines, and the `kubehz/`
-and `benchmarks/` directories. Nothing else differs from upstream; the
-check is
+`kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
+provides), two workflow files (`unit.yml` gains a step per patch and that
+service, `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the
+`kubehz/` and `benchmarks/` directories. Nothing else differs from
+upstream. The check, from the repository root, is
 
 ```bash
 git diff --stat upstream-master..main -- . ':!benchmarks' ':!kubehz' ':!.github' ':!.gitignore' ':!**/kubehz_*_test.go'
 ```
 
-which must list exactly `pgsql/notify.go`, `pgsql/pgsql.go`,
-`pgsql/kubehz_quota.go`, `pgsql/kubehz_reloptions.go`, `sqllog/sql.go`,
-`logstructured.go`,
-`server/kubehz_quota.go`, `metrics/kubehz_quota.go`, `app/app.go`,
-`endpoint/endpoint.go` and `server/kv.go`.
+which must list exactly these files:
+
+```
+pkg/app/app.go
+pkg/drivers/pgsql/kubehz_quota.go
+pkg/drivers/pgsql/kubehz_reloptions.go
+pkg/drivers/pgsql/notify.go
+pkg/drivers/pgsql/pgsql.go
+pkg/endpoint/endpoint.go
+pkg/logstructured/logstructured.go
+pkg/logstructured/sqllog/sql.go
+pkg/metrics/kubehz_quota.go
+pkg/server/kubehz_quota.go
+pkg/server/kv.go
+```
 
 ## Principles
 

@@ -1,54 +1,45 @@
 package pgsql
 
-// KUBEHZ-PATCH P3 tests. Hermetic: no PostgreSQL. The CREATE TABLE statement
-// carries the storage parameters, and the ALTER path is chosen exactly when
-// pg_class.reloptions differ. The database round trip itself
-// (ensureRelOptions) is not run here.
+// KUBEHZ-PATCH P3 tests. Hermetic: no PostgreSQL. The ALTER is chosen exactly
+// when pg_class.reloptions differ, and never on CockroachDB. The CREATE TABLE
+// statement stays upstream's. The database round trip (setRelOptions) runs
+// in TestKubehzP2P3Postgres against a real PostgreSQL.
 
 import (
 	"strings"
 	"testing"
 )
 
-const wantClause = "WITH (autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_scale_factor = 0.05)"
+const alterBoth = "ALTER TABLE kine SET (autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_scale_factor = 0.05)"
 
-func TestKubehzP3CreateTableCarriesRelOptions(t *testing.T) {
-	if relOptionsClause() != wantClause {
-		t.Fatalf("clause: %q, want %q", relOptionsClause(), wantClause)
-	}
+func TestKubehzP3CreateTableIsUpstreams(t *testing.T) {
 	create := schema[0]
 	if !strings.HasPrefix(strings.TrimSpace(create), "CREATE TABLE IF NOT EXISTS kine") {
 		t.Fatalf("schema[0] is not the CREATE TABLE statement: %q", create)
 	}
-	if !strings.Contains(create, wantClause) {
-		t.Fatalf("CREATE TABLE does not carry the storage parameters:\n%s", create)
-	}
-	if strings.Index(create, wantClause) < strings.Index(create, ")") {
-		t.Fatal("the WITH clause must follow the column list")
+	if strings.Contains(create, "WITH (") || strings.Contains(create, "autovacuum") {
+		t.Fatalf("CREATE TABLE carries storage parameters; they belong to the ALTER path (CockroachDB rejects them):\n%s", create)
 	}
 }
 
 func TestKubehzP3AlterExactlyWhenDiffer(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		current string // pg_class.reloptions joined with ","
-		want    string // the ALTER statement, "" when none must run
+		name      string
+		cockroach bool
+		current   string // pg_class.reloptions joined with ","
+		want      string // the ALTER statement, "" when none must run
 	}{
-		{"fresh table without options", "", "ALTER TABLE kine SET (autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_scale_factor = 0.05)"},
-		{"both already set", "autovacuum_vacuum_scale_factor=0.05,autovacuum_analyze_scale_factor=0.02", ""},
-		{"both set in the other order with an unrelated option", "fillfactor=70,autovacuum_analyze_scale_factor=0.02,autovacuum_vacuum_scale_factor=0.05", ""},
-		{"only vacuum set", "autovacuum_vacuum_scale_factor=0.05", "ALTER TABLE kine SET (autovacuum_analyze_scale_factor = 0.02)"},
-		{"analyze set, vacuum at the default", "autovacuum_analyze_scale_factor=0.02,autovacuum_vacuum_scale_factor=0.2", "ALTER TABLE kine SET (autovacuum_vacuum_scale_factor = 0.05)"},
-		{"unrelated option only", "fillfactor=70", "ALTER TABLE kine SET (autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_scale_factor = 0.05)"},
+		{"fresh table, no reloptions: ALTER both", false, "", alterBoth},
+		{"both already set", false, "autovacuum_vacuum_scale_factor=0.05,autovacuum_analyze_scale_factor=0.02", ""},
+		{"both set in the other order with an unrelated option", false, "fillfactor=70,autovacuum_analyze_scale_factor=0.02,autovacuum_vacuum_scale_factor=0.05", ""},
+		{"only vacuum set", false, "autovacuum_vacuum_scale_factor=0.05", "ALTER TABLE kine SET (autovacuum_analyze_scale_factor = 0.02)"},
+		{"analyze set, vacuum at the default", false, "autovacuum_analyze_scale_factor=0.02,autovacuum_vacuum_scale_factor=0.2", "ALTER TABLE kine SET (autovacuum_vacuum_scale_factor = 0.05)"},
+		{"unrelated option only", false, "fillfactor=70", alterBoth},
+		{"CockroachDB: no statement", true, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			keys := relOptionsToSet(tc.current)
-			got := ""
-			if len(keys) > 0 {
-				got = alterRelOptionsSQL(keys)
-			}
-			if got != tc.want {
-				t.Fatalf("reloptions %q:\n got %q\nwant %q", tc.current, got, tc.want)
+			if got := relOptionsPlan(tc.cockroach, tc.current); got != tc.want {
+				t.Fatalf("cockroach=%v reloptions %q:\n got %q\nwant %q", tc.cockroach, tc.current, got, tc.want)
 			}
 		})
 	}

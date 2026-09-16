@@ -1,21 +1,23 @@
-package endpoint_test
+package endpoint
 
-// KUBEHZ-PATCH P2 test: the wiring in endpoint.Listen. A real kine on sqlite
-// (cgo and nocgo builds both have a driver) with QuotaBytes set refuses a
-// client Put with etcd's no-space error and still serves reads and deletes;
-// without QuotaBytes the same Put succeeds. Deleting the P2 block in Listen
-// turns the first case green for the wrong reason, so this test fails.
+// KUBEHZ-PATCH P2 test: the wiring in Listen. A real kine on sqlite (cgo and
+// nocgo builds both have a driver) with QuotaBytes set refuses a client Put
+// with etcd's no-space error and still serves reads and deletes; without
+// QuotaBytes the same Put succeeds; a live source that fails on the first
+// sample fails Listen. Deleting the P2 block in Listen turns the first case
+// green for the wrong reason, so this test fails.
 
 import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/k3s-io/kine/pkg/drivers/sqlite"
-	"github.com/k3s-io/kine/pkg/endpoint"
+	"github.com/k3s-io/kine/pkg/server"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc/codes"
@@ -31,11 +33,19 @@ func TestKubehzP2Listen(t *testing.T) {
 		{"no limit accepts the put", 0, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client := listenSQLite(t, tc.quota)
+			e, err := listenSQLite(t, tc.quota)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := clientv3.New(clientv3.Config{Endpoints: e.Endpoints, DialTimeout: 10 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { client.Close() })
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			_, err := client.Put(ctx, "/a", "v")
+			_, err = client.Put(ctx, "/a", "v")
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("Put with QuotaBytes=%d: got %v, want %v", tc.quota, err, tc.want)
 			}
@@ -68,9 +78,24 @@ func TestKubehzP2Listen(t *testing.T) {
 	}
 }
 
-// listenSQLite starts kine on a fresh sqlite database behind a unix socket
-// and returns a connected client. Everything stops with the test.
-func listenSQLite(t *testing.T, quota int64) *clientv3.Client {
+// TestKubehzP2ListenFailsOnFirstSample: a live source that fails at boot
+// must fail Listen, not serve with no limit until the next tick.
+func TestKubehzP2ListenFailsOnFirstSample(t *testing.T) {
+	seam := liveSizeOf
+	t.Cleanup(func() { liveSizeOf = seam })
+	liveSizeOf = func(server.Backend) server.SizeSource {
+		return func(context.Context) (int64, error) { return 0, errors.New("relation kine does not exist") }
+	}
+	_, err := listenSQLite(t, 1)
+	if err == nil || !strings.Contains(err.Error(), "quota: the first size sample failed") ||
+		!strings.Contains(err.Error(), "relation kine does not exist") {
+		t.Fatalf("Listen with a failing live source: got %v, want the first-sample error", err)
+	}
+}
+
+// listenSQLite starts kine on a fresh sqlite database behind a unix socket.
+// Everything stops with the test.
+func listenSQLite(t *testing.T, quota int64) (ETCDConfig, error) {
 	t.Helper()
 	// a short path: unix socket paths are limited to about 100 bytes
 	dir, err := os.MkdirTemp("", "kine-p2-")
@@ -86,7 +111,7 @@ func listenSQLite(t *testing.T, quota int64) *clientv3.Client {
 		wg.Wait()
 	})
 
-	e, err := endpoint.Listen(ctx, endpoint.Config{
+	return Listen(ctx, Config{
 		WaitGroup:      wg,
 		Listener:       "unix://" + dir + "/kine.sock",
 		Endpoint:       "sqlite://" + dir + "/state.db?" + sqlite.DefaultParams,
@@ -98,17 +123,4 @@ func listenSQLite(t *testing.T, quota int64) *clientv3.Client {
 		PollBatchSize:    500,
 		QuotaBytes:       quota,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	client, err := clientv3.New(clientv3.Config{
-		Endpoints:   e.Endpoints,
-		DialTimeout: 10 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { client.Close() })
-	return client
 }

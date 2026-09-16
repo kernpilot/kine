@@ -14,16 +14,19 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ### P3 — storage parameters on the kine table
 
-Adds `pkg/drivers/pgsql/kubehz_reloptions.go`. Touches the `CREATE TABLE`
-statement and `New()` in `pkg/drivers/pgsql/pgsql.go`.
+Adds `pkg/drivers/pgsql/kubehz_reloptions.go`. Touches `setup()` (one flag
+from its existing CockroachDB probe) and `New()` in
+`pkg/drivers/pgsql/pgsql.go`. The `CREATE TABLE` statement stays upstream's.
 
 **What.** The kine table carries `autovacuum_vacuum_scale_factor = 0.05`
 and `autovacuum_analyze_scale_factor = 0.02` (PostgreSQL's defaults are 0.2
-and 0.1). A new table gets them from `CREATE TABLE ... WITH (...)`. An
-existing table (a fork upgrade) gets one `ALTER TABLE kine SET (...)` at
-startup for the parameters that differ in `pg_class.reloptions`, with one
-INFO line. A table that already carries them causes no statement and no
-line. Only the pgsql driver has this. sqlite and the others are untouched.
+and 0.1). New or upgraded, the table gets them from one idempotent
+`ALTER TABLE kine SET (...)` at startup for the parameters that differ in
+`pg_class.reloptions`, with one INFO line. A table that already carries
+them causes no statement and no line. CockroachDB: the parameters are not
+applied (no table storage parameters there), and the fork is not tested
+there beyond upstream's suite, which the fork's CI keeps. Only the pgsql driver has
+this. sqlite and the others are untouched.
 
 **Why.** Two reasons, both about P2. A lower vacuum threshold shrinks the
 plateau slack the file carries above live data, the slack
@@ -33,15 +36,15 @@ threshold keeps the limit honest after the row shape changes (larger
 objects, a new CRD).
 
 **Not a correctness patch.** If the `ALTER` fails (a role without `ALTER`
-on the table), kine logs a warning and starts. CockroachDB, which upstream
-tolerates through a collation switch in `setup()`, rejects table storage
-parameters; this fork is PostgreSQL-only (see the image release notes) and
-does not carry that case.
+on the table, or a lock held by an anti-wraparound autovacuum past the 10 s
+bound), kine logs a warning and starts.
 
 **Re-check** `go test -tags=test -race -run TestKubehzP3 ./pkg/drivers/pgsql/`:
-the `CREATE TABLE` statement carries the clause, and the `ALTER` path is
-chosen exactly when the reloptions differ. The database round trip is not
-run in CI.
+the `CREATE TABLE` statement carries no storage parameters, and the
+`ALTER` is chosen exactly when the reloptions differ and never on
+CockroachDB. Against a real PostgreSQL
+(`unit.yml` runs one), `TestKubehzP2P3Postgres` opens the driver with
+`New()` and checks that `pg_class.reloptions` carries both parameters.
 
 ### P2 — per-database size limit (`--quota-bytes`)
 
@@ -59,7 +62,10 @@ client can free space. The apiserver already handles that error.
 
 **What.** `--quota-bytes <n>` (`KINE_QUOTA_BYTES`), default 0 = no limit,
 so an existing deployment changes nothing. With a limit, live data and the
-physical size are sampled once at start and then every 30 s. At or above
+physical size are sampled once at start and then every 30 s. A failed
+first sample fails the start: setup just succeeded on the same pool, so a
+failing size query is a real fault, and the process manager restarts kine
+rather than serving with no limit until the next tick. At or above
 the limit on live data, `Put` and every `Txn` that puts return etcd's
 error, same gRPC code (`ResourceExhausted`) and message (`etcdserver:
 mvcc: database space exceeded`). Range, Watch, delete transactions and
@@ -75,16 +81,27 @@ the relation plateaus under autovacuum: kine's compaction deletes old
 revisions and autovacuum makes the space reusable. After a write-then-
 delete spike the file stays large while live data is small, and a limit on
 `pg_total_relation_size` would then refuse a customer who holds almost
-nothing. So the pgsql driver reports `n_live_tup × Σ avg_width` from
-`pg_stat_user_tables` and `pg_stats`: a planner-statistics estimate, two
-catalog lookups and no scan, heap tuples only (indexes and page overhead
-are not counted), 0 until the first `ANALYZE`. `pgstattuple_approx` would
-be closer but needs an extension the tenant role cannot create. The
-physical size stays what `Status` reports and what `kine_db_size_bytes`
-shows: a capacity figure for whoever runs the PostgreSQL, not the
-customer's. The source travels as an optional interface
-(`server.LiveSizer`) from the pgsql dialect through `SQLLog` and
-`LogStructured`. A driver without one (sqlite) falls back to its `DbSize`.
+nothing. So the pgsql driver estimates the on-disk size of live rows in
+one query with two terms. Heap: `n_live_tup × Σ avg_width` from
+`pg_stat_user_tables` and `pg_stats`. `ANALYZE` measures a datum as stored
+inline, so a `value` or `old_value` still above about 2 KB after
+compression (most Pods, Secrets and CRs) counts as its 18-byte pointer
+there. TOAST: the toast relation's `n_live_tup × 1996`
+(`TOAST_MAX_CHUNK_SIZE` on 8 KB pages, one row per chunk), an upper bound
+within one chunk per value. Both terms are compressed sizes, so the figure
+is the compressed size of live rows. etcd's in-use figure is uncompressed,
+so a kine cluster reads smaller for the same objects. Two catalog lookups
+and no scan. Indexes and page overhead are not counted.
+`pgstattuple_approx` would be closer but needs an extension the tenant
+role cannot create. The heap term needs statistics: at start, when
+`pg_stats` has no row for the table, kine runs `ANALYZE kine` once
+(bounded, a warning on failure). After that autovacuum must be enabled for
+the figure to stay current (the CNPG default). The physical size stays
+what `Status` reports and what `kine_db_size_bytes` shows: a capacity
+figure for whoever runs the PostgreSQL, not the customer's. The source
+travels as an optional interface (`server.LiveSizer`) from the pgsql
+dialect through `SQLLog` and `LogStructured`. A driver without one
+(sqlite) falls back to its `DbSize`.
 
 **Exactly etcd's rule.** A first draft kept the apiserver's compaction
 bookkeeping key writable above the limit. On the live figure that changes
@@ -99,8 +116,13 @@ the sampler one catalog query per 30 s.
 (`unit.yml` fails when the tests are missing, not only when they fail).
 `TestKubehzP2Listen` runs a real kine on sqlite through `endpoint.Listen`
 and a client `Put`, so the wiring block is covered too.
-`TestKubehzP2LiveSizeChain` pins the forwarding of the live figure. The
-PostgreSQL query itself is not run in CI (no database). Mutation-checked:
+`TestKubehzP2LiveSizeChain` pins the forwarding of the live figure.
+`TestKubehzP2ListenFailsOnFirstSample` pins the failed start.
+`TestKubehzP2P3Postgres` runs against the PostgreSQL service in `unit.yml`:
+200 rows with 64 KB incompressible values, `VACUUM ANALYZE`, and the
+estimate must be within 0.9 and 1.3 of
+`SUM(pg_column_size(value) + pg_column_size(old_value))`. Without the
+TOAST term it reads a few kilobytes. Mutation-checked:
 with the `Full()` check removed from the wrapper's `Create`,
 `TestKubehzP2Limit` fails on `Put above the limit`. With the P2 block
 removed from `endpoint.Listen`, `TestKubehzP2Listen` fails. With
