@@ -80,6 +80,11 @@ jobs:
         done
         # shellcheck disable=SC2086 # $pkgs is a space-separated list on purpose
         go test -tags=test -count=1 -race -run 'TestKubehzP2' $pkgs
+        # The PostgreSQL test logs its measured live-size ratio; print it (a
+        # passing test hides t.Logf without -v) and fail when it did not run.
+        out=$(go test -tags=test -count=1 -v -run 'TestKubehzP2P3Postgres' ./pkg/drivers/pgsql/)
+        grep 'live-size ratio' <<<"$out" \
+          || { echo "::error::TestKubehzP2P3Postgres did not report a ratio (skipped or failed)"; echo "$out" | tail -20; exit 1; }
 
     # kubehz fork: same guard for the P3 tests (kubehz/MERGE-GUIDE.md#p3).
     - name: kubehz P3 tests exist and pass
