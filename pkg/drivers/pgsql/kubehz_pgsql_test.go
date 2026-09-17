@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,12 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	if dsn == "" {
 		t.Skip("KINE_TEST_PGSQL_DSN is not set; this test needs a PostgreSQL")
 	}
+	// New() takes the DSN without its scheme, as the driver registry hands it
+	// over (prepareConfig prepends "postgres://" again)
+	_, source, found := strings.Cut(dsn, "://")
+	if !found {
+		t.Fatalf("KINE_TEST_PGSQL_DSN %q has no scheme; want postgres://user:pass@host:port/db", dsn)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -36,7 +43,7 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		wg.Wait()
 	})
 	_, backend, err := New(ctx, wg, &drivers.Config{
-		DataSourceName:       dsn,
+		DataSourceName:       source,
 		ConnectionPoolConfig: generic.ConnectionPoolConfig{MaxIdle: 2, MaxOpen: 4, MaxIdleTime: time.Minute},
 		CompactTimeout:       5 * time.Second,
 		CompactMinRetain:     1000,
