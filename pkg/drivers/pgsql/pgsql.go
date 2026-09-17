@@ -130,6 +130,26 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		return false, nil, err
 	}
 
+	// KUBEHZ-PATCH P3 BEGIN — see kubehz/MERGE-GUIDE.md#p3
+	// INTENT: the kine table gets its storage parameters here, new or
+	//   upgraded alike, through one idempotent ALTER. A warning, not a failed
+	//   start, when the role cannot ALTER the table. Nothing on CockroachDB.
+	// CONFLICT: keep this after setup() (the table exists, the probe ran) and
+	//   before serving.
+	if err := setRelOptions(ctx, dialect.DB, cockroachDB); err != nil {
+		logrus.Warnf("kine table storage parameters not set: %v", err)
+	}
+	// KUBEHZ-PATCH P3 END
+
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: the live-data figure needs statistics; a table ANALYZE never saw
+	//   reads as 0. Analyze it once here; a warning, not a failed start.
+	// CONFLICT: keep this after setup() (the table exists) and before serving.
+	if err := analyzeIfNoStats(ctx, dialect.DB); err != nil {
+		logrus.Warnf("kine table not analyzed, the live-data figure reads 0 until autovacuum analyzes it: %v", err)
+	}
+	// KUBEHZ-PATCH P2 END
+
 	dialect.Migrate(context.Background())
 
 	// KUBEHZ-PATCH P1 BEGIN — wire the cross-instance notifier
@@ -190,6 +210,11 @@ func setup(db *sql.DB) error {
 		// which parses it as a BCP47 language tag instead of a collation.
 		collationSupported = false
 	}
+	// KUBEHZ-PATCH P3 BEGIN — see kubehz/MERGE-GUIDE.md#p3
+	// INTENT: reuse this one probe; setRelOptions in New() skips CockroachDB,
+	//   which has no table storage parameters.
+	cockroachDB = !collationSupported
+	// KUBEHZ-PATCH P3 END
 
 	for _, stmt := range schema {
 		if !collationSupported {

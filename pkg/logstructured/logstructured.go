@@ -285,6 +285,21 @@ func (l *LogStructured) DbSize(ctx context.Context) (int64, error) {
 	return l.log.DbSize(ctx)
 }
 
+// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+// INTENT: forward the optional live-bytes figure from the log underneath, so
+// endpoint.Listen can compare --quota-bytes to live data rather than to the
+// file. Returns nil when the log has none.
+// CONFLICT: this is an added method; keep it as is. If Log changes shape, the
+// only requirement is that a log offering server.LiveSizer is reachable.
+func (l *LogStructured) LiveSize() server.SizeSource {
+	if s, ok := l.log.(server.LiveSizer); ok {
+		return s.LiveSize()
+	}
+	return nil
+}
+
+// KUBEHZ-PATCH P2 END
+
 func (l *LogStructured) CurrentRevision(ctx context.Context) (int64, error) {
 	return l.log.CurrentRevision(ctx)
 }

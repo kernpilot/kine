@@ -104,9 +104,16 @@ func toKV(kv *KeyValue) *mvccpb.KeyValue {
 
 func (k *KVServerBridge) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
 	res, err := k.limited.Put(ctx, r)
-	if err != nil && !errors.Is(err, context.Canceled) {
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: a write refused for lack of space is not logged here. The
+	//   apiserver answers 500 and its clients and controllers retry, so every
+	//   retry would print this line with the full request, value included.
+	//   The quota logs one line per transition instead.
+	// CONFLICT: keep upstream's condition and add the ErrNoSpace clause.
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNoSpace) {
 		logrus.Errorf("error in put %s: %v", r, err)
 	}
+	// KUBEHZ-PATCH P2 END
 	return res, err
 }
 
@@ -116,9 +123,11 @@ func (k *KVServerBridge) DeleteRange(ctx context.Context, r *etcdserverpb.Delete
 
 func (k *KVServerBridge) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	res, err := k.limited.Txn(ctx, r)
-	if err != nil && !errors.Is(err, context.Canceled) {
+	// KUBEHZ-PATCH P2 BEGIN — same as in Put above.
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNoSpace) {
 		logrus.Errorf("error in txn %s: %v", r, err)
 	}
+	// KUBEHZ-PATCH P2 END
 	return res, err
 }
 

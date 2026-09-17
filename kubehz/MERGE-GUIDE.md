@@ -122,6 +122,146 @@ a correctness fix.
 
 **Re-verify** `benchmarks/run-cross.sh` (two kine instances, one database).
 
+### P2 — per-database size limit (`--quota-bytes`)
+
+**Files** `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go` and
+`pkg/drivers/pgsql/kubehz_quota.go` (new, conflict-free). Edits: `pkg/app/app.go`
+(the flag), `pkg/endpoint/endpoint.go` (the config field and the wiring),
+`pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
+and `pkg/logstructured/sqllog/sql.go` (one forwarding method each). Tests
+`pkg/server/kubehz_quota_test.go`, `pkg/app/kubehz_quota_test.go`,
+`pkg/endpoint/kubehz_quota_test.go` (a real kine on sqlite through
+`Listen`), `pkg/drivers/pgsql/kubehz_quota_test.go` and
+`pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain),
+and `pkg/drivers/pgsql/kubehz_pgsql_test.go` against the PostgreSQL
+service `unit.yml` runs (skipped without `KINE_TEST_PGSQL_DSN`).
+`unit.yml` fails when they are missing.
+
+**Problem.** Upstream kine has no size limit: `Alarm` is unsupported, there
+is no quota flag, and PostgreSQL has no per-database quota. One kine per
+tenant on a shared PostgreSQL lets one tenant fill the shard. etcd caps the
+store with `--quota-backend-bytes`: above it the capped applier refuses
+puts with `ErrGRPCNoSpace` and keeps reads, deletes and compaction working,
+and the apiserver already handles that error.
+
+**Approach.** `--quota-bytes <n>`, default 0 = no limit. With a limit,
+`endpoint.Listen` wraps the backend in `server.WithQuota` and samples two
+figures once at start and then every `server.QuotaSampleInterval` (30 s):
+live data, which the limit compares, and the physical size the `Status`
+RPC already reports (`Backend.DbSize`), which only feeds a gauge. A failed
+first sample fails `Listen` (same path as a failed `backend.Start`): setup
+just succeeded on the same pool, so the query is at fault, and the process
+manager restarts kine instead of it serving with no limit. The
+wrapper returns `rpctypes.ErrGRPCNoSpace` from `Create` and `Update` while
+the last live sample is at or above the limit. Everything else passes
+through. So `Put` and every `Txn` that puts are refused (the apiserver's
+compaction bookkeeping key included, as in etcd), while Range, Watch,
+delete transactions and `Compact` keep working. One INFO line on each
+transition. Three gauges, `kine_quota_bytes`, `kine_live_bytes` and
+`kine_db_size_bytes`, registered only with a limit. `kv.go` skips the
+per-request error log for this one error: the apiserver answers 500, its
+clients and controllers retry, and that line prints the full request each
+time.
+
+**Which bytes, and why.** On PostgreSQL the relation plateaus under
+autovacuum (kine's compaction deletes old revisions, autovacuum makes the
+space reusable), and after a write-then-delete spike the file stays large
+while live data is small. A limit on `pg_total_relation_size` would then
+refuse a customer who holds almost nothing, so the file is a capacity
+figure for whoever runs the PostgreSQL, and the limit is on live data. The
+pgsql driver estimates it in one query with two terms. Heap:
+`n_live_tup × Σ avg_width` from `pg_stat_user_tables` and `pg_stats`.
+`ANALYZE` measures a datum as stored inline, so an out-of-line TOAST value
+(a `value` or `old_value` above about 2 KB after compression) counts as
+its 18-byte pointer here. TOAST: the toast relation's `n_live_tup × 1996`
+(`TOAST_MAX_CHUNK_SIZE` on 8 KB pages), an upper bound within one chunk
+per value. The whole figure is the compressed on-disk size of live rows,
+so it reads smaller than etcd's uncompressed in-use figure for the same
+objects. Two catalog lookups, no scan, no indexes or page overhead.
+`pgstattuple_approx` would be closer but needs an extension the tenant
+role cannot create. Preconditions: `New()` runs `ANALYZE kine` once when
+`pg_stats` has no row for the table (else the heap term is 0), and
+autovacuum must be enabled for the statistics to stay current (the CNPG
+default). The source travels as the
+optional interface `server.LiveSizer`, asserted at the call site like
+`RevisionNotify` in P1: the pgsql `notifyingDialect` offers it, `SQLLog`
+and `LogStructured` forward it, `endpoint.Listen` asks for it and falls
+back to `DbSize` when it gets nil (sqlite, the others).
+
+**Invariant.** The sizes are sampled, never queried on the write path: a
+write costs one atomic load. A failed sample keeps the last value and never
+clears the limit. The first sample must succeed or kine does not start. On
+PostgreSQL the compared figure is live data: if a rebase loses a
+forwarding method the limit silently becomes a file-size limit, which is
+why `TestKubehzP2LiveSizeChain` exists. The TOAST term is load-bearing:
+without it the figure misses most of the data, which is why
+`TestKubehzP2P3Postgres` measures the estimate against
+`pg_column_size` on a real PostgreSQL.
+
+**Not an optimisation.** This is a safety bound. There is no benchmark to
+re-measure. The test suite is the check.
+
+**If it conflicts.** The three new files never conflict. If upstream changes
+the flag table, re-add the one `Int64Flag`. If `endpoint.Listen` is
+restructured, keep upstream's order (backend `Start`, then `server.New`) and
+re-express the block: sample from the unwrapped backend, hand the wrapped
+one to `server.New`. The two forwarding methods are additions next to
+`DbSize`. Re-add them wherever `DbSize` lands. If upstream changes `Backend`
+so that puts no longer go through `Create`/`Update`, move the check to
+whatever the new write methods are. The test on a fake backend shows which
+calls must be refused. If upstream adds its own size limit, drop P2 and map
+`--quota-bytes` onto it. `New()` in `pgsql.go` also carries the one-time
+`ANALYZE` block. Keep it after `setup()`.
+
+**Re-verify** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`,
+with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part.
+
+### P3 — storage parameters on the kine table
+
+**Files** `pkg/drivers/pgsql/kubehz_reloptions.go` (new, conflict-free).
+`pkg/drivers/pgsql/pgsql.go`: one assignment inside `setup()` after its
+CockroachDB probe, and one call in `New()` after `setup()`. The `CREATE
+TABLE` statement is upstream's. Test
+`pkg/drivers/pgsql/kubehz_reloptions_test.go`. `unit.yml` fails when it is
+missing.
+
+**Problem.** With PostgreSQL's defaults, autovacuum runs after 20 % of the
+table changed and autoanalyze after 10 %. On a per-tenant kine table that
+means the file carries up to a fifth of dead rows above live data, and
+P2's `avg_width` can be a tenth of the table stale.
+
+**Approach.** The table carries `autovacuum_vacuum_scale_factor = 0.05`
+and `autovacuum_analyze_scale_factor = 0.02`. New or upgraded, it gets
+them from one idempotent `ALTER TABLE kine SET (...)` at startup for the
+parameters that differ in `pg_class.reloptions` (read as one string
+through `array_to_string`), with one INFO line. One code path, one test
+table. The `CREATE TABLE` statement stays upstream's, because CockroachDB
+rejects a `WITH (...)` clause there and the fork's CI keeps upstream's
+CockroachDB matrix. On CockroachDB no statement runs: `setup()` already
+probes `select version()` for it, and the flag it sets is the only probe.
+Both statements are bounded by 10 s: an anti-wraparound autovacuum can
+hold the lock the `ALTER` waits on. Only the pgsql driver has this.
+
+**Invariant.** The parameters live in one map, `kineRelOptions`, and the
+`ALTER` renders from it. `relOptionsPlan` is the whole decision (CockroachDB,
+nothing to set, or the statement) and the decision table test pins it. A
+failed or timed-out `ALTER` is a warning, never a failed start.
+
+**If it conflicts.** The `CREATE TABLE` statement carries nothing of ours.
+`TestKubehzP3CreateTableIsUpstreams` fails if a merge lets a `WITH` clause
+in. If upstream changes how `setup()` detects CockroachDB, keep the one
+assignment after its probe, whatever the probe becomes. If upstream adds
+its own storage parameters, keep the lower value for these two. If
+upstream restructures `New()`, the only requirement is that
+`setRelOptions` runs after the table exists and before serving.
+
+**Re-verify after an upstream merge.** `go test -tags=test -race -run
+TestKubehzP3 ./pkg/drivers/pgsql/` passes. Against a real PostgreSQL
+(`TestKubehzP2P3Postgres` with `KINE_TEST_PGSQL_DSN`, as `unit.yml` runs
+it): after one start, `SELECT reloptions FROM pg_class WHERE oid =
+'kine'::regclass` lists both parameters, and a second start runs no
+`ALTER` (no "Set storage parameters" line).
+
 ## Patches considered and deliberately NOT taken
 
 Recorded so nobody spends the effort twice. Each was measured.

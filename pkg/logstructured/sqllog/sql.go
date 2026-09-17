@@ -776,6 +776,20 @@ func (s *SQLLog) DbSize(ctx context.Context) (int64, error) {
 	return s.d.GetSize(ctx)
 }
 
+// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+// INTENT: forward the optional live-bytes figure from the dialect (the pgsql
+// driver offers one). Returns nil when the dialect has none, so sqlite and
+// the others are untouched.
+// CONFLICT: this is an added method; keep it as is.
+func (s *SQLLog) LiveSize() server.SizeSource {
+	if d, ok := s.d.(server.LiveSizer); ok {
+		return d.LiveSize()
+	}
+	return nil
+}
+
+// KUBEHZ-PATCH P2 END
+
 func (s *SQLLog) Compact(ctx context.Context, targetCompactRev int64) (int64, error) {
 	currentRev, _ := s.CurrentRevision(ctx)
 	if targetCompactRev > currentRev {

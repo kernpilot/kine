@@ -56,6 +56,10 @@ type Config struct {
 	LogFormat             string
 	PeerConfig            drivers.PeerConfig
 	S3Config              drivers.S3Config
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// QuotaBytes is the database size limit in bytes. 0 means no limit.
+	QuotaBytes int64
+	// KUBEHZ-PATCH P2 END
 }
 
 type ETCDConfig struct {
@@ -134,6 +138,38 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 	if err := backend.Start(bctx); err != nil {
 		return ETCDConfig{}, fmt.Errorf("starting kine backend: %w", err)
 	}
+
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: with --quota-bytes > 0 the backend handed to server.New is
+	//   wrapped by server.WithQuota. The limit compares live data when the
+	//   driver reports it (server.LiveSizer, pgsql), else the physical DbSize.
+	//   Both are sampled once here, and a failed first sample fails Listen:
+	//   setup just succeeded on the same pool, so a failing size query is a
+	//   real fault, and serving with no limit until the next tick would break
+	//   "refuses from the first write". Then every QuotaSampleInterval on
+	//   bctx, which ends with the gRPC server.
+	// CONFLICT: keep upstream's order (Start, then New). The sampler must read
+	//   from the unwrapped backend; the wrapped one is what serves. The error
+	//   return takes the same path as a failed backend.Start (bcancel via the
+	//   deferred rerr check).
+	if config.QuotaBytes > 0 {
+		quota := server.NewQuota(config.QuotaBytes)
+		physical := backend.DbSize
+		live, figure := liveSizeOf(backend), "live data"
+		if live == nil {
+			live, figure = physical, "database size (this driver reports no live figure)"
+		}
+		if err := quota.Sample(bctx, live, physical); err != nil {
+			return ETCDConfig{}, fmt.Errorf("quota: the first size sample failed: %w", err)
+		}
+		go quota.Run(bctx, server.QuotaSampleInterval, live, physical)
+		backend = server.WithQuota(backend, quota)
+		if config.MetricsRegisterer != nil {
+			config.MetricsRegisterer.MustRegister(metrics.QuotaBytes, metrics.LiveBytes, metrics.DBSizeBytes)
+		}
+		logrus.Infof("quota: the limit is %d bytes of %s, sampled every %s", config.QuotaBytes, figure, server.QuotaSampleInterval)
+	}
+	// KUBEHZ-PATCH P2 END (the liveSizeOf seam is declared at the end of this file)
 
 	// set up GRPC server and register services
 	b := server.New(backend, endpointScheme(config), config.NotifyInterval, config.EmulatedETCDVersion)
@@ -322,3 +358,8 @@ func (l *loggingServerStream) SendMsg(m any) error {
 func (l *loggingServerStream) RecvMsg(m any) error {
 	return l.ServerStream.RecvMsg(m)
 }
+
+// KUBEHZ-PATCH P2 (seam) — see kubehz/MERGE-GUIDE.md#p2. The live-size lookup
+// Listen uses; a variable so the Listen test can hand it a failing source
+// without a driver that fails. Never set outside tests.
+var liveSizeOf = server.LiveSizeOf
