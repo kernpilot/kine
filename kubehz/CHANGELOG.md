@@ -12,6 +12,33 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+Nothing yet.
+
+---
+
+## Released `v0.17.0-kubehz.3` — on upstream `v0.17.0` (`6fb95f5`); release commit `a390482`
+
+Image `ghcr.io/kernpilot/kine:v0.17.0-kubehz.3`, index digest
+
+```
+sha256:40e3d839fcc1800ec38b8ce67f99d580ce9cf6376f3831d40ef88a62e6edb7a8
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-09-17). The moving
+`kubehz` tag now points at the same digest. `publish-kubehz.yml` built and
+signed it: keyless cosign signature, buildkit provenance and SBOM in the
+index, and an attested SPDX SBOM. The run's own verify gate passed (run
+`35193544031`). Consumers pin the digest above (`KUBEHZ_EXTCP_KINE_IMAGE`).
+Carries P1 and its hardening from the two releases before. This release adds
+P2, the per-database size limit (`--quota-bytes`), and P3, the storage
+parameters that keep the kine table's statistics current. Both sections are
+below.
+
+The release's own CI ran the P2 estimate against a real PostgreSQL
+(`TestKubehzP2P3Postgres`). On 200 rows of 65,536 incompressible bytes the
+estimate read 13,187,400 bytes against an actual 13,107,400, a ratio of
+1.006. The test bound is 0.9 to 1.3.
+
 ### P3 — storage parameters on the kine table
 
 Adds `pkg/drivers/pgsql/kubehz_reloptions.go`. Touches `setup()` (one flag
