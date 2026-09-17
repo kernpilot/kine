@@ -18,23 +18,52 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. It carries one patch, P1, which touches
-three files: `pkg/drivers/pgsql/notify.go` is new and cannot conflict;
-`pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go` carry
-small marker-wrapped edits. `sqllog/sql.go` is a file upstream churns (~21
-commits a year), so that edit is written to be dropped cheaply, and is a
-candidate for upstreaming rather than indefinite carrying. Beside the three
-source files, the fork carries its own tests (`pkg/drivers/pgsql/
-kubehz_notify_test.go`, `pkg/logstructured/sqllog/kubehz_notify_test.go`),
-two workflow files (`unit.yml` gains a P1 step, `publish-kubehz.yml` is
-ours), a few `.gitignore` lines, and the `kubehz/` and `benchmarks/`
-directories. Nothing else differs from upstream; the check is
+The fork is deliberately narrow. It carries three patches.
+
+P1 touches three files. `pkg/drivers/pgsql/notify.go` is new and cannot
+conflict. `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`
+carry small marker-wrapped edits. `sqllog/sql.go` is a file upstream churns
+(~21 commits a year), so that edit is written to be dropped cheaply, and is
+a candidate for upstreaming rather than indefinite carrying.
+
+P2 (the `--quota-bytes` limit on live data) adds `pkg/server/kubehz_quota.go`,
+`pkg/metrics/kubehz_quota.go` and `pkg/drivers/pgsql/kubehz_quota.go`, and
+carries marker-wrapped edits in `pkg/app/app.go` (the flag),
+`pkg/endpoint/endpoint.go` (the config field and the wiring),
+`pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
+and `pkg/logstructured/sqllog/sql.go` (one forwarding method each).
+
+P3 (storage parameters on the kine table) adds
+`pkg/drivers/pgsql/kubehz_reloptions.go` and touches `setup()` (one flag from
+its CockroachDB probe) and `New()` in `pkg/drivers/pgsql/pgsql.go`. The
+`CREATE TABLE` statement stays upstream's.
+
+Beside those source files, the fork carries its own tests (every
+`kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
+provides), two workflow files (`unit.yml` gains a step per patch and that
+service, `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the
+`kubehz/` and `benchmarks/` directories. Nothing else differs from
+upstream. The check, from the repository root, is
 
 ```bash
 git diff --stat upstream-master..main -- . ':!benchmarks' ':!kubehz' ':!.github' ':!.gitignore' ':!**/kubehz_*_test.go'
 ```
 
-which must list exactly `notify.go`, `pgsql.go` and `sqllog/sql.go`.
+which must list exactly these files:
+
+```
+pkg/app/app.go
+pkg/drivers/pgsql/kubehz_quota.go
+pkg/drivers/pgsql/kubehz_reloptions.go
+pkg/drivers/pgsql/notify.go
+pkg/drivers/pgsql/pgsql.go
+pkg/endpoint/endpoint.go
+pkg/logstructured/logstructured.go
+pkg/logstructured/sqllog/sql.go
+pkg/metrics/kubehz_quota.go
+pkg/server/kubehz_quota.go
+pkg/server/kv.go
+```
 
 ## Principles
 
