@@ -55,7 +55,7 @@ var liveSizeSQL = fmt.Sprintf(`
 			GROUP BY s.n_live_tup
 		), 0)::bigint
 		+ COALESCE((
-			SELECT t.n_live_tup * %d
+			SELECT 0 * t.n_live_tup * %d -- MUTATION: the TOAST term contributes nothing
 			FROM pg_class AS c
 			JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
 			WHERE c.oid = 'kine'::regclass
