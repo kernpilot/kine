@@ -211,6 +211,16 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	owedAtTableSize("the source after a reset that follows new rows", live)
+	// the insert counters that sample read were 0 (they only go up until the
+	// next reset), so only the vacuum counts can show the second reset below
+	var heapIns, toastIns, heapRel, toastRel, heapVac, toastVac int64
+	var hasToast bool
+	if err := db.QueryRowContext(ctx, statsCountersSQL).Scan(&heapIns, &toastIns, &heapRel, &toastRel, &heapVac, &toastVac, &hasToast); err != nil {
+		t.Fatal(err)
+	}
+	if heapIns != 0 || toastIns != 0 {
+		t.Fatalf("insert counters %d and %d after the reset; the second reset needs them at 0 to test the vacuum baseline", heapIns, toastIns)
+	}
 	refreshPass("after a reset that follows new rows")
 	// another reset before the source sampled again: the refresh's vacuum
 	// counts are the baseline, so it still shows as a decrease

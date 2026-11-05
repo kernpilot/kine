@@ -782,20 +782,22 @@ func TestKubehzP2PendingWindow(t *testing.T) {
 // settles it, as the PostgreSQL dialect's does.
 // onPass, when set, runs inside each pass (a slow pass moves the fake clock).
 type reliefFake struct {
-	targets   []int64 // the compaction passes' targets
-	refreshes int     // the refresh passes
-	calls     []string
-	rows      int64
-	refreshed bool
-	owed      bool
-	noStats   bool          // the backend keeps no statistics: deleted rows owe no refresh
-	uncertain bool          // the pass's commit failed and can have deleted rows: stale with 0 rows
-	head      int64         // 0: the current revision of cur is the head
-	cur       *atomic.Int64 // set by reliefSetup
-	err       error
-	short     bool // the pass stops 10 revisions short of its target
-	onPass    func()
-	budgets   []time.Duration // the time each pass had left when it began
+	targets     []int64 // the compaction passes' targets
+	refreshes   int     // the refresh passes
+	calls       []string
+	rows        int64
+	refreshed   bool
+	owed        bool
+	noStats     bool          // the backend keeps no statistics: deleted rows owe no refresh
+	uncertain   bool          // the pass's commit failed and can have deleted rows: stale with 0 rows
+	head        int64         // 0: the current revision of cur is the head
+	cur         *atomic.Int64 // set by reliefSetup
+	err         error
+	short       bool // the pass stops 10 revisions short of its target
+	onPass      func()
+	budgets     []time.Duration // the time each pass had left when it began
+	block       bool            // a refresh pass waits for its context, 5 s at most
+	interrupted bool            // a blocked refresh pass ended because its context did
 }
 
 func (r *reliefFake) RelieveQuota(ctx context.Context, target int64, refresh bool) (ReliefResult, error) {
@@ -808,6 +810,14 @@ func (r *reliefFake) RelieveQuota(ctx context.Context, target int64, refresh boo
 	if refresh {
 		r.refreshes++
 		r.calls = append(r.calls, "refresh")
+		if r.block {
+			select {
+			case <-ctx.Done():
+				r.interrupted = true
+				return ReliefResult{}, ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
 		if !r.refreshed {
 			return ReliefResult{}, errors.New("refresh failed")
 		}
@@ -1180,11 +1190,15 @@ func TestKubehzP2ReliefBudgets(t *testing.T) {
 		}
 	}
 
-	// the sampler stops during a refresh: no failure counted, still owed
+	// the sampler stops during a refresh: the refresh ends with it, no
+	// failure counted, still owed
 	cctx, cancel := context.WithCancel(ctx)
-	relief.rows, relief.owed, relief.refreshed = 0, true, false
+	relief.rows, relief.owed, relief.refreshed, relief.block = 0, true, false, true
 	relief.onPass = cancel
 	quota.tick(cctx, live, nil)
+	if !relief.interrupted {
+		t.Fatalf("passes %v; want the refresh to end when the sampler stops, not wait for its budget", relief.calls)
+	}
 	if quota.refreshFails != 0 || !quota.refreshOwed {
 		t.Fatalf("a refresh cut off by the stop: %d failures counted, owed %v; want 0 and still owed", quota.refreshFails, quota.refreshOwed)
 	}

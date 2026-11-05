@@ -139,6 +139,18 @@ skips it after a second, a short pass gets no quiet tick, autovacuum has
 no deadline during the pause, a slow refresh delays the next sample, the
 reset misses in general terms, and "this bounds retained rows" is gone.
 
+A fifth Astra review, of `45a61bd`, found both points fixed and no new
+defect (verdict: ship). It named low test and wording gaps, and this
+revision closes them: the refresh-budget test now blocks the refresh until
+its context ends, so a refresh that does not stop with the sampler fails
+it; the cancelled-before-the-transaction test is back (round 4 replaced
+it by mistake); the second-reset check first asserts that the insert
+counters read 0, so only the vacuum baseline can see that reset. The
+wording: the delay keeps the bytes written meanwhile reserved (it does not
+make the figure read high), the quiet tick depends on the time since the
+pass ended, and the reset misses are measured against the watch's baseline
+and include counts at or above the catalog's estimates at the first sample.
+
 The new PostgreSQL phase found one more: a VACUUM right after a delete
 reads low. PostgreSQL sets `n_live_tup` to an absolute value in the VACUUM,
 and the deleting backend's counters reach the shared statistics up to
@@ -212,7 +224,8 @@ with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
   (`errVacuumSkipped`, also through the refresh pass, and the reset stays
   owed), a reset while the insert counters already read 0 (the vacuum
   counts see it), a reset right after a refresh and before the next sample
-  (the refresh's baseline sees it), and a VACUUM from elsewhere that
+  (the refresh's baseline sees it; the test first asserts that the insert
+  counters read 0), and a VACUUM from elsewhere that
   settles it. After every refresh pass `StatsOwed` is false at once. Autovacuum
   is off for the later ones, so only a VACUUM the test or the quota runs
   brings `reltuples` up to date.
@@ -231,7 +244,7 @@ Each of these mutations makes a test fail:
 
 The mutations of the first two revisions (25, then 13, all caught) were
 rebuilt for the third, since its passes changed. The mutations of the
-third and fourth revisions, MUT-COUNT-PENDING (each applied to a
+third to fifth revisions, MUT-COUNT-PENDING (each applied to a
 backup copy, the named test run, the file restored and compared). Two
 missed the first run of the third: a first-sample check that ignores a
 VACUUM behaves the same except for one log line, so the test now fails on
@@ -268,7 +281,8 @@ that line; one mutation did not compile. Both are caught since:
 - the fourth revision: a failed commit that owes no refresh, a stale pass
   ignored after an error, the settle not set while paused, a refresh
   budget of hours, a stopped refresh counted as failed, a refresh that
-  does not settle the reset, a refresh that sets no baseline.
+  does not settle the reset, a refresh that sets no baseline
+- the fifth revision: a refresh that does not end when the sampler stops.
 
 Not covered by a test: the reader's load order in `figure` (base, then
 live). A wrong order opens a window of two atomic loads; a seam there

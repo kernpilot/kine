@@ -401,6 +401,20 @@ func TestKubehzP2ReliefLostCommitAck(t *testing.T) {
 	}
 }
 
+// TestKubehzP2ReliefCancelled: a cancelled pass compacts nothing and begins
+// no transaction: the pass's context bounds the transaction too.
+func TestKubehzP2ReliefCancelled(t *testing.T) {
+	d := &reliefDialect{current: 100}
+	s := New(d, 0, 0, 0, 0, 10, 0)
+	s.polledRev.Store(100)
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), reliefCtxKey{}, true))
+	cancel()
+	res, err := s.RelieveQuota(ctx, 20, false)
+	if !errors.Is(err, context.Canceled) || res.Rows != 0 || len(d.batches) != 0 || d.begins != 0 {
+		t.Fatalf("err %v, rows %d, batches %v, transactions %d; want context.Canceled, nothing compacted and no transaction", err, res.Rows, d.batches, d.begins)
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

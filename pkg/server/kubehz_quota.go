@@ -145,8 +145,8 @@ const (
 	// quotaRefreshBudget bounds one refresh pass. A pass refreshes or
 	// compacts, never both, so a VACUUM of a large table does not take the
 	// compaction's time. The next sample waits for it (no 30 s cadence
-	// then); the written bytes keep counting meanwhile, so the figure can
-	// only read high.
+	// then); the bytes written meanwhile are reserved and stay in the
+	// figure.
 	quotaRefreshBudget = 2 * time.Minute
 	// quotaRefreshSettle is how long after a pass that deleted rows the
 	// statistics refresh waits, with no compaction in between. PostgreSQL

@@ -227,14 +227,18 @@ which only feeds a gauge. The rules:
    figure then reads low. While an owed refresh waits for the 15 s, the
    tick runs no pass (a quiet tick): a compaction on every tick would move
    the last delete each time and put the refresh off for as long as there
-   is history to delete. A tick comes every 30 s, so a deleting pass of
-   more than 15 s is followed by a quiet tick and a shorter one by the
-   refresh at once. The 15 s is a margin, not a proof: PostgreSQL gives no
-   flush deadline under contention. An owed refresh also runs while the
+   is history to delete. Whether the next tick is quiet depends on the
+   time since the end of that pass, not on the pass's length alone: a slow
+   sample or a tick that waited also counts. For example, with ticks on
+   time every 30 s, a deleting pass of more than 15 s is followed by a
+   quiet tick, and a shorter one by the refresh at once. The 15 s is a
+   margin, not a proof: PostgreSQL gives no flush deadline under
+   contention. An owed refresh also runs while the
    quota is not full. A refresh pass has 2 min (`quotaRefreshBudget`), a
    compaction pass 20 s. The sampler waits for a pass, so a slow refresh
-   delays the next sample by up to 2 min (the written bytes keep counting,
-   so the figure can only read high meanwhile), and three slow failures
+   delays the next sample by up to 2 min (the bytes written meanwhile are
+   reserved and stay in the figure; the gaps under "Bounds" stay as they
+   are), and three slow failures
    put the compaction off by about 6 min before the pause. On PostgreSQL a
    refresh counts only when the manual `vacuum_count` of the table and of
    its TOAST table went up: `SKIP_LOCKED` skips a table that another
@@ -341,10 +345,12 @@ gaps, accepted with their bounds:
 - The reset watch misses a reset that none of the counters it reads shows.
   On a running source that is a reset after which none of the four counts
   (inserts and vacuums of the table and of its TOAST table) is below the
-  last sample: for example no VACUUM since the reset before, and as many
-  rows inserted after the reset as before it. At the first sample the
-  watch compares the insert counts with the catalog's row estimates, which
-  can be equal by chance. The estimate then misses the rows written after
+  watch's baseline: the last sample's counts, with the vacuum counts of a
+  refresh since then. For example: no VACUUM since the reset before, and
+  as many rows inserted after the reset as before it. At the first sample
+  the watch compares the insert counts with the catalog's row estimates,
+  and misses a reset when both counts are at or above their estimates (a
+  stale `reltuples` can be lower than the rows the counters saw). The estimate then misses the rows written after
   the last VACUUM until autovacuum or autoanalyze brings `reltuples` back.
   That is no stated time or byte bound.
 - kine's own compactor (`--compact-interval`) and autovacuum run outside
