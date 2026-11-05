@@ -164,7 +164,8 @@ vacuum counts go down then, so the watch reads them too.
 
 **Measured.** `TestKubehzP2P3Postgres` on PostgreSQL 17.11, the estimate
 against `SUM(pg_column_size(value) + pg_column_size(old_value))`. PostgreSQL
-18.4 gives the same ratios (it passes there too):
+18.4 gives the same ratios except one, named below the k3s table (it
+passes there too):
 
 | Data | Estimate / actual | Ratio |
 |---|---|---|
@@ -190,7 +191,23 @@ network, limit 48 MiB), on the first implementation `53bc833`:
 | Hostile checks (a new ConfigMap, a Lease +12 KB, a ConfigMap +1 KB refused; a small new Lease accepted) | not run | 4 of 4 as expected |
 | Delete the fill | the figure rose to 246 MiB and stayed | rose to 98 MB, then below the limit 61 s after the delete, with no staff step (relief: 482 rows) |
 
-K3S-FINAL-PENDING
+The same scenario on the code of this revision, `3060e7b` (later commits
+change only these notes), against PostgreSQL 17, on two k3s versions:
+
+| Step | k3s v1.36.6 | k3s v1.37.2 |
+|---|---|---|
+| Fill with 900 KB ConfigMaps | refused at write 55 (47 MiB), after 9 s | refused at write 55, after 9 s |
+| 3 min at the limit | 0 exits, the Lease renewed every 30 s, node Ready | the same |
+| Hostile checks | 4 of 4 as expected | 4 of 4 as expected |
+| Delete the fill | puts accepted again 246 s after the delete, with no staff step; live data 0.8 MB | puts accepted again 231 s after the delete, with no staff step; live data 0.9 MB |
+
+The recovery takes longer than on `53bc833` because the relief now
+compacts only revisions at least 2 min old (`QuotaReliefLag`), and on
+PostgreSQL the statistics refresh waits 15 s after the last deleting pass.
+On `5a7d308` (the third revision) the same runs took 231 s and 260 s.
+`TestKubehzP2P3Postgres` passes on PostgreSQL 18.4 with `3060e7b` as well.
+There, one reading differs from the table above: "100 rows written after
+the last VACUUM" read 0.971 (inside the test's band of 0.9 to 1.3).
 
 **Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`,
 with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
@@ -244,7 +261,7 @@ Each of these mutations makes a test fail:
 
 The mutations of the first two revisions (25, then 13, all caught) were
 rebuilt for the third, since its passes changed. The mutations of the
-third to fifth revisions, MUT-COUNT-PENDING (each applied to a
+third to fifth revisions: 64, all caught on `3060e7b` (each applied to a
 backup copy, the named test run, the file restored and compared). Two
 missed the first run of the third: a first-sample check that ignores a
 VACUUM behaves the same except for one log line, so the test now fails on
