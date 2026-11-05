@@ -147,11 +147,12 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 	//   setup just succeeded on the same pool, so a failing size query is a
 	//   real fault, and serving with no limit until the next tick would break
 	//   "refuses from the first write". Then every QuotaSampleInterval on
-	//   bctx, which ends with the gRPC server.
-	// CONFLICT: keep upstream's order (Start, then New). The sampler must read
-	//   from the unwrapped backend; the wrapped one is what serves. The error
-	//   return takes the same path as a failed backend.Start (bcancel via the
-	//   deferred rerr check).
+	//   bctx, which ends with the gRPC server, with a relief pass (compaction
+	//   of the history) after each sample that finds the quota full (B481).
+	// CONFLICT: keep upstream's order (Start, then New). The sampler and the
+	//   relief must use the unwrapped backend; the wrapped one is what
+	//   serves. The error return takes the same path as a failed
+	//   backend.Start (bcancel via the deferred rerr check).
 	if config.QuotaBytes > 0 {
 		quota := server.NewQuota(config.QuotaBytes)
 		physical := backend.DbSize
@@ -162,12 +163,15 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 		if err := quota.Sample(bctx, live, physical); err != nil {
 			return ETCDConfig{}, fmt.Errorf("quota: the first size sample failed: %w", err)
 		}
-		go quota.Run(bctx, server.QuotaSampleInterval, live, physical)
+		if relief := server.QuotaReliefOf(backend); relief != nil {
+			quota.EnableRelief(relief, backend.CurrentRevision)
+		}
+		go quota.Run(bctx, quotaSampleInterval, live, physical)
 		backend = server.WithQuota(backend, quota)
 		if config.MetricsRegisterer != nil {
-			config.MetricsRegisterer.MustRegister(metrics.QuotaBytes, metrics.LiveBytes, metrics.DBSizeBytes)
+			config.MetricsRegisterer.MustRegister(metrics.QuotaMetrics()...)
 		}
-		logrus.Infof("quota: the limit is %d bytes of %s, sampled every %s", config.QuotaBytes, figure, server.QuotaSampleInterval)
+		logrus.Infof("quota: the limit is %d bytes of %s, sampled every %s; the lanes stop at %d bytes", config.QuotaBytes, figure, quotaSampleInterval, quota.Ceiling())
 	}
 	// KUBEHZ-PATCH P2 END (the liveSizeOf seam is declared at the end of this file)
 
@@ -363,3 +367,8 @@ func (l *loggingServerStream) RecvMsg(m any) error {
 // Listen uses; a variable so the Listen test can hand it a failing source
 // without a driver that fails. Never set outside tests.
 var liveSizeOf = server.LiveSizeOf
+
+// quotaSampleInterval is how often Listen's quota samples and, while full,
+// compacts. A variable so the relief test can tick fast. Never set outside
+// tests.
+var quotaSampleInterval = server.QuotaSampleInterval

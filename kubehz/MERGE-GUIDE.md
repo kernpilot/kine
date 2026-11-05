@@ -124,44 +124,78 @@ a correctness fix.
 
 ### P2 — per-database size limit (`--quota-bytes`)
 
-**Files** `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go` and
-`pkg/drivers/pgsql/kubehz_quota.go` (new, conflict-free). Edits: `pkg/app/app.go`
-(the flag), `pkg/endpoint/endpoint.go` (the config field and the wiring),
-`pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
-and `pkg/logstructured/sqllog/sql.go` (one forwarding method each). Tests
+**Files** `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
+`pkg/drivers/pgsql/kubehz_quota.go` and `pkg/logstructured/sqllog/kubehz_relief.go`
+(new, conflict-free). Edits: `pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go`
+(the config field, the wiring and two test seams), `pkg/server/kv.go` (two log
+conditions), `pkg/logstructured/logstructured.go` (two forwarding methods) and
+`pkg/logstructured/sqllog/sql.go` (one forwarding method), and `go.mod`
+(`golang.org/x/time` is a direct dependency now). Tests
 `pkg/server/kubehz_quota_test.go`, `pkg/app/kubehz_quota_test.go`,
 `pkg/endpoint/kubehz_quota_test.go` (a real kine on sqlite through
-`Listen`), `pkg/drivers/pgsql/kubehz_quota_test.go` and
-`pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain),
+`Listen`, the B481 relief end to end), `pkg/drivers/pgsql/kubehz_quota_test.go`
+and `pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain),
 and `pkg/drivers/pgsql/kubehz_pgsql_test.go` against the PostgreSQL
-service `unit.yml` runs (skipped without `KINE_TEST_PGSQL_DSN`).
-`unit.yml` fails when they are missing.
+service `unit.yml` runs (skipped without `KINE_TEST_PGSQL_DSN`; it needs a
+role that may call `pg_stat_reset()`). `unit.yml` fails when they are missing.
 
 **Problem.** Upstream kine has no size limit: `Alarm` is unsupported, there
 is no quota flag, and PostgreSQL has no per-database quota. One kine per
 tenant on a shared PostgreSQL lets one tenant fill the shard. etcd caps the
 store with `--quota-backend-bytes`: above it the capped applier refuses
-puts with `ErrGRPCNoSpace` and keeps reads, deletes and compaction working,
-and the apiserver already handles that error.
+every put with `ErrGRPCNoSpace` and keeps reads, deletes and compaction.
+The first version of P2 copied that, and B481 showed what it does to a
+cluster that reaches the limit: k3s loses its leader-election Lease and
+exits, a delete makes the figure larger (the delete row keeps the old
+value), and the apiserver's compaction starts with a put the limit refuses,
+so nothing ever frees the space. Only staff could bring it back.
 
 **Approach.** `--quota-bytes <n>`, default 0 = no limit. With a limit,
-`endpoint.Listen` wraps the backend in `server.WithQuota` and samples two
-figures once at start and then every `server.QuotaSampleInterval` (30 s):
-live data, which the limit compares, and the physical size the `Status`
-RPC already reports (`Backend.DbSize`), which only feeds a gauge. A failed
-first sample fails `Listen` (same path as a failed `backend.Start`): setup
-just succeeded on the same pool, so the query is at fault, and the process
-manager restarts kine instead of it serving with no limit. The
-wrapper returns `rpctypes.ErrGRPCNoSpace` from `Create` and `Update` while
-the last live sample is at or above the limit. Everything else passes
-through. So `Put` and every `Txn` that puts are refused (the apiserver's
-compaction bookkeeping key included, as in etcd), while Range, Watch,
-delete transactions and `Compact` keep working. One INFO line on each
-transition. Three gauges, `kine_quota_bytes`, `kine_live_bytes` and
-`kine_db_size_bytes`, registered only with a limit. `kv.go` skips the
-per-request error log for this one error: the apiserver answers 500, its
-clients and controllers retry, and that line prints the full request each
-time.
+`endpoint.Listen` wraps the backend in `server.WithQuota`, samples two
+figures once at start (a failed first sample fails `Listen`), and then
+every `server.QuotaSampleInterval` (30 s): live data, which the limit
+compares, and the physical size the `Status` RPC reports (`Backend.DbSize`),
+which only feeds a gauge. The rules:
+
+1. The figure is the last good live sample plus the bytes this process
+   wrote since the good sample two samples back. Every put reserves its
+   bytes before the check and gives them back when it is refused or
+   fails, so concurrent writes see each other and the limit is passed by
+   one write at most. A create counts key + value, an update key + 2 ×
+   value (the row also carries the old value). A failed sample changes
+   nothing, so the bytes keep adding up and a sampler that keeps failing
+   refuses writes (fail closed).
+2. At or above the limit ("full") a new key is refused, except a small
+   control key. Deletes, reads, watches and `Compact` pass. An update
+   passes only if it does not grow the value by more than 64 bytes; it is
+   then charged key + new + old exactly (the check reads the key). Two
+   token buckets: the control lane (`/registry/leases/`,
+   `/registry/masterleases/` and kine's stand-in for the apiserver's
+   compaction key, values up to 4 KiB, 100/s) and the cleanup lane (every
+   other key, 20/s and 4 MiB/s). An update that cannot write (no such key,
+   a stale compare revision) passes without a charge.
+3. The lanes stop at the ceiling, `2 × limit + 64 MiB`: a lane write passes
+   only while figure + its cost stays at or below it. Deletes are never
+   refused, so the database can hold up to the ceiling plus the data deleted
+   since the last relief pass.
+4. Relief. After each sample that finds the quota full, one pass compacts
+   the history up to the revision of the previous sample. It never passes
+   the revision the poller has sent to watchers, and never the newest row.
+   It does not go through `compact()`, whose `--compact-min-retain` floor
+   would keep the deleted rows while no new revision comes. Each batch is
+   its own transaction that commits or rolls back (never `MustCommit`).
+   When rows went, the dialect refreshes its statistics (PostgreSQL:
+   `VACUUM (ANALYZE, SKIP_LOCKED) kine`) and the figure is read again.
+5. The PostgreSQL estimate uses `GREATEST(n_live_tup, reltuples)` for the
+   heap and TOAST row counts, because a crash and a promoted standby reset
+   `n_live_tup`, and analyzes the table first when `pg_stats` has no row
+   for it. Each size query has its own 10 s deadline.
+
+INFO lines on each transition and on each relief pass. The metrics
+(`metrics.QuotaMetrics()`) are registered only with a limit. `kv.go`
+skips the per-request error log for the no-space error: the apiserver
+answers 500, its clients and controllers retry, and that line prints the
+full request each time.
 
 **Which bytes, and why.** On PostgreSQL the relation plateaus under
 autovacuum (kine's compaction deletes old revisions, autovacuum makes the
@@ -169,49 +203,63 @@ space reusable), and after a write-then-delete spike the file stays large
 while live data is small. A limit on `pg_total_relation_size` would then
 refuse a customer who holds almost nothing, so the file is a capacity
 figure for whoever runs the PostgreSQL, and the limit is on live data. The
-pgsql driver estimates it in one query with two terms. Heap:
-`n_live_tup × Σ avg_width` from `pg_stat_user_tables` and `pg_stats`.
-`ANALYZE` measures a datum as stored inline, so an out-of-line TOAST value
-(a `value` or `old_value` above about 2 KB after compression) counts as
-its 18-byte pointer here. TOAST: the toast relation's `n_live_tup × 1996`
-(`TOAST_MAX_CHUNK_SIZE` on 8 KB pages), an upper bound within one chunk
-per value. The whole figure is the compressed on-disk size of live rows,
-so it reads smaller than etcd's uncompressed in-use figure for the same
-objects. Two catalog lookups, no scan, no indexes or page overhead.
-`pgstattuple_approx` would be closer but needs an extension the tenant
-role cannot create. Preconditions: `New()` runs `ANALYZE kine` once when
-`pg_stats` has no row for the table (else the heap term is 0), and
-autovacuum must be enabled for the statistics to stay current (the CNPG
-default). The source travels as the
+pgsql driver estimates it in one query with two terms. Heap: rows ×
+`Σ avg_width` from `pg_stats`. `ANALYZE` measures a datum as stored inline,
+so an out-of-line TOAST value (a `value` or `old_value` above about 2 KB
+after compression) counts as its 18-byte pointer here. TOAST: the toast
+relation's rows × 1996 (`TOAST_MAX_CHUNK_SIZE` on 8 KB pages), an upper
+bound within one chunk per value. The whole figure is the compressed
+on-disk size of live rows, so it reads smaller than etcd's uncompressed
+in-use figure for the same objects. Catalog lookups only, no scan, no
+indexes or page overhead. `pgstattuple_approx` would be closer but needs an
+extension the tenant role cannot create. The source travels as the
 optional interface `server.LiveSizer`, asserted at the call site like
 `RevisionNotify` in P1: the pgsql `notifyingDialect` offers it, `SQLLog`
 and `LogStructured` forward it, `endpoint.Listen` asks for it and falls
-back to `DbSize` when it gets nil (sqlite, the others).
+back to `DbSize` when it gets nil (sqlite, the others). The relief travels
+the same way as `server.QuotaRelief` (`SQLLog` implements it,
+`LogStructured` forwards it), and the statistics refresh as
+`server.StatsRefresher` on the dialect.
 
-**Invariant.** The sizes are sampled, never queried on the write path: a
-write costs one atomic load. A failed sample keeps the last value and never
-clears the limit. The first sample must succeed or kine does not start. On
+**Bounds, for a tenant that is hostile.** Above the limit only the two
+lanes put, at their rates, and a lane value grows by 64 bytes per update
+at most. The ceiling bounds where that ends. A tenant that spends the
+lanes on its own keys can starve its own controllers' renewals; that
+harms only its own cluster. This bounds retained rows, not the physical
+file or the WAL, which are the PostgreSQL operator's (CNPG volume and WAL
+limits).
+
+**Invariant.** The sizes are sampled, never queried on the write path
+while below the limit: a write costs atomic operations. Only a write while
+full reads its key. A failed sample keeps the last value and never clears
+the limit. The first sample must succeed or kine does not start. On
 PostgreSQL the compared figure is live data: if a rebase loses a
 forwarding method the limit silently becomes a file-size limit, which is
-why `TestKubehzP2LiveSizeChain` exists. The TOAST term is load-bearing:
-without it the figure misses most of the data, which is why
-`TestKubehzP2P3Postgres` measures the estimate against
-`pg_column_size` on a real PostgreSQL.
+why `TestKubehzP2LiveSizeChain` exists; if it loses the relief forward or
+the wiring, B481 comes back, which is why `TestKubehzP2ListenRelief`
+exists. The TOAST term and the `reltuples` floor are load-bearing, which is
+why `TestKubehzP2P3Postgres` measures the estimate against `pg_column_size`
+on a real PostgreSQL, also after `pg_stat_reset()` and after a
+`RefreshStats`.
 
 **Not an optimisation.** This is a safety bound. There is no benchmark to
 re-measure. The test suite is the check.
 
-**If it conflicts.** The three new files never conflict. If upstream changes
+**If it conflicts.** The new files never conflict. If upstream changes
 the flag table, re-add the one `Int64Flag`. If `endpoint.Listen` is
 restructured, keep upstream's order (backend `Start`, then `server.New`) and
-re-express the block: sample from the unwrapped backend, hand the wrapped
-one to `server.New`. The two forwarding methods are additions next to
-`DbSize`. Re-add them wherever `DbSize` lands. If upstream changes `Backend`
-so that puts no longer go through `Create`/`Update`, move the check to
-whatever the new write methods are. The test on a fake backend shows which
-calls must be refused. If upstream adds its own size limit, drop P2 and map
-`--quota-bytes` onto it. `New()` in `pgsql.go` also carries the one-time
-`ANALYZE` block. Keep it after `setup()`.
+re-express the block: sample and relieve from the unwrapped backend, hand
+the wrapped one to `server.New`. The forwarding methods are additions next
+to `DbSize`. Re-add them wherever `DbSize` lands. If upstream changes
+`Backend` so that puts no longer go through `Create`/`Update`, move the
+checks to whatever the new write methods are. The tests on a fake backend
+show which calls must be refused and which must pass. If upstream changes
+the poll loop's `polledRev` or the transaction methods the relief uses
+(`CurrentRevision`, `GetCompactRevision`, `Compact`, `SetCompactRevision`),
+re-check `kubehz_relief.go` against the new contract. If upstream adds its
+own size limit, compare it with B481 before mapping `--quota-bytes` onto
+it. `New()` in `pgsql.go` also carries the one-time `ANALYZE` block. Keep
+it after `setup()`.
 
 **Re-verify** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`,
 with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part.

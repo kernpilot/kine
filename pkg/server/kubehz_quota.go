@@ -3,15 +3,40 @@ package server
 // KUBEHZ-PATCH P2 — per-database size limit. This whole file is ours; see
 // kubehz/MERGE-GUIDE.md#p2.
 //
-// INTENT: with --quota-bytes > 0, a database whose live data is at or above
-//   the limit refuses new keys and new values with etcd's no-space error,
-//   and keeps serving reads, deletes, watches and compaction. That is what
-//   etcd's capped applier does once its NOSPACE alarm is armed, and the
-//   apiserver already handles it.
+// INTENT: with --quota-bytes L > 0, a database whose figure is at or above L
+//   ("full") refuses new keys with etcd's no-space error and keeps serving
+//   reads, deletes, watches and compaction. Unlike etcd's capped applier it
+//   also keeps the cluster able to run and to clean up while full (B481):
+//   - an update of an EXISTING key that does not grow the value passes
+//     inside a rate limit. Leader-election Leases, kine's stand-in for the
+//     apiserver's compaction key, a deletionTimestamp and a finalizer
+//     removal are such updates. Without them k3s exits on its first lost
+//     lease and the tenant can never delete its way back;
+//   - a small create or update of a control key (Leases, master leases, the
+//     compaction key) passes in its own rate limit;
+//   - the sampler compacts history by itself while full (QuotaRelief), so a
+//     delete frees space within a few intervals without staff.
 //
 // INVARIANT: the size is sampled, never queried on the write path. A write
-//   costs one atomic load. The last good sample stays in use when a sample
-//   fails, so a flaky size query never lifts the limit by itself.
+//   below the limit costs atomic loads and two atomic adds at most. The
+//   figure is the last good live sample plus the bytes this process wrote
+//   since the good sample TWO samples back (60 to 90 s). PostgreSQL flushes
+//   a busy backend's counters within 1 s, an idle one within 10 s, and
+//   forces a flush after 60 s, so a write the statistics do not show yet is
+//   still in the figure. The overlap counts some writes twice, which only
+//   refuses early. A failed sample changes neither term, so the written
+//   bytes keep adding up: a sampler that keeps failing refuses writes after
+//   (L - live) bytes, it fails closed.
+//
+// INVARIANT: every put reserves its bytes BEFORE the check, so concurrent
+//   writes see each other: the limit is passed by one write at most. A
+//   refused or failed write gives its bytes back. A create counts key +
+//   value; an update counts key + 2 x value below the limit (the new row
+//   also carries the old value; over a key's life the charge is at least the
+//   bytes written, less the key's first value) and key + new + old value
+//   exactly when full, because the check reads the key anyway. A delete is
+//   never refused and not counted; its row keeps the old value until
+//   compaction, so the next sample shows it.
 //
 // INVARIANT: the compared figure is LIVE data where the driver can report
 //   it, not the file. On PostgreSQL the relation plateaus under autovacuum:
@@ -23,17 +48,33 @@ package server
 //   kine_db_size_bytes gauge. A driver without a live figure (sqlite) falls
 //   back to its DbSize, which is pages minus the free list.
 //
-// Every put is refused above the limit, the apiserver's compaction
-// bookkeeping key included, exactly as in etcd.
+// INVARIANT (the bounds a hostile tenant keeps):
+//   - Above L only the two lanes put. The control lane writes values of at
+//     most quotaControlMaxValue bytes at quotaControlRate; the cleanup lane
+//     writes no-growth updates at quotaCleanupOps and quotaCleanupBytes
+//     (charged key + new + old).
+//   - The ceiling 2L + quotaCeilingMargin is a put-admission threshold: a
+//     lane write passes only while figure + its cost stays at or below it.
+//     It is that high so that a tenant who deletes all its data at L (each
+//     delete row keeps the old value until compaction) does not close the
+//     lease lane in the middle of its cleanup. Deletes are never refused, so
+//     the database can hold up to the ceiling plus the data deleted since
+//     the last relief pass; relief removes that within about two intervals.
+//   - A tenant that spends the lanes' rate on its own keys can starve its own
+//     controllers' renewals. That harms only its own cluster.
+//   This bounds retained rows, not the physical file or the WAL; those are
+//   the PostgreSQL operator's (CNPG volume and WAL limits).
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/k3s-io/kine/pkg/metrics"
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	"golang.org/x/time/rate"
 )
 
 // ErrNoSpace is the error a write gets above the limit. It is etcd's own
@@ -41,10 +82,46 @@ import (
 var ErrNoSpace = rpctypes.ErrGRPCNoSpace
 
 // QuotaSampleInterval is how often the sizes are read for the quota check.
-// Every sample is one or two cheap catalog queries, so 30 s costs nothing
-// measurable and bounds how long live data can grow past the limit before
-// writes stop.
+// Every sample is a few cheap catalog queries, so 30 s costs nothing
+// measurable. The written-bytes term covers the time between samples.
 const QuotaSampleInterval = 30 * time.Second
+
+const (
+	// quotaQueryTimeout bounds one size query, so a hung query cannot stop
+	// the sampler; a timed-out sample counts as a failed one.
+	quotaQueryTimeout = 10 * time.Second
+	// quotaReliefBudget bounds one relief pass (compaction and statistics),
+	// so a pass ends before the next sample is due.
+	quotaReliefBudget = 20 * time.Second
+	// quotaGrowthSlack is how much larger a value may get in an update while
+	// full. A Lease renewal changes renewTime, whose encoding can grow by a
+	// byte or two; deletionTimestamp and a finalizer removal add a few bytes
+	// or none.
+	quotaGrowthSlack = 64
+	// quotaControlMaxValue is the largest value the control lane writes. A
+	// Lease is a few hundred bytes; a larger one goes to the cleanup lane.
+	quotaControlMaxValue = 4 << 10
+	// quotaCeilingMargin is added to twice the limit to make the ceiling, so a
+	// small limit still has room for the deletes of its own cleanup.
+	quotaCeilingMargin = 64 << 20
+)
+
+// The lanes' rates. A 100-node k3s cluster renews about 15 Leases a second.
+var (
+	quotaControlRate       = rate.Limit(100)
+	quotaControlBurst      = 200
+	quotaCleanupOps        = rate.Limit(20)
+	quotaCleanupBurst      = 50
+	quotaCleanupBytes      = rate.Limit(4 << 20)
+	quotaCleanupBytesBurst = 16 << 20
+)
+
+// quotaControlPrefixes are the keys of the control lane: coordination Leases
+// (leader election, node heartbeats, apiserver identity), the endpoint
+// reconciler's master leases, and kine's stand-in for the apiserver's
+// compaction key (compact.go). The names say which bucket a write uses; they
+// do not make a caller trusted.
+var quotaControlPrefixes = []string{"/registry/leases/", "/registry/masterleases/", string(compactRevAPI)}
 
 // SizeSource reads one size figure in bytes.
 type SizeSource func(context.Context) (int64, error)
@@ -67,19 +144,78 @@ func LiveSizeOf(backend Backend) SizeSource {
 	return nil
 }
 
-// Quota holds a limit on live bytes and the last sampled figures. A zero
-// limit means no limit; WithQuota then returns the backend unchanged.
+// ReliefResult is what one relief pass did.
+type ReliefResult struct {
+	// Rows is the number of rows the pass deleted.
+	Rows int64
+	// CompactedTo is the compact revision after the pass.
+	CompactedTo int64
+}
+
+// QuotaRelief is an optional interface a backend or a log can offer: compact
+// history up to target, never past what its own watchers were sent and never
+// the newest row, then refresh the statistics the live figure reads when
+// rows were deleted. Asserted at the call site like LiveSizer.
+type QuotaRelief interface {
+	RelieveQuota(ctx context.Context, target int64) (ReliefResult, error)
+}
+
+// QuotaReliefOf returns the relief of backend, or nil when it offers none.
+func QuotaReliefOf(backend Backend) QuotaRelief {
+	if r, ok := backend.(QuotaRelief); ok {
+		return r
+	}
+	return nil
+}
+
+// StatsRefresher is an optional interface a dialect can offer to bring the
+// statistics behind its live figure up to date after a compaction.
+type StatsRefresher interface {
+	RefreshStats(ctx context.Context) error
+}
+
+// Quota holds a limit on live bytes, the last sampled figures and the
+// written-bytes term. A zero limit means no limit; WithQuota then returns the
+// backend unchanged.
 type Quota struct {
 	limit    int64
+	ceiling  int64
 	live     atomic.Int64
 	physical atomic.Int64
-	full     atomic.Bool
+	// written is every byte this process reserved through the wrapper since
+	// it started, less what refused or failed writes gave back; base is its
+	// value when the good sample two samples back started. The figure is
+	// live + written - base.
+	written atomic.Int64
+	base    atomic.Int64
+	full    atomic.Bool
+	// marks are written at the start of the previous two good samples, the
+	// older first. Sampler goroutine only.
+	marks [2]int64
+
+	control      *rate.Limiter
+	cleanupOps   *rate.Limiter
+	cleanupBytes *rate.Limiter
+
+	// relief and revision are set by EnableRelief before Run starts. prevRev
+	// is the current revision at the previous tick. Sampler goroutine only.
+	relief   QuotaRelief
+	revision func(context.Context) (int64, error)
+	prevRev  int64
 }
 
 // NewQuota returns a quota for limit bytes of live data. limit <= 0 means no
 // limit.
 func NewQuota(limit int64) *Quota {
-	q := &Quota{limit: max(limit, 0)}
+	q := &Quota{
+		limit:        max(limit, 0),
+		control:      rate.NewLimiter(quotaControlRate, quotaControlBurst),
+		cleanupOps:   rate.NewLimiter(quotaCleanupOps, quotaCleanupBurst),
+		cleanupBytes: rate.NewLimiter(quotaCleanupBytes, quotaCleanupBytesBurst),
+	}
+	if q.limit > 0 {
+		q.ceiling = 2*q.limit + quotaCeilingMargin
+	}
 	metrics.QuotaBytes.Set(float64(q.limit))
 	return q
 }
@@ -87,36 +223,78 @@ func NewQuota(limit int64) *Quota {
 // Limit is the configured limit in bytes; 0 when there is none.
 func (q *Quota) Limit() int64 { return q.limit }
 
-// Live is the last sampled live data size in bytes, the figure the limit
-// compares.
+// Ceiling is the put-admission threshold of the lanes.
+func (q *Quota) Ceiling() int64 { return q.ceiling }
+
+// Live is the last sampled live data size in bytes.
 func (q *Quota) Live() int64 { return q.live.Load() }
 
 // Physical is the last sampled database size in bytes, the figure Status
 // reports. It is not compared.
 func (q *Quota) Physical() int64 { return q.physical.Load() }
 
-// Full reports whether the last live sample was at or above the limit. etcd
-// refuses a write when size + cost would pass the quota, and every put has a
-// cost, so "at the limit" already refuses.
-func (q *Quota) Full() bool { return q.limit > 0 && q.full.Load() }
+// Pending is the written-bytes term of the figure.
+func (q *Quota) Pending() int64 { return q.written.Load() - q.base.Load() }
+
+// Figure is what the limit compares: the last live sample plus Pending.
+func (q *Quota) Figure() int64 { return q.Live() + q.Pending() }
+
+// Full reports whether the figure is at or above the limit. etcd refuses a
+// write when size + cost would pass the quota, and every put has a cost, so
+// "at the limit" already refuses.
+func (q *Quota) Full() bool { return q.limit > 0 && q.Figure() >= q.limit }
+
+// reserveBelow reserves cost and keeps it when the figure without this write
+// (other writes' reservations included) is below the limit.
+func (q *Quota) reserveBelow(cost int64) bool {
+	after := q.live.Load() + q.written.Add(cost) - q.base.Load()
+	if after-cost < q.limit {
+		return true
+	}
+	q.written.Add(-cost)
+	return false
+}
+
+// reserveWithin reserves cost and keeps it when the figure with this write
+// stays at or below the ceiling.
+func (q *Quota) reserveWithin(cost int64) bool {
+	after := q.live.Load() + q.written.Add(cost) - q.base.Load()
+	if after <= q.ceiling {
+		return true
+	}
+	q.written.Add(-cost)
+	return false
+}
+
+// release gives back the reservation of a write that did not happen.
+func (q *Quota) release(cost int64) { q.written.Add(-cost) }
 
 // Observe records a sampled live size and logs the two transitions: the
-// first sample at or above the limit, and the first sample below it again.
+// first figure at or above the limit, and the first one below it again.
 func (q *Quota) Observe(live int64) {
 	q.live.Store(live)
 	metrics.LiveBytes.Set(float64(live))
 	if q.limit <= 0 {
 		return
 	}
-	full := live >= q.limit
+	figure := q.Figure()
+	full := figure >= q.limit
+	metrics.QuotaFull.Set(boolGauge(full))
 	if q.full.Swap(full) == full {
 		return
 	}
 	if full {
-		logrus.Infof("quota: live data is %d bytes, the limit is %d bytes. Puts are refused until live data is smaller than the limit.", live, q.limit)
+		logrus.Infof("quota: live data is %d bytes, the limit is %d bytes. New keys are refused until live data is smaller than the limit; reads, deletes and updates that do not grow a value continue.", figure, q.limit)
 	} else {
-		logrus.Infof("quota: live data is %d bytes, below the limit of %d bytes. Puts are accepted again.", live, q.limit)
+		logrus.Infof("quota: live data is %d bytes, below the limit of %d bytes. Puts are accepted again.", figure, q.limit)
 	}
+}
+
+func boolGauge(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ObservePhysical records a sampled database size. It only feeds the gauge.
@@ -126,34 +304,64 @@ func (q *Quota) ObservePhysical(size int64) {
 }
 
 // Sample reads both figures once and records them. physical may be nil. A
-// failed read keeps the last value and is logged; it never clears the limit.
-// The returned error is the live read's. A read that failed because ctx
-// ended (shutdown) is returned without a warning.
+// failed read keeps the last value and is logged; it never clears the limit
+// and it does not move the written-bytes base. The returned error is the
+// live read's. A read that failed because ctx ended (shutdown) is returned
+// without a warning.
 func (q *Quota) Sample(ctx context.Context, live, physical SizeSource) error {
+	return q.sample(ctx, live, physical, true)
+}
+
+// sample is Sample; advance=false records the live figure without moving the
+// written-bytes base (the re-read right after a relief pass, which is too
+// soon after the last mark for the statistics to have every write).
+func (q *Quota) sample(ctx context.Context, live, physical SizeSource, advance bool) error {
+	mark := q.written.Load()
 	if physical != nil {
-		if size, err := physical(ctx); err != nil {
+		if size, err := query(ctx, physical); err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
+			metrics.QuotaSampleErrors.Inc()
 			logrus.Warnf("quota: cannot read the database size: %v. The last value, %d bytes, stays in use.", err, q.Physical())
 		} else {
 			q.ObservePhysical(size)
 		}
 	}
-	size, err := live(ctx)
+	size, err := query(ctx, live)
 	if err != nil {
 		if ctx.Err() == nil {
-			logrus.Warnf("quota: cannot read the live data size: %v. The last value, %d bytes, stays in use.", err, q.Live())
+			metrics.QuotaSampleErrors.Inc()
+			logrus.Warnf("quota: cannot read the live data size: %v. The last value, %d bytes, and the bytes written since stay in use.", err, q.Live())
 		}
 		return err
 	}
+	if advance {
+		q.base.Store(q.marks[0])
+		q.marks[0], q.marks[1] = q.marks[1], mark
+		metrics.QuotaLastSample.SetToCurrentTime()
+	}
 	q.Observe(size)
+	metrics.QuotaPendingBytes.Set(float64(q.Pending()))
 	return nil
 }
 
-// Run samples both figures every interval until ctx ends. Call Sample once
-// before serving so a database that is already over the limit refuses from
-// the first write, then run this on its own goroutine.
+func query(ctx context.Context, src SizeSource) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, quotaQueryTimeout)
+	defer cancel()
+	return src(ctx)
+}
+
+// EnableRelief makes Run compact history while full. revision reads the
+// current revision (cheap: the log keeps it in memory). Call before Run.
+func (q *Quota) EnableRelief(relief QuotaRelief, revision func(context.Context) (int64, error)) {
+	q.relief, q.revision = relief, revision
+}
+
+// Run samples both figures every interval until ctx ends, and runs a relief
+// pass after each sample that finds the quota full. Call Sample once before
+// serving so a database that is already over the limit refuses from the
+// first write, then run this on its own goroutine.
 func (q *Quota) Run(ctx context.Context, interval time.Duration, live, physical SizeSource) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -162,14 +370,51 @@ func (q *Quota) Run(ctx context.Context, interval time.Duration, live, physical 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = q.Sample(ctx, live, physical)
+			q.tick(ctx, live, physical)
 		}
 	}
 }
 
-// WithQuota wraps backend so Create and Update return ErrNoSpace while the
-// quota is full. Everything else passes through. A nil or zero quota returns
-// backend itself, so a kine without --quota-bytes runs upstream's code path.
+// tick is one sample and, while full, one relief pass: compact the history
+// older than the previous tick, then read the live figure again at once.
+func (q *Quota) tick(ctx context.Context, live, physical SizeSource) {
+	var current int64
+	if q.relief != nil {
+		rev, err := q.revision(ctx)
+		if err != nil && ctx.Err() == nil {
+			logrus.Warnf("quota: cannot read the current revision, no relief this pass: %v", err)
+		}
+		current = rev
+	}
+	prev := q.prevRev
+	q.prevRev = current
+	if err := q.Sample(ctx, live, physical); err != nil || q.relief == nil || !q.Full() || prev <= 0 || current <= 0 {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, quotaReliefBudget)
+	defer cancel()
+	start := time.Now()
+	before := q.Figure()
+	res, err := q.relief.RelieveQuota(rctx, prev)
+	metrics.QuotaReliefPasses.Inc()
+	metrics.QuotaReliefRows.Add(float64(res.Rows))
+	if res.Rows > 0 {
+		_ = q.sample(ctx, live, physical, false)
+	}
+	took := time.Since(start).Truncate(time.Millisecond)
+	if err != nil {
+		if ctx.Err() == nil {
+			logrus.Warnf("quota: relief compacted %d rows to revision %d in %s, then failed: %v. Live data is %d bytes.", res.Rows, res.CompactedTo, took, err, q.Figure())
+		}
+		return
+	}
+	metrics.QuotaLastRelief.SetToCurrentTime()
+	logrus.Infof("quota: relief compacted %d rows to revision %d in %s. Live data was %d bytes and is %d bytes, the limit is %d bytes.", res.Rows, res.CompactedTo, took, before, q.Figure(), q.limit)
+}
+
+// WithQuota wraps backend so puts follow the quota (see the INTENT above).
+// Everything else passes through. A nil or zero quota returns backend
+// itself, so a kine without --quota-bytes runs upstream's code path.
 func WithQuota(backend Backend, quota *Quota) Backend {
 	if quota == nil || quota.limit <= 0 {
 		return backend
@@ -183,15 +428,103 @@ type quotaBackend struct {
 }
 
 func (b *quotaBackend) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
-	if b.quota.Full() {
-		return 0, ErrNoSpace
+	cost := int64(len(key) + len(value))
+	if !b.quota.reserveBelow(cost) {
+		if reason := b.admitControlCreate(key, value, cost); reason != "" {
+			metrics.QuotaRefused.WithLabelValues(reason).Inc()
+			return 0, ErrNoSpace
+		}
 	}
-	return b.Backend.Create(ctx, key, value, lease)
+	rev, err := b.Backend.Create(ctx, key, value, lease)
+	if err != nil {
+		b.quota.release(cost)
+	}
+	return rev, err
+}
+
+// admitControlCreate decides a create while full: only a small control key,
+// within the ceiling and the control bucket. It returns the refusal reason,
+// or "" with cost reserved.
+func (b *quotaBackend) admitControlCreate(key string, value []byte, cost int64) string {
+	if !isControlKey(key) || len(value) > quotaControlMaxValue {
+		return "create"
+	}
+	if !b.quota.reserveWithin(cost) {
+		return "ceiling"
+	}
+	if !b.quota.control.Allow() {
+		b.quota.release(cost)
+		return "rate"
+	}
+	metrics.QuotaLaneWrites.WithLabelValues("control").Inc()
+	return ""
 }
 
 func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *KeyValue, bool, error) {
-	if b.quota.Full() {
-		return 0, nil, false, ErrNoSpace
+	cost := int64(len(key) + 2*len(value))
+	if !b.quota.reserveBelow(cost) {
+		var reason string
+		if cost, reason = b.admitUpdate(ctx, key, value, revision); reason != "" {
+			metrics.QuotaRefused.WithLabelValues(reason).Inc()
+			return 0, nil, false, ErrNoSpace
+		}
 	}
-	return b.Backend.Update(ctx, key, value, revision, lease)
+	rev, kv, ok, err := b.Backend.Update(ctx, key, value, revision, lease)
+	if err != nil || !ok {
+		b.quota.release(cost)
+	}
+	return rev, kv, ok, err
+}
+
+// admitUpdate decides an update while full. It reads the key once. An update
+// that cannot write (no such key, or the compare revision is not the current
+// one) passes with no reservation: the backend answers it without a new row,
+// and the compare-and-swap means no other write can slip in between. One
+// that would write passes when the value does not grow by more than
+// quotaGrowthSlack, the figure with its exact cost (key + new + old) stays
+// within the ceiling, and its lane's bucket has room. It returns the
+// reserved cost and "" when it passes, else the refusal reason.
+func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string) {
+	_, cur, err := b.Backend.Get(ctx, key, 0, false)
+	if err != nil {
+		return 0, "read"
+	}
+	if cur == nil || cur.ModRevision != revision {
+		return 0, ""
+	}
+	if len(value)-len(cur.Value) > quotaGrowthSlack {
+		return 0, "growth"
+	}
+	cost := int64(len(key) + len(value) + len(cur.Value))
+	if !b.quota.reserveWithin(cost) {
+		return 0, "ceiling"
+	}
+	now := time.Now()
+	if isControlKey(key) && len(value) <= quotaControlMaxValue {
+		if !b.quota.control.AllowN(now, 1) {
+			b.quota.release(cost)
+			return 0, "rate"
+		}
+		metrics.QuotaLaneWrites.WithLabelValues("control").Inc()
+		return cost, ""
+	}
+	if !b.quota.cleanupOps.AllowN(now, 1) {
+		b.quota.release(cost)
+		return 0, "rate"
+	}
+	if !b.quota.cleanupBytes.AllowN(now, int(min(cost, int64(quotaCleanupBytesBurst)))) {
+		b.quota.release(cost)
+		return 0, "rate"
+	}
+	metrics.QuotaLaneWrites.WithLabelValues("cleanup").Inc()
+	return cost, ""
+}
+
+func isControlKey(key string) bool {
+	for _, p := range quotaControlPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }

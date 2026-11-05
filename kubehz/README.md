@@ -26,12 +26,16 @@ carry small marker-wrapped edits. `sqllog/sql.go` is a file upstream churns
 (~21 commits a year), so that edit is written to be dropped cheaply, and is
 a candidate for upstreaming rather than indefinite carrying.
 
-P2 (the `--quota-bytes` limit on live data) adds `pkg/server/kubehz_quota.go`,
-`pkg/metrics/kubehz_quota.go` and `pkg/drivers/pgsql/kubehz_quota.go`, and
-carries marker-wrapped edits in `pkg/app/app.go` (the flag),
-`pkg/endpoint/endpoint.go` (the config field and the wiring),
+P2 (the `--quota-bytes` limit on live data, and the B481 lanes and relief
+that keep a full cluster running and cleaning up) adds
+`pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
+`pkg/drivers/pgsql/kubehz_quota.go` and `pkg/logstructured/sqllog/kubehz_relief.go`,
+and carries marker-wrapped edits in `pkg/app/app.go` (the flag),
+`pkg/endpoint/endpoint.go` (the config field, the wiring and two test seams),
 `pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
-and `pkg/logstructured/sqllog/sql.go` (one forwarding method each).
+(two forwarding methods) and `pkg/logstructured/sqllog/sql.go` (one).
+`go.mod` and `go.sum` differ from upstream too: the dependency bumps for
+advisories, and `golang.org/x/time` as a direct dependency (P2's rate limits).
 
 P3 (storage parameters on the kine table) adds
 `pkg/drivers/pgsql/kubehz_reloptions.go` and touches `setup()` (one flag from
@@ -52,6 +56,8 @@ git diff --stat upstream-master..main -- . ':!benchmarks' ':!kubehz' ':!.github'
 which must list exactly these files:
 
 ```
+go.mod
+go.sum
 pkg/app/app.go
 pkg/drivers/pgsql/kubehz_quota.go
 pkg/drivers/pgsql/kubehz_reloptions.go
@@ -59,6 +65,7 @@ pkg/drivers/pgsql/notify.go
 pkg/drivers/pgsql/pgsql.go
 pkg/endpoint/endpoint.go
 pkg/logstructured/logstructured.go
+pkg/logstructured/sqllog/kubehz_relief.go
 pkg/logstructured/sqllog/sql.go
 pkg/metrics/kubehz_quota.go
 pkg/server/kubehz_quota.go

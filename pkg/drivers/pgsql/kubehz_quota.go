@@ -39,24 +39,33 @@ const toastChunkBytes = 1996
 //     compressed size of live rows. etcd's in-use figure is uncompressed; a
 //     kine cluster reads smaller for the same objects.
 //
-// Two catalog lookups and no table scan. Indexes and page overhead are not
-// counted. Before the first ANALYZE pg_stats has no rows and the heap term is
-// 0; New() runs ANALYZE once when that is the case, and autovacuum keeps the
-// statistics current after that. pg_total_relation_size was rejected for
-// this role: it is the file, which plateaus under autovacuum and stays large
-// after a write-then-delete spike.
+// Both row counts are GREATEST(n_live_tup, pg_class.reltuples). PostgreSQL
+// resets the cumulative statistics after a crash and on a promoted standby
+// (a CNPG failover), and n_live_tup then counts only the rows written since:
+// alone it would lift the limit (B481). reltuples is in the catalog, so it
+// survives both; VACUUM and ANALYZE set it, and it reads -1 before the
+// first one. After a large delete it stays high until the next VACUUM, which
+// only refuses early; the quota's relief runs one.
+//
+// A few catalog lookups and no table scan. Indexes and page overhead are not
+// counted. Before the first ANALYZE pg_stats has no rows and the heap term
+// would be 0, so liveSize analyzes first when that is the case.
+// pg_total_relation_size was rejected for this role: it is the file, which
+// plateaus under autovacuum and stays large after a write-then-delete spike.
 var liveSizeSQL = fmt.Sprintf(`
 	SELECT
 		COALESCE((
-			SELECT s.n_live_tup * SUM(p.avg_width)
+			SELECT GREATEST(s.n_live_tup, c.reltuples::bigint) * SUM(p.avg_width)
 			FROM pg_stat_user_tables AS s
+			JOIN pg_class AS c ON c.oid = s.relid
 			JOIN pg_stats AS p ON p.schemaname = s.schemaname AND p.tablename = s.relname
 			WHERE s.schemaname = current_schema() AND s.relname = 'kine'
-			GROUP BY s.n_live_tup
+			GROUP BY s.n_live_tup, c.reltuples
 		), 0)::bigint
 		+ COALESCE((
-			SELECT t.n_live_tup * %d
+			SELECT GREATEST(t.n_live_tup, tc.reltuples::bigint) * %d
 			FROM pg_class AS c
+			JOIN pg_class AS tc ON tc.oid = c.reltoastrelid
 			JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
 			WHERE c.oid = 'kine'::regclass
 		), 0)::bigint`, toastChunkBytes)
@@ -76,12 +85,35 @@ func (d *notifyingDialect) LiveSize() server.SizeSource {
 	return d.liveSize
 }
 
+// liveSize reads the figure. A table without statistics is analyzed first; if
+// that fails the sample fails, so the quota keeps its last figure and the
+// bytes written since instead of reading a heap term of 0.
 func (d *notifyingDialect) liveSize(ctx context.Context) (int64, error) {
+	if err := analyzeIfNoStats(ctx, d.DB); err != nil {
+		return 0, err
+	}
 	var size int64
 	if err := d.DB.QueryRowContext(ctx, liveSizeSQL).Scan(&size); err != nil {
 		return 0, err
 	}
 	return size, nil
+}
+
+// compile-time check: the dialect refreshes the statistics after the quota's
+// relief compaction.
+var _ server.StatsRefresher = (*notifyingDialect)(nil)
+
+// RefreshStats runs VACUUM (ANALYZE) on the kine table after the quota's
+// relief deleted rows: ANALYZE for the widths and the heap's row count,
+// VACUUM for the TOAST relation's reltuples (ANALYZE does not visit it) and
+// to make the freed space reusable. SKIP_LOCKED, so a running autovacuum is
+// not waited for; that one updates the same figures. VACUUM cannot run in a
+// transaction, so this is a plain statement under ctx.
+func (d *notifyingDialect) RefreshStats(ctx context.Context) error {
+	if _, err := d.DB.ExecContext(ctx, "VACUUM (ANALYZE, SKIP_LOCKED) kine"); err != nil {
+		return fmt.Errorf("vacuuming the kine table: %w", err)
+	}
+	return nil
 }
 
 // analyzeIfNoStats runs ANALYZE once on a table pg_stats does not know yet

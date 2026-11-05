@@ -124,4 +124,83 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	if ratio < 0.9 || ratio > 1.3 {
 		t.Fatalf("live-size estimate %d is %.3f of the actual %d; want within 0.9 and 1.3", got, ratio, want)
 	}
+
+	// B481: a crash or a promoted standby resets the cumulative statistics, so
+	// n_live_tup reads 0. The estimate must not drop with it (that would lift
+	// the limit); reltuples in the catalog carries it.
+	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = live(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ratio = float64(got) / float64(want); ratio < 0.9 || ratio > 1.3 {
+		t.Fatalf("after a statistics reset the estimate is %d, %.3f of the actual %d; want within 0.9 and 1.3", got, ratio, want)
+	}
+
+	// B481: after the quota's relief deletes rows, RefreshStats brings the
+	// estimate down to what is left (reltuples alone would keep it high).
+	if _, err := db.ExecContext(ctx, `DELETE FROM kine WHERE name LIKE '/kubehz/p2/%' AND substr(name, 12)::int % 2 = 0`); err != nil {
+		t.Fatal(err)
+	}
+	refresher := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	if err := refresher.RefreshStats(ctx); err != nil {
+		t.Fatalf("RefreshStats: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(pg_column_size(value) + pg_column_size(old_value)), 0) FROM kine`,
+	).Scan(&want); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		if got, err = live(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ratio = float64(got) / float64(want)
+		if ratio >= 0.9 && ratio <= 1.3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Logf("after deleting half and RefreshStats: estimate %d / actual %d = %.3f", got, want, ratio)
+	if ratio < 0.9 || ratio > 1.3 {
+		t.Fatalf("after RefreshStats the estimate is %d, %.3f of the actual %d; want within 0.9 and 1.3", got, ratio, want)
+	}
+
+	// The same statistics reset with values small enough to stay inline, so
+	// the heap term carries the figure and its reltuples floor is the one
+	// under test.
+	if _, err := db.ExecContext(ctx, "TRUNCATE kine"); err != nil {
+		t.Fatal(err)
+	}
+	// 4000 rows of 1 KiB random bytes (64 md5 digests each), in one statement
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT '/kubehz/p2/inline/' || g, 1, 0, 0, 0, 0,
+			decode((SELECT string_agg(md5(random()::text || g || k), '') FROM generate_series(1, 64) AS k), 'hex'),
+			''::bytea
+		FROM generate_series(1, 4000) AS g`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM ANALYZE kine"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(pg_column_size(value) + pg_column_size(old_value)), 0) FROM kine`,
+	).Scan(&want); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = live(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ratio = float64(got) / float64(want)
+	t.Logf("inline rows after a statistics reset: estimate %d / actual %d = %.3f", got, want, ratio)
+	if ratio < 0.9 || ratio > 1.3 {
+		t.Fatalf("inline rows after a statistics reset: the estimate is %d, %.3f of the actual %d; want within 0.9 and 1.3", got, ratio, want)
+	}
 }

@@ -298,6 +298,17 @@ func (l *LogStructured) LiveSize() server.SizeSource {
 	return nil
 }
 
+// RelieveQuota forwards the quota's compaction while full (B481) to the log
+// underneath. A log without one compacts nothing: the result is empty and
+// the quota then relies on the regular compactor.
+// CONFLICT: an added method next to LiveSize; keep it with that one.
+func (l *LogStructured) RelieveQuota(ctx context.Context, target int64) (server.ReliefResult, error) {
+	if r, ok := l.log.(server.QuotaRelief); ok {
+		return r.RelieveQuota(ctx, target)
+	}
+	return server.ReliefResult{}, nil
+}
+
 // KUBEHZ-PATCH P2 END
 
 func (l *LogStructured) CurrentRevision(ctx context.Context) (int64, error) {
