@@ -302,9 +302,9 @@ func (l *LogStructured) LiveSize() server.SizeSource {
 // underneath. A log without one compacts nothing: the result is empty and
 // the quota then relies on the regular compactor.
 // CONFLICT: an added method next to LiveSize; keep it with that one.
-func (l *LogStructured) RelieveQuota(ctx context.Context, target int64) (server.ReliefResult, error) {
+func (l *LogStructured) RelieveQuota(ctx context.Context, target int64, refresh bool) (server.ReliefResult, error) {
 	if r, ok := l.log.(server.QuotaRelief); ok {
-		return r.RelieveQuota(ctx, target)
+		return r.RelieveQuota(ctx, target, refresh)
 	}
 	return server.ReliefResult{}, nil
 }

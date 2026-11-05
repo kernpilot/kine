@@ -133,8 +133,9 @@ conditions), `pkg/logstructured/logstructured.go` (two forwarding methods) and
 (`golang.org/x/time` is a direct dependency now). Tests
 `pkg/server/kubehz_quota_test.go`, `pkg/app/kubehz_quota_test.go`,
 `pkg/endpoint/kubehz_quota_test.go` (a real kine on sqlite through
-`Listen`, the B481 relief end to end), `pkg/drivers/pgsql/kubehz_quota_test.go`
-and `pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain),
+`Listen`, the B481 relief end to end), `pkg/drivers/pgsql/kubehz_quota_test.go`,
+`pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain) and
+`pkg/logstructured/sqllog/kubehz_relief_test.go` (the relief bounds),
 and `pkg/drivers/pgsql/kubehz_pgsql_test.go` against the PostgreSQL
 service `unit.yml` runs (skipped without `KINE_TEST_PGSQL_DSN`; it needs a
 role that may call `pg_stat_reset()`). `unit.yml` fails when they are missing.
@@ -158,11 +159,17 @@ compares, and the physical size the `Status` RPC reports (`Backend.DbSize`),
 which only feeds a gauge. The rules:
 
 1. The figure is the last good live sample plus the bytes this process
-   wrote since the good sample two samples back. Every put reserves its
-   bytes before the check and gives them back when it is refused or
-   fails, so concurrent writes see each other and the limit is passed by
-   one write at most. A create counts key + value, an update key + 2 ×
-   value (the row also carries the old value). A failed sample changes
+   reserved, less the bytes that were committed at the start of the good
+   sample two samples back. Every put reserves its bytes before the check,
+   so concurrent writes see each other and the limit is passed by one
+   write at most. A refused write gives its bytes back, and so does a write
+   that provably did not happen (a create whose key exists, an update that
+   lost its compare-and-swap). Any other error counts as written, because
+   the row can exist. The marks read committed bytes, so a write that is
+   still running at a mark stays in the figure. A sample stores the live
+   figure before it moves the base, and a reader loads the base first, so
+   a mixed read reads high. A create counts key + value, an update key +
+   2 × value (the row also carries the old value). A failed sample changes
    nothing, so the bytes keep adding up and a sampler that keeps failing
    refuses writes (fail closed).
 2. At or above the limit ("full") a new key is refused, except a small
@@ -174,22 +181,43 @@ which only feeds a gauge. The rules:
    compaction key, values up to 4 KiB, 100/s) and the cleanup lane (every
    other key, 20/s and 4 MiB/s). An update that cannot write (no such key,
    a stale compare revision) passes without a charge.
-3. The lanes stop at the ceiling, `2 × limit + 64 MiB`: a lane write passes
-   only while figure + its cost stays at or below it. Deletes are never
-   refused, so the database can hold up to the ceiling plus the data deleted
-   since the last relief pass.
-4. Relief. After each sample that finds the quota full, one pass compacts
-   the history up to the revision of the previous sample. It never passes
-   the revision the poller has sent to watchers, and never the newest row.
-   It does not go through `compact()`, whose `--compact-min-retain` floor
-   would keep the deleted rows while no new revision comes. Each batch is
-   its own transaction that commits or rolls back (never `MustCommit`).
-   When rows went, the dialect refreshes its statistics (PostgreSQL:
-   `VACUUM (ANALYZE, SKIP_LOCKED) kine`) and the figure is read again.
-5. The PostgreSQL estimate uses `GREATEST(n_live_tup, reltuples)` for the
+3. The ceiling is `2 × limit + 64 MiB`: a lane write passes only while
+   figure + its cost stays at or below its lane's cap. Control creates stop
+   at `limit + 16 MiB` (new Leases while full are few, so many are a fault
+   or an attack). Cleanup updates stop 32 MiB below the ceiling, so cleanup
+   churn cannot close the renewals. Only control updates go up to the
+   ceiling. Deletes are never refused, so the database can hold up to the
+   ceiling plus the data deleted since the last relief pass.
+4. Relief. After each sample that finds the quota full (also after a
+   failed sample: the written bytes alone can fill it), one pass compacts
+   the history up to the newest tick revision that is at least
+   `server.QuotaReliefLag` (2 min) old. The lag is longer than the
+   apiserver's 60 s request timeout: a compaction that is too recent lets a
+   write that paused between its read and its insert pass its
+   compare-and-swap. The pass never passes the revision the poller has sent
+   to watchers, and never the newest row. With no watch yet the poller has
+   not run, so the pass starts it and compacts nothing. If no revision came
+   during the lag, the pass writes kine's health key, so the deleted rows
+   fall behind the newest row. It does not go through `compact()`, whose
+   `--compact-min-retain` floor would keep the deleted rows while no new
+   revision comes. Each batch is its own transaction that commits or rolls
+   back (never `MustCommit`), under the pass's 20 s budget.
+5. The statistics refresh (PostgreSQL: `VACUUM (ANALYZE, SKIP_LOCKED)
+   kine`) runs one tick after a pass deleted rows, at the start of the next
+   pass and before its compaction. A VACUUM sets `n_live_tup` to an absolute
+   value, and the deleting backend's counter changes reach the shared
+   statistics up to 10 s later, so a VACUUM right after the delete
+   subtracts the deleted rows twice and the figure then reads low. A failed
+   refresh stays owed and does not stop the compaction.
+6. The PostgreSQL estimate uses `GREATEST(n_live_tup, reltuples)` for the
    heap and TOAST row counts, because a crash and a promoted standby reset
    `n_live_tup`, and analyzes the table first when `pg_stats` has no row
-   for it. Each size query has its own 10 s deadline.
+   for it. `reltuples` misses the rows written after the last VACUUM or
+   ANALYZE, so the source also watches for a reset: an insert counter that
+   went down since the last sample, or at the first sample a counter below
+   the catalog row count. It then refreshes the statistics (5 s budget).
+   If that fails, the figure is `pg_table_size('kine')`, an upper bound,
+   until a refresh succeeds. Each size query has its own 10 s deadline.
 
 INFO lines on each transition and on each relief pass. The metrics
 (`metrics.QuotaMetrics()`) are registered only with a limit. `kv.go`
@@ -223,11 +251,20 @@ the same way as `server.QuotaRelief` (`SQLLog` implements it,
 
 **Bounds, for a tenant that is hostile.** Above the limit only the two
 lanes put, at their rates, and a lane value grows by 64 bytes per update
-at most. The ceiling bounds where that ends. A tenant that spends the
-lanes on its own keys can starve its own controllers' renewals; that
-harms only its own cluster. This bounds retained rows, not the physical
-file or the WAL, which are the PostgreSQL operator's (CNPG volume and WAL
-limits).
+at most. The lane caps and the ceiling bound where that ends. A tenant
+that spends the lanes on its own keys can starve its own controllers'
+renewals; that harms only its own cluster. An update below the limit that
+shrinks a value is charged less than it writes, by at most the old value.
+That value already counts in the live figure, so the stored data stays
+below about 2 × limit, inside the ceiling. Each kine process counts only
+its own writes: two processes on one database (a rolling update) see each
+other's writes at the next good sample, so together they can pass the
+limit by what both write in about two intervals. The relief lag keeps each
+relief behind the other's poller. The reset watch's first-sample check
+misses a reset after which more rows were inserted than the table holds;
+autovacuum and autoanalyze then bring `reltuples` back. This bounds
+retained rows, not the physical file or the WAL, which are the PostgreSQL
+operator's (CNPG volume and WAL limits).
 
 **Invariant.** The sizes are sampled, never queried on the write path
 while below the limit: a write costs atomic operations. Only a write while
@@ -237,10 +274,13 @@ PostgreSQL the compared figure is live data: if a rebase loses a
 forwarding method the limit silently becomes a file-size limit, which is
 why `TestKubehzP2LiveSizeChain` exists; if it loses the relief forward or
 the wiring, B481 comes back, which is why `TestKubehzP2ListenRelief`
-exists. The TOAST term and the `reltuples` floor are load-bearing, which is
-why `TestKubehzP2P3Postgres` measures the estimate against `pg_column_size`
-on a real PostgreSQL, also after `pg_stat_reset()` and after a
-`RefreshStats`.
+exists. The TOAST term, the `reltuples` floor and the reset watch are
+load-bearing, which is why `TestKubehzP2P3Postgres` measures the estimate
+against `pg_column_size` on a real PostgreSQL: after `pg_stat_reset()`,
+after a `RefreshStats`, for rows written after the last VACUUM, and for
+both reset checks. The order of the refresh is load-bearing too: a refresh
+right after the delete reads low, which `TestKubehzP2ReliefBounds` and
+`TestKubehzP2ReliefRefreshOwed` pin.
 
 **Not an optimisation.** This is a safety bound. There is no benchmark to
 re-measure. The test suite is the check.
@@ -254,9 +294,14 @@ to `DbSize`. Re-add them wherever `DbSize` lands. If upstream changes
 `Backend` so that puts no longer go through `Create`/`Update`, move the
 checks to whatever the new write methods are. The tests on a fake backend
 show which calls must be refused and which must pass. If upstream changes
-the poll loop's `polledRev` or the transaction methods the relief uses
+the poll loop's `polledRev`, the broadcaster's `Subscribe` (the relief
+starts the poller with it) or the transaction methods the relief uses
 (`CurrentRevision`, `GetCompactRevision`, `Compact`, `SetCompactRevision`),
-re-check `kubehz_relief.go` against the new contract. If upstream adds its
+re-check `kubehz_relief.go` against the new contract. If upstream changes
+`ErrKeyExists` or how an update reports a lost compare-and-swap, re-check
+which errors `quotaBackend` settles as written. If the PostgreSQL
+statistics flush intervals change (`PGSTAT_IDLE_INTERVAL`, 10 s), re-check
+that the sample interval stays above them. If upstream adds its
 own size limit, compare it with B481 before mapping `--quota-bytes` onto
 it. `New()` in `pgsql.go` also carries the one-time `ANALYZE` block. Keep
 it after `setup()`.

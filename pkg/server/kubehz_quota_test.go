@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,15 +36,18 @@ type quotaFake struct {
 	sizeErr   atomic.Pointer[error]
 	sizeReads atomic.Int64
 	// current is the value Get returns at revision 1; missing makes Get find
-	// no key; createErr fails every Create.
+	// no key; createErr fails every Create, updateErr every Update.
 	current   []byte
 	missing   bool
 	createErr error
+	updateErr error
 	// hold, when set, keeps the first Create inside the backend until it is
-	// closed; held is signalled when that Create arrives.
-	hold   chan struct{}
-	held   chan struct{}
-	holder atomic.Bool
+	// closed; held is signalled when that Create arrives. heldErr is what
+	// that Create then returns.
+	hold    chan struct{}
+	held    chan struct{}
+	holder  atomic.Bool
+	heldErr error
 }
 
 func (f *quotaFake) Start(context.Context) error { return nil }
@@ -62,6 +66,9 @@ func (f *quotaFake) Create(_ context.Context, key string, _ []byte, _ int64) (in
 	if f.hold != nil && f.holder.CompareAndSwap(false, true) {
 		f.held <- struct{}{}
 		<-f.hold
+		if f.heldErr != nil {
+			return 0, f.heldErr
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -86,6 +93,9 @@ func (f *quotaFake) Update(_ context.Context, key string, _ []byte, revision, _ 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates = append(f.updates, key)
+	if f.updateErr != nil {
+		return 0, nil, false, f.updateErr
+	}
 	// the compare-and-swap of the real backend: no row unless revision is current
 	if f.missing || revision != 1 {
 		return 1, nil, false, nil
@@ -545,8 +555,9 @@ func TestKubehzP2LaneRate(t *testing.T) {
 
 // TestKubehzP2Reservation: a write reserves its bytes before it reaches the
 // backend, so a second create just below the limit sees the first one while
-// it is still in flight and is refused; a create the backend fails gives its
-// bytes back.
+// it is still in flight and is refused. A create of an existing key gives its
+// bytes back; a create with any other error keeps them (it may have written),
+// and so does nothing else: a lost compare-and-swap gives them back too.
 func TestKubehzP2Reservation(t *testing.T) {
 	ctx := context.Background()
 	fake := &quotaFake{hold: make(chan struct{}), held: make(chan struct{}, 1)}
@@ -572,13 +583,153 @@ func TestKubehzP2Reservation(t *testing.T) {
 		t.Fatalf("pending %d and creates %v, want 100 and one", quota.Pending(), fake.creates)
 	}
 
-	failing := NewQuota(1000)
-	bf := WithQuota(&quotaFake{createErr: errors.New("disk I/O error")}, failing)
-	if _, err := bf.Create(ctx, "/k", bytesOf(98), 0); err == nil {
-		t.Fatal("the failing create passed")
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int64
+	}{
+		{"an existing key", ErrKeyExists, 0},
+		{"a lost connection", errors.New("conn closed"), 100},
+	} {
+		failing := NewQuota(1000)
+		bf := WithQuota(&quotaFake{createErr: tc.err}, failing)
+		if _, err := bf.Create(ctx, "/k", bytesOf(98), 0); err == nil {
+			t.Fatalf("%s: the failing create passed", tc.name)
+		}
+		if failing.Pending() != tc.want {
+			t.Fatalf("%s: pending %d after the failed create, want %d", tc.name, failing.Pending(), tc.want)
+		}
 	}
-	if failing.Pending() != 0 {
-		t.Fatalf("pending %d after a failed create, want 0", failing.Pending())
+
+	lost := NewQuota(1000)
+	bl := WithQuota(&quotaFake{}, lost)
+	if _, _, ok, err := bl.Update(ctx, "/k", bytesOf(98), 7, 0); ok || err != nil {
+		t.Fatalf("a stale compare revision: ok %v, err %v; want a lost compare-and-swap", ok, err)
+	}
+	if lost.Pending() != 0 {
+		t.Fatalf("pending %d after a lost compare-and-swap, want 0", lost.Pending())
+	}
+
+	// an update error can follow the write, so its cost stays counted
+	broken := NewQuota(1000)
+	bb := WithQuota(&quotaFake{updateErr: errors.New("conn closed")}, broken)
+	if _, _, _, err := bb.Update(ctx, "/k", bytesOf(98), 1, 0); err == nil {
+		t.Fatal("the failing update passed")
+	}
+	if broken.Pending() != 198 { // key + 2 x value
+		t.Fatalf("pending %d after a failed update, want 198", broken.Pending())
+	}
+}
+
+// TestKubehzP2ReservationAcrossSamples: a sample that starts while a write is
+// in flight, and that write then gives its bytes back, never makes the
+// figure lower than the bytes really written (B481 review: the marks read
+// committed bytes, not reservations).
+func TestKubehzP2ReservationAcrossSamples(t *testing.T) {
+	ctx := context.Background()
+	fake := &quotaFake{hold: make(chan struct{}), held: make(chan struct{}, 1), heldErr: ErrKeyExists}
+	quota := NewQuota(1000)
+	b := WithQuota(fake, quota)
+	live := func(context.Context) (int64, error) { return 0, nil }
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Create(ctx, "/k", bytesOf(498), 0) // 500 bytes with the key
+		done <- err
+	}()
+	<-fake.held
+	if err := quota.Sample(ctx, live, nil); err != nil { // its mark sees the create in flight
+		t.Fatal(err)
+	}
+	close(fake.hold)
+	if err := <-done; !errors.Is(err, ErrKeyExists) {
+		t.Fatalf("the held create: %v, want %v", err, ErrKeyExists)
+	}
+	for i := 0; i < 2; i++ {
+		if err := quota.Sample(ctx, live, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if quota.Pending() != 0 || quota.Figure() != 0 {
+		t.Fatalf("pending %d, figure %d after a given-back create; want 0 and 0", quota.Pending(), quota.Figure())
+	}
+}
+
+// TestKubehzP2SampleOrder: while a sample moves the base, a concurrent figure
+// never reads lower than the data really held. The sample stores the live
+// figure before the base; the other order would, for a moment, subtract
+// the written bytes before the sample that shows them is visible.
+func TestKubehzP2SampleOrder(t *testing.T) {
+	ctx := context.Background()
+	quota := NewQuota(10000)
+	b := WithQuota(&quotaFake{}, quota)
+	if _, err := b.Create(ctx, "/k", bytesOf(998), 0); err != nil { // 1000 bytes
+		t.Fatal(err)
+	}
+	var shown atomic.Int64
+	live := func(context.Context) (int64, error) { return shown.Load(), nil }
+	for i := 0; i < 2; i++ { // the statistics do not show the write yet
+		if err := quota.Sample(ctx, live, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	low := int64(-1)
+	quotaSampleHook = func() {
+		if f := quota.Figure(); f < 1000 {
+			low = f
+		}
+	}
+	t.Cleanup(func() { quotaSampleHook = nil })
+	shown.Store(1000) // now they do, and this sample moves the base past the write
+	if err := quota.Sample(ctx, live, nil); err != nil {
+		t.Fatal(err)
+	}
+	if low >= 0 {
+		t.Fatalf("the figure read %d between the two stores of a sample, below the 1000 bytes held", low)
+	}
+	if quota.Figure() != 1000 {
+		t.Fatalf("figure %d after the sample, want 1000", quota.Figure())
+	}
+}
+
+// TestKubehzP2LaneCaps: new control keys stop at limit + quotaCreateMargin,
+// cleanup updates at the ceiling less quotaControlReserve, and control
+// updates (the renewals) go on up to the ceiling.
+func TestKubehzP2LaneCaps(t *testing.T) {
+	ctx := context.Background()
+	const lease = "/registry/leases/kube-system/k3s"
+	const pod = "/registry/pods/default/a"
+	for _, tc := range []struct {
+		name   string
+		at     func(q *Quota) int64 // the figure the case starts from
+		create bool
+		key    string
+		pass   bool
+	}{
+		{"control create below the create cap", func(q *Quota) int64 { return q.createCap - 1000 }, true, "/registry/leases/default/n", true},
+		{"control create past the create cap", func(q *Quota) int64 { return q.createCap }, true, "/registry/leases/default/n", false},
+		{"cleanup update past the cleanup cap", func(q *Quota) int64 { return q.cleanupCap }, false, pod, false},
+		{"control update past the cleanup cap", func(q *Quota) int64 { return q.cleanupCap }, false, lease, true},
+		{"control update past the ceiling", func(q *Quota) int64 { return q.ceiling }, false, lease, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &quotaFake{current: bytesOf(100)}
+			quota := NewQuota(1000)
+			quota.Observe(tc.at(quota))
+			b := WithQuota(fake, quota)
+			var err error
+			if tc.create {
+				_, err = b.Create(ctx, tc.key, bytesOf(100), 0)
+			} else {
+				_, _, _, err = b.Update(ctx, tc.key, bytesOf(100), 1, 0)
+			}
+			if tc.pass && err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			if !tc.pass && !isNoSpace(err) {
+				t.Fatalf("got %v, want %v", err, ErrNoSpace)
+			}
+		})
 	}
 }
 
@@ -623,45 +774,142 @@ func TestKubehzP2PendingWindow(t *testing.T) {
 	}
 }
 
-// reliefFake records the relief passes it was asked for.
+// reliefFake records the relief passes it was asked for. refreshed is what
+// it reports as done; refreshes records the refresh flag of each call.
 type reliefFake struct {
-	targets []int64
-	rows    int64
+	targets   []int64
+	refreshes []bool
+	rows      int64
+	refreshed bool
 }
 
-func (r *reliefFake) RelieveQuota(_ context.Context, target int64) (ReliefResult, error) {
+func (r *reliefFake) RelieveQuota(_ context.Context, target int64, refresh bool) (ReliefResult, error) {
 	r.targets = append(r.targets, target)
-	return ReliefResult{Rows: r.rows, CompactedTo: target}, nil
+	r.refreshes = append(r.refreshes, refresh)
+	return ReliefResult{Rows: r.rows, CompactedTo: target, Refreshed: r.refreshed}, nil
 }
 
-// TestKubehzP2ReliefTick: a tick that finds the quota full compacts to the
-// revision of the previous tick and reads the figure again when rows went;
-// a tick below the limit, or the first tick, compacts nothing.
-func TestKubehzP2ReliefTick(t *testing.T) {
+// revFake is a backend whose current revision the test sets.
+type revFake struct {
+	*quotaFake
+	rev atomic.Int64
+}
+
+func (f *revFake) CurrentRevision(context.Context) (int64, error) { return f.rev.Load(), nil }
+
+// reliefSetup is a quota with relief, a fake clock and a 60 s lag.
+func reliefSetup(t *testing.T, relief QuotaRelief) (*Quota, *revFake, *time.Time) {
+	t.Helper()
 	out := logrus.StandardLogger().Out
 	logrus.SetOutput(io.Discard)
 	t.Cleanup(func() { logrus.SetOutput(out) })
+	fake := &revFake{quotaFake: &quotaFake{}}
+	quota := NewQuota(1000)
+	quota.EnableRelief(relief, fake, time.Minute)
+	clock := time.Unix(1_000_000, 0)
+	quota.now = func() time.Time { return clock }
+	return quota, fake, &clock
+}
 
+// TestKubehzP2ReliefTick: a tick that finds the quota full compacts to the
+// newest revision at least the lag old and reads the figure again when rows
+// went; before the lag has passed, and below the limit, it compacts nothing.
+func TestKubehzP2ReliefTick(t *testing.T) {
 	ctx := context.Background()
 	var size, reads atomic.Int64
 	live := func(context.Context) (int64, error) { reads.Add(1); return size.Load(), nil }
-	var rev atomic.Int64
 	relief := &reliefFake{rows: 5}
-	quota := NewQuota(1000)
-	quota.EnableRelief(relief, func(context.Context) (int64, error) { return rev.Load(), nil })
+	quota, fake, clock := reliefSetup(t, relief)
 
 	size.Store(2000)
-	rev.Store(50)
-	quota.tick(ctx, live, nil) // first tick: no previous revision yet
-	rev.Store(80)
-	quota.tick(ctx, live, nil)
+	for _, rev := range []int64{50, 80, 90} { // ticks at 0 s, 30 s and 60 s
+		fake.rev.Store(rev)
+		quota.tick(ctx, live, nil)
+		*clock = clock.Add(30 * time.Second)
+	}
 	size.Store(10)
-	rev.Store(90)
+	fake.rev.Store(95)
 	quota.tick(ctx, live, nil) // below the limit
 	if len(relief.targets) != 1 || relief.targets[0] != 50 {
-		t.Fatalf("relief targets %v, want [50]", relief.targets)
+		t.Fatalf("relief targets %v, want [50] (the revision of the tick 60 s back)", relief.targets)
 	}
-	if reads.Load() != 4 {
-		t.Fatalf("%d live reads, want 4 (three ticks and one after the relief pass)", reads.Load())
+	if reads.Load() != 5 {
+		t.Fatalf("%d live reads, want 5 (four ticks and one after the relief pass)", reads.Load())
+	}
+	if len(fake.updates) != 0 {
+		t.Fatalf("head marker written while revisions came in: %v", fake.updates)
+	}
+}
+
+// TestKubehzP2ReliefHead: when no revision came during the whole lag, the
+// newest row cannot be compacted; the relief writes the health key once so
+// the head moves.
+func TestKubehzP2ReliefHead(t *testing.T) {
+	ctx := context.Background()
+	live := func(context.Context) (int64, error) { return 2000, nil }
+	quota, fake, clock := reliefSetup(t, &reliefFake{})
+	fake.rev.Store(100)
+	quota.tick(ctx, live, nil)
+	*clock = clock.Add(time.Minute)
+	quota.tick(ctx, live, nil)
+	if len(fake.updates) != 1 || fake.updates[0] != HealthKey {
+		t.Fatalf("updates %v, want one write of %s", fake.updates, HealthKey)
+	}
+}
+
+// TestKubehzP2ReliefAfterFailedSample: a failed sample does not stop the
+// relief, and the full gauge follows the figure even then (the written bytes
+// alone filled the quota).
+func TestKubehzP2ReliefAfterFailedSample(t *testing.T) {
+	ctx := context.Background()
+	relief := &reliefFake{}
+	quota, fake, clock := reliefSetup(t, relief)
+	b := WithQuota(fake, quota)
+	if _, err := b.Create(ctx, "/k", bytesOf(1200), 0); err != nil {
+		t.Fatal(err)
+	}
+	failed := func(context.Context) (int64, error) { return 0, errors.New("connection refused") }
+	fake.rev.Store(10)
+	quota.tick(ctx, failed, nil)
+	*clock = clock.Add(time.Minute)
+	fake.rev.Store(20)
+	quota.tick(ctx, failed, nil)
+	if len(relief.targets) != 1 {
+		t.Fatalf("relief targets %v, want one pass after the failed samples", relief.targets)
+	}
+	if !quota.full.Load() {
+		t.Fatal("the full state did not follow the figure after a failed sample")
+	}
+}
+
+// TestKubehzP2ReliefRefreshOwed: a pass that deleted rows but did not refresh
+// the statistics hands the refresh to the next pass.
+func TestKubehzP2ReliefRefreshOwed(t *testing.T) {
+	ctx := context.Background()
+	live := func(context.Context) (int64, error) { return 2000, nil }
+	// what each pass does; a refresh covers earlier passes' rows only
+	passes := []struct {
+		rows      int64
+		refreshed bool
+	}{
+		{rows: 5},                  // deletes rows: the next pass refreshes
+		{},                         // the refresh fails: still owed
+		{rows: 5, refreshed: true}, // refreshes and deletes more: still owed
+		{refreshed: true},          // refreshes: nothing owed
+		{},                         // nothing to do
+	}
+	want := []bool{false, true, true, true, false}
+	relief := &reliefFake{}
+	quota, fake, clock := reliefSetup(t, relief)
+	for _, rev := range []int64{10, 20, 30, 40, 50, 60} {
+		if n := len(relief.targets); n < len(passes) {
+			relief.rows, relief.refreshed = passes[n].rows, passes[n].refreshed
+		}
+		fake.rev.Store(rev)
+		quota.tick(ctx, live, nil)
+		*clock = clock.Add(time.Minute)
+	}
+	if !slices.Equal(relief.refreshes, want) {
+		t.Fatalf("refresh flags %v, want %v", relief.refreshes, want)
 	}
 }

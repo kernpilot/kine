@@ -12,7 +12,146 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
-Nothing yet.
+### P2 revision — a full cluster keeps running and frees space by itself (B481)
+
+Adds `pkg/logstructured/sqllog/kubehz_relief.go`. Touches
+`pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
+`pkg/drivers/pgsql/kubehz_quota.go`, `pkg/endpoint/endpoint.go`,
+`pkg/logstructured/logstructured.go`, `pkg/app/app.go` (the flag text) and
+`go.mod` (`golang.org/x/time` is direct now).
+
+**Why.** B481 (kubehz-cluster `BUGS-FOUND.md`, found 2026-11-05 in the
+managed-state prototype: k3s v1.36.6 on PostgreSQL 17, limit 48 MiB). At
+the limit the first P2 refused every put, as etcd's capped applier does.
+On k3s that loses the cluster: the leader-election Lease update fails and
+k3s exits (twice in 23 minutes). A delete raised the figure from 138 MiB to
+246 MiB, because the delete row keeps the old value. Nothing compacted in
+12 minutes: kine's own compactor is off by default and the apiserver's
+compaction starts with a put the limit refused. Only staff could bring the
+cluster back (`--compact-min-retain 10` and `ANALYZE kine` by hand).
+
+The same run also found the overshoot. 140 writes of 900 KB passed in 18 s,
+before the 30 s sample saw them: 2.5 times the limit.
+
+**What.** The rules are in [MERGE-GUIDE.md](MERGE-GUIDE.md#p2), items 1-6.
+In short:
+- Every put reserves its bytes before the check. The figure is the last
+  good sample plus the bytes reserved since the committed mark of the good
+  sample two samples back. A refused write gives its bytes back, and so
+  does a write that provably did not happen; any other error counts as
+  written. A failed sample changes nothing (fail closed).
+- While full, a new key is refused except a small control key (Leases,
+  master leases, the compaction key). An update that grows its value by
+  64 bytes or less passes, in two token buckets (control: 100/s, cleanup:
+  20/s and 4 MiB/s). Each lane has a cap: control creates stop at
+  `limit + 16 MiB`, cleanup updates 32 MiB below the ceiling of
+  `2 × limit + 64 MiB`, control updates at the ceiling.
+- After each sample that finds the quota full, also after a failed one,
+  kine compacts the history up to the newest tick revision that is at
+  least 2 min old (bounded by the poller's revision and the newest row),
+  in transactions that never end the process. It starts the poller when no
+  watch did, and writes its health key when no revision came during the
+  lag. One tick later it runs `VACUUM (ANALYZE, SKIP_LOCKED) kine` and
+  samples again.
+- The PostgreSQL estimate uses `GREATEST(n_live_tup, reltuples)`, so a
+  crash or a CNPG failover (both reset `n_live_tup`) does not lift the
+  limit. The source watches the insert counters for a reset and then
+  refreshes the statistics, because `reltuples` misses the rows written
+  after the last VACUUM.
+- New metrics: `kine_quota_full`, `kine_quota_pending_bytes`,
+  `kine_quota_refused_total{reason}`, `kine_quota_lane_writes_total{lane}`,
+  `kine_quota_relief_passes_total`, `kine_quota_relief_rows_total`,
+  `kine_quota_sample_errors_total` and the two last-run timestamps.
+
+The design went through two Astra (gpt-6-astra) rounds before the code.
+An Astra code review of the first implementation (`53bc833`) gave 17
+findings. This revision answers them: the committed marks, the store and
+load order, the lane caps, the relief lag and head marker, the relief
+after a failed sample, the owed refresh, the poller start, the settle
+rules and the reset watch.
+
+The new PostgreSQL phase found one more: a VACUUM right after a delete
+reads low. PostgreSQL sets `n_live_tup` to an absolute value in the VACUUM,
+and the deleting backend's counters reach the shared statistics up to
+10 s later, so the deleted rows are subtracted twice. Measured: 100 rows
+written after such a refresh read 0.865 of the actual size for 15 s. The
+relief now refreshes one tick after its delete.
+
+**Measured.** `TestKubehzP2P3Postgres` on PostgreSQL 17, the estimate
+against `SUM(pg_column_size(value) + pg_column_size(old_value))`:
+
+| Data | Estimate / actual | Ratio |
+|---|---|---|
+| 200 TOAST rows of 65,536 bytes | 13,187,400 / 13,107,400 | 1.006 (in band after `pg_stat_reset()` too) |
+| half of them deleted, then `RefreshStats` | 6,593,700 / 6,553,700 | 1.006 |
+| 100 rows written after the last VACUUM | 13,187,400 / 13,107,400 | 1.006 |
+| a reset after those rows (the source refreshes) | 13,188,600 / 13,107,400 | 1.006 |
+| 100 more rows, then a reset, a new source | 19,783,800 / 19,661,100 | 1.006 |
+| 4,000 inline rows of 1 KiB, after a statistics reset | 4,348,000 / 4,116,000 | 1.056 (the old query read 0) |
+
+The B481 scenario on k3s v1.36.6 against PostgreSQL 17 (isolated docker
+network, limit 48 MiB), on the first implementation `53bc833`:
+
+| Step | B481 (`v0.17.0-kubehz.3`) | `53bc833` |
+|---|---|---|
+| Fill with 900 KB ConfigMaps | 140 writes passed (2.5 × the limit) | refused at write 55 (47 MiB), after 14 s |
+| 3 min at the limit | k3s exited twice | 0 exits, the Lease renewed every 30 s, node Ready |
+| Hostile checks (a new ConfigMap, a Lease +12 KB, a ConfigMap +1 KB refused; a small new Lease accepted) | not run | 4 of 4 as expected |
+| Delete the fill | the figure rose to 246 MiB and stayed | rose to 98 MB, then below the limit 61 s after the delete, with no staff step (relief: 482 rows) |
+
+K3S-FINAL-PENDING
+
+**Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`,
+with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
+- on a fake backend: `TestKubehzP2Lanes`, `TestKubehzP2Ceiling`,
+  `TestKubehzP2LaneRate`, `TestKubehzP2Reservation`,
+  `TestKubehzP2ReservationAcrossSamples`, `TestKubehzP2SampleOrder`,
+  `TestKubehzP2LaneCaps`, `TestKubehzP2PendingWindow`,
+  `TestKubehzP2ReliefTick`, `TestKubehzP2ReliefHead`,
+  `TestKubehzP2ReliefAfterFailedSample`, `TestKubehzP2ReliefRefreshOwed`
+- on a fake dialect: `TestKubehzP2ReliefBounds`,
+  `TestKubehzP2ReliefStartsPoller`
+- `TestKubehzP2ListenRelief`: a real kine on sqlite fills to the limit. A
+  Lease update and a no-growth update pass, a new key is refused, and kine
+  recovers by itself within 15 s after the deletes (relief lag 1 s here)
+- six new phases in `TestKubehzP2P3Postgres`: the floor after a reset, the
+  refresh after a relief, rows written after the last VACUUM, and both
+  reset checks. Autovacuum is off for the last ones, so only the source
+  can bring `reltuples` up to date.
+
+Each of these mutations makes a test fail:
+- quota: no update lane, the reservation after the write, the base one
+  sample back, the relief target at the current revision, no growth check,
+  a strict ceiling, a failed sample that moves the base, control creates
+  closed
+- wiring: no relief, a forward that drops the relief, a relief that keeps
+  `--compact-min-retain`
+- PostgreSQL: no heap `reltuples` floor, no TOAST `reltuples` floor,
+  `RefreshStats` a no-op
+- relief: no poller bound, the newest row compacted, no batching, a
+  statistics refresh on 0 rows, a pass that goes on after an error.
+
+The revision's mutations, 25 of 25 caught (each applied to a backup copy,
+the named test run, the file restored and compared):
+- accounting: the marks read the written bytes, the base stored before the
+  live figure, a create error refunded, an existing key counted, an update
+  error refunded, a lost compare-and-swap counted
+- lanes: control creates up to the ceiling, cleanup up to the ceiling
+- relief: no lag, no head marker, no publish after a failed sample, no
+  relief after a failed sample, the owed refresh not carried, a refresh
+  that clears the new rows' debt, no poller start, a failed commit
+  recorded, a batch under another context, the refresh after the
+  compaction, a refresh on every pass, a failed refresh that stops the
+  compaction, the post-compaction step on 0 rows
+- PostgreSQL: no reset check on a counter that went down, no first-sample
+  check, `reltuples` only, no `reltuples` floor.
+
+Not covered by a test: the reader's load order in `figure` (base, then
+live). A wrong order opens a window of two atomic loads; a seam there
+would sit on the write path. The writer's order has its test.
+
+Not caused by this change: `TestBackend_Get` in `pkg/drivers/nats` fails
+under `-race` on the base `7c8a4f7` too.
 
 ---
 

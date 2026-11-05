@@ -12,6 +12,7 @@ import (
 	"fmt"
 
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/sirupsen/logrus"
 )
 
 // compile-time check: the log offers the quota its relief.
@@ -22,38 +23,80 @@ var _ server.QuotaRelief = (*SQLLog)(nil)
 // would be a gap, sql.go's poll loop) and never reaches the newest row (the
 // current revision is MAX(id)). It works in batches of compact-batch-size,
 // each in its own transaction that commits or rolls back: an error ends the
-// pass, it never ends the process. When rows were deleted it asks the
-// dialect to refresh its statistics. Every query runs under ctx.
-func (s *SQLLog) RelieveQuota(ctx context.Context, target int64) (server.ReliefResult, error) {
+// pass, it never ends the process. After rows were deleted, also before an
+// error, it runs the dialect's post-compaction step, as compact() does.
+//
+// When refresh is true it first asks the dialect to refresh its statistics,
+// for the rows an EARLIER pass deleted. Not for this pass's rows: on
+// PostgreSQL a VACUUM sets the live row count to an absolute value, and the
+// deleting backend's counter changes reach the shared statistics up to 10 s
+// later, so a VACUUM right after the delete subtracts the deleted rows twice
+// and the live figure then reads low. A refresh failure does not stop the
+// compaction. Every query runs under ctx.
+func (s *SQLLog) RelieveQuota(ctx context.Context, target int64, refresh bool) (server.ReliefResult, error) {
 	var res server.ReliefResult
-	if polled := s.polledRev.Load(); target > polled {
-		target = polled
+	polled := s.polledRev.Load()
+	if polled <= 0 {
+		return res, s.startPolling()
 	}
+	var errs error
+	if refresh {
+		if r, ok := s.d.(server.StatsRefresher); ok {
+			if err := r.RefreshStats(ctx); err != nil {
+				errs = fmt.Errorf("refreshing the statistics: %w", err)
+			}
+		}
+		res.Refreshed = errs == nil
+	}
+	target = min(target, polled)
+	var err error
 	for {
-		done, rows, to, err := s.reliefBatch(ctx, target)
+		var done bool
+		var rows, to int64
+		done, rows, to, err = s.reliefBatch(ctx, target)
 		res.Rows += rows
 		if to > 0 {
 			res.CompactedTo = to
 		}
-		if err != nil {
-			return res, err
-		}
-		if done {
+		if err != nil || done {
 			break
 		}
 	}
-	if res.Rows == 0 {
-		return res, nil
+	if err != nil {
+		errs = joinRelief(errs, err)
 	}
-	if err := s.d.PostCompact(ctx); err != nil {
-		return res, fmt.Errorf("after compacting: %w", err)
-	}
-	if r, ok := s.d.(server.StatsRefresher); ok {
-		if err := r.RefreshStats(ctx); err != nil {
-			return res, fmt.Errorf("refreshing the statistics: %w", err)
+	if res.Rows > 0 {
+		if err := s.d.PostCompact(ctx); err != nil {
+			errs = joinRelief(errs, fmt.Errorf("after compacting: %w", err))
 		}
 	}
-	return res, nil
+	return res, errs
+}
+
+func joinRelief(first, then error) error {
+	if first == nil {
+		return then
+	}
+	return fmt.Errorf("%w; %w", first, then)
+}
+
+// startPolling starts the poll loop when no watch has started it yet: the
+// relief never compacts past the poller, so without one it would never
+// compact. The poller starts at the current revision and runs until the log
+// stops (pkg/broadcaster), so this pass compacts nothing and the next one can.
+// The subscription is drained and never read; a slow reader is dropped by the
+// broadcaster, which leaves the poller running.
+func (s *SQLLog) startPolling() error {
+	values, err := s.broadcaster.Subscribe(s.ctx, s.startWatch)
+	if err != nil {
+		return fmt.Errorf("the poller is not running, and starting it failed: %w", err)
+	}
+	go func() {
+		for range values {
+		}
+	}()
+	logrus.Infof("quota: started the poller for the relief, which needs it")
+	return nil
 }
 
 // reliefBatch compacts one batch toward target. done is true when there is

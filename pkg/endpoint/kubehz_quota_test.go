@@ -102,9 +102,9 @@ func TestKubehzP2ListenFailsOnFirstSample(t *testing.T) {
 // compactor off, as in the KKP render) the deleted rows stay and new keys stay
 // refused, which is the lock B481 found.
 func TestKubehzP2ListenRelief(t *testing.T) {
-	seam := quotaSampleInterval
-	t.Cleanup(func() { quotaSampleInterval = seam })
-	quotaSampleInterval = 100 * time.Millisecond
+	interval, lag := quotaSampleInterval, quotaReliefLag
+	t.Cleanup(func() { quotaSampleInterval, quotaReliefLag = interval, lag })
+	quotaSampleInterval, quotaReliefLag = 100*time.Millisecond, time.Second
 
 	e, err := listenSQLite(t, 512<<10)
 	if err != nil {
@@ -168,7 +168,7 @@ func TestKubehzP2ListenRelief(t *testing.T) {
 		}
 	}
 
-	// the relief needs two ticks: one to record the revision, one to compact
+	// the relief compacts only to a revision at least quotaReliefLag old
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		_, err := client.Put(ctx, "/registry/configmaps/default/after", "v")

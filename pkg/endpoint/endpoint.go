@@ -164,7 +164,7 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 			return ETCDConfig{}, fmt.Errorf("quota: the first size sample failed: %w", err)
 		}
 		if relief := server.QuotaReliefOf(backend); relief != nil {
-			quota.EnableRelief(relief, backend.CurrentRevision)
+			quota.EnableRelief(relief, backend, quotaReliefLag)
 		}
 		go quota.Run(bctx, quotaSampleInterval, live, physical)
 		backend = server.WithQuota(backend, quota)
@@ -372,3 +372,8 @@ var liveSizeOf = server.LiveSizeOf
 // compacts. A variable so the relief test can tick fast. Never set outside
 // tests.
 var quotaSampleInterval = server.QuotaSampleInterval
+
+// quotaReliefLag is how old a revision must be before the relief compacts to
+// it. A variable so the relief test can run in seconds. Never set outside
+// tests.
+var quotaReliefLag = server.QuotaReliefLag
