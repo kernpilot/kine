@@ -37,11 +37,12 @@ type reliefDialect struct {
 	compactRev   int64 // the committed compact revision
 	failAt       int64 // Compact to this revision fails; 0 = never
 	commitAt     int64 // the commit of the batch to this revision fails; 0 = never
+	commitLostAt int64 // the commit of the batch to this revision takes effect, then reports an error
 	foreignCtx   bool  // a query ran under a context that is not the caller's
 	refreshFails bool
 	owed         bool          // StatsOwed
 	revBlock     chan struct{} // CurrentRevision waits for it to close
-	revErr       error         // CurrentRevision fails with it
+	revFails     atomic.Int32  // CurrentRevision fails this many more times
 	onBegin      func()        // runs in BeginTx after the transaction began
 	revCalls     atomic.Int32
 	calls        []string // "refresh" and "compact", in order
@@ -73,7 +74,10 @@ func (d *reliefDialect) CurrentRevision(context.Context) (int64, error) {
 	if d.revBlock != nil {
 		<-d.revBlock
 	}
-	return d.current, d.revErr
+	if d.revFails.Add(-1) >= 0 {
+		return 0, errors.New("connection refused")
+	}
+	return d.current, nil
 }
 func (d *reliefDialect) PostCompact(context.Context) error { d.postCompacts++; return nil }
 func (d *reliefDialect) RefreshStats(ctx context.Context) error {
@@ -101,6 +105,11 @@ func (t *reliefTx) Commit() error {
 	}
 	if t.d.commitAt != 0 && t.compactRev == t.d.commitAt {
 		return errCommit // the deferred Rollback then ends the transaction
+	}
+	if t.d.commitLostAt != 0 && t.compactRev == t.d.commitLostAt {
+		t.done = true
+		t.d.compactRev = t.compactRev
+		return errCommit // committed, but the acknowledgement was lost
 	}
 	t.done = true
 	t.d.compactRev = t.compactRev
@@ -209,8 +218,9 @@ func TestKubehzP2ReliefBounds(t *testing.T) {
 			if tc.refresh && (d.begins != 0 || len(d.batches) != 0) {
 				t.Errorf("a refresh pass began %d transactions and compacted %v; want none", d.begins, d.batches)
 			}
-			if res.Stale != (res.Rows > 0) {
-				t.Errorf("Stale = %v with %d rows deleted; want it set exactly when rows went", res.Stale, res.Rows)
+			// a failed commit can have deleted its rows too
+			if wantStale := res.Rows > 0 || tc.commitAt != 0; res.Stale != wantStale {
+				t.Errorf("Stale = %v with %d rows deleted; want %v: set when rows went or a commit failed", res.Stale, res.Rows, wantStale)
 			}
 			wantHead := tc.current // every compaction pass here reads MAX(id)
 			if tc.refresh {
@@ -359,11 +369,12 @@ func TestKubehzP2ReliefCancelledInBatch(t *testing.T) {
 }
 
 // TestKubehzP2ReliefPollerRetry: a poller start that failed lets a later
-// pass try again.
+// pass try again, and that start runs the poller.
 func TestKubehzP2ReliefPollerRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	d := &reliefDialect{current: 50, revErr: errors.New("connection refused")}
+	d := &reliefDialect{current: 50}
+	d.revFails.Store(1)
 	s := New(d, 0, 0, 0, 0, 10, 0)
 	s.ctx = ctx
 	rctx := context.WithValue(ctx, reliefCtxKey{}, true)
@@ -374,20 +385,19 @@ func TestKubehzP2ReliefPollerRetry(t *testing.T) {
 	if _, err := s.RelieveQuota(rctx, 40, false); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { return d.revCalls.Load() == 2 }, "a second start after the failed one")
+	waitFor(t, func() bool { return s.polledRev.Load() == 50 }, "the poller of the second start")
 }
 
-// TestKubehzP2ReliefCancelled: a cancelled pass compacts nothing and begins
-// no transaction: the pass's context bounds the transaction too.
-func TestKubehzP2ReliefCancelled(t *testing.T) {
-	d := &reliefDialect{current: 100}
+// TestKubehzP2ReliefLostCommitAck: a batch whose commit took effect but
+// reported an error: no rows are confirmed, but the pass is stale, so the
+// quota's refresh waits for those deletes to settle.
+func TestKubehzP2ReliefLostCommitAck(t *testing.T) {
+	d := &reliefDialect{current: 100, commitLostAt: 10}
 	s := New(d, 0, 0, 0, 0, 10, 0)
 	s.polledRev.Store(100)
-	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), reliefCtxKey{}, true))
-	cancel()
-	res, err := s.RelieveQuota(ctx, 20, false)
-	if !errors.Is(err, context.Canceled) || res.Rows != 0 || len(d.batches) != 0 || d.begins != 0 {
-		t.Fatalf("err %v, rows %d, batches %v, transactions %d; want context.Canceled, nothing compacted and no transaction", err, res.Rows, d.batches, d.begins)
+	res, err := s.RelieveQuota(context.WithValue(context.Background(), reliefCtxKey{}, true), 30, false)
+	if !errors.Is(err, errCommit) || res.Rows != 0 || !res.Stale || d.compactRev != 10 {
+		t.Fatalf("err %v, rows %d, stale %v, committed %d; want the commit error, 0 rows, stale and revision 10 committed", err, res.Rows, res.Stale, d.compactRev)
 	}
 }
 

@@ -102,8 +102,8 @@ package server
 //     effect stays in the tenant's own data.
 //   - A tenant that spends the lanes' rate on its own keys can starve its own
 //     controllers' renewals. That harms only its own cluster.
-//   This bounds retained rows, not the physical file or the WAL; those are
-//   the PostgreSQL operator's (CNPG volume and WAL limits).
+//   None of this bounds the physical file or the WAL; those are the
+//   PostgreSQL operator's (CNPG volume and WAL limits).
 
 import (
 	"context"
@@ -144,8 +144,9 @@ const (
 	quotaReliefBudget = 20 * time.Second
 	// quotaRefreshBudget bounds one refresh pass. A pass refreshes or
 	// compacts, never both, so a VACUUM of a large table does not take the
-	// compaction's time. The next sample waits for it; the written bytes keep
-	// counting meanwhile, so the figure can only read high.
+	// compaction's time. The next sample waits for it (no 30 s cadence
+	// then); the written bytes keep counting meanwhile, so the figure can
+	// only read high.
 	quotaRefreshBudget = 2 * time.Minute
 	// quotaRefreshSettle is how long after a pass that deleted rows the
 	// statistics refresh waits, with no compaction in between. PostgreSQL

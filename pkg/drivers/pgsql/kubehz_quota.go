@@ -119,8 +119,10 @@ const vacuumCountsSQL = `
 // (autovacuum, a manual VACUUM, DDL) and reports no error for it.
 var errVacuumSkipped = errors.New("the VACUUM skipped the kine table or its TOAST table, which another process holds")
 
-// statsWatches holds the newest reset watch of each dialect, for StatsOwed.
-// A map here keeps the dialect's struct (pgsql.go) as upstream has it.
+// statsWatches holds the newest reset watch of each dialect, for StatsOwed
+// and RefreshStats. A map here keeps the dialect's struct (pgsql.go) as
+// upstream has it. Entries are never removed: kine opens one dialect per
+// process, so this holds one; a process that opened many would keep them.
 var statsWatches sync.Map // *notifyingDialect -> *statsWatch
 
 // LiveSize implements server.LiveSizer. Each call returns a source with its
@@ -155,7 +157,7 @@ func (d *notifyingDialect) StatsOwed() bool {
 type statsWatch struct {
 	d                 *notifyingDialect
 	heapIns, toastIns int64       // -1 before the first sample; sampler goroutine only
-	heapVac, toastVac int64       // sampler goroutine only
+	heapVac, toastVac int64       // sampler goroutine only (RefreshStats runs there too)
 	owed              atomic.Bool // a reset was seen and no VACUUM ran since
 }
 
@@ -233,6 +235,17 @@ func (d *notifyingDialect) RefreshStats(ctx context.Context) error {
 			return err
 		}
 		if heap > heapBefore && (!hasToast || toast > toastBefore) {
+			// A VACUUM ran after any reset the watch saw, so that reset is
+			// settled now, also when the next samples fail before they can
+			// see it. The manual counts become the watch's baseline, so a
+			// reset before the next sample still shows as a decrease. They
+			// are at most the counts the watch reads, so a later sample
+			// sees no false decrease.
+			if w, ok := statsWatches.Load(d); ok {
+				w := w.(*statsWatch)
+				w.heapVac, w.toastVac = heap, toast
+				w.owed.Store(false)
+			}
 			return nil
 		}
 		select {

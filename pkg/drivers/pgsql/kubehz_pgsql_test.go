@@ -139,6 +139,11 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		if res, err := relief.RelieveQuota(ctx, 0, true); err != nil || !res.Refreshed || res.Rows != 0 {
 			t.Fatalf("%s: the refresh pass: refreshed %v, rows %d, err %v; want a refresh and no rows", what, res.Refreshed, res.Rows, err)
 		}
+		// the refresh itself settles the reset, before any sample: samples
+		// that fail after it must not keep the refresh owed
+		if relief.StatsOwed() {
+			t.Fatalf("%s: StatsOwed after a refresh that ran, before the next sample", what)
+		}
 	}
 
 	// B481: a crash or a promoted standby resets the cumulative statistics, so
@@ -207,6 +212,13 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	}
 	owedAtTableSize("the source after a reset that follows new rows", live)
 	refreshPass("after a reset that follows new rows")
+	// another reset before the source sampled again: the refresh's vacuum
+	// counts are the baseline, so it still shows as a decrease
+	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
+		t.Fatal(err)
+	}
+	owedAtTableSize("the source after a second reset right after the refresh", live)
+	refreshPass("after the second reset")
 	inBand(t, "the source after a reset that follows new rows and the refresh", live, actualOf(db))
 
 	// The same for a source that starts after the reset (a kine restart after

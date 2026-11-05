@@ -9,6 +9,7 @@ package sqllog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -23,6 +24,11 @@ var _ server.QuotaRelief = (*SQLLog)(nil)
 // comes while one runs does not start another.
 var pollerStarts sync.Map // *SQLLog -> struct{}
 
+// errCommitUnknown marks a batch whose commit returned an error. The commit
+// can have taken effect all the same (a lost acknowledgement), so the batch's
+// rows may be gone.
+var errCommitUnknown = errors.New("the commit can have taken effect")
+
 // RelieveQuota compacts to target, lowered so that it never passes the
 // revision this log's poller has sent to its watchers (a row it has not sent
 // would be a gap, sql.go's poll loop) and never reaches the newest row (the
@@ -31,6 +37,8 @@ var pollerStarts sync.Map // *SQLLog -> struct{}
 // pass, it never ends the process. After rows were deleted, also before an
 // error, it runs the dialect's post-compaction step, as compact() does.
 // Every query runs under ctx. res.Head is MAX(id) as the last batch read it.
+// res.Stale is set when rows were or may have been deleted (a failed commit)
+// and the dialect keeps statistics the quota must refresh.
 //
 // With refresh it only asks the dialect to refresh its statistics and
 // compacts nothing. A pass never does both: on PostgreSQL a VACUUM sets the
@@ -72,8 +80,12 @@ func (s *SQLLog) RelieveQuota(ctx context.Context, target int64, refresh bool) (
 			break
 		}
 	}
-	if res.Rows > 0 {
+	if res.Rows > 0 || errors.Is(err, errCommitUnknown) {
+		// a commit that returned an error can have deleted its rows too, so
+		// the refresh must wait for them to settle as well
 		_, res.Stale = s.d.(server.StatsRefresher)
+	}
+	if res.Rows > 0 {
 		if perr := s.d.PostCompact(ctx); perr != nil {
 			err = joinRelief(err, fmt.Errorf("after compacting: %w", perr))
 		}
@@ -156,7 +168,7 @@ func (s *SQLLog) reliefBatch(ctx context.Context, target int64) (done bool, rows
 		return true, 0, 0, current, fmt.Errorf("recording compact revision %d: %w", batch, err)
 	}
 	if err := t.Commit(); err != nil {
-		return true, 0, 0, current, fmt.Errorf("committing the compaction to revision %d: %w", batch, err)
+		return true, 0, 0, current, fmt.Errorf("committing the compaction to revision %d: %w (%w)", batch, err, errCommitUnknown)
 	}
 	return batch >= target, rows, batch, current, nil
 }

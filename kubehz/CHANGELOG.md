@@ -124,6 +124,21 @@ kine's own compactor and autovacuum run outside the coordination. The
 15 s settle is a margin, not a proof. All of it is in
 [MERGE-GUIDE.md](MERGE-GUIDE.md#p2), "Bounds".
 
+A fourth Astra review, of `5a7d308`, found the three blocking points
+fixed and two more on error paths. This revision answers them:
+- A batch whose commit returned an error reported 0 rows and owed no
+  refresh, but the commit can have taken effect (a lost acknowledgement).
+  Such a pass is now stale too, so the refresh waits for its deletes.
+- A refresh settled the reset only at the next good sample. If the
+  samples failed after it, the reset stayed owed, and refresh passes could
+  keep the compaction out for good. Now a refresh that ran settles the
+  reset at once, and its vacuum counts become the watch's baseline, so a
+  reset before the next sample still shows.
+It also corrected the wording: a lagging poller tries to fill a gap or
+skips it after a second, a short pass gets no quiet tick, autovacuum has
+no deadline during the pause, a slow refresh delays the next sample, the
+reset misses in general terms, and "this bounds retained rows" is gone.
+
 The new PostgreSQL phase found one more: a VACUUM right after a delete
 reads low. PostgreSQL sets `n_live_tup` to an absolute value in the VACUUM,
 and the deleting backend's counters reach the shared statistics up to
@@ -135,8 +150,9 @@ The reworked PostgreSQL phases found one more: a reset that comes while
 the insert counters still read 0 from the reset before is no decrease. The
 vacuum counts go down then, so the watch reads them too.
 
-**Measured.** `TestKubehzP2P3Postgres` on PostgreSQL 17, the estimate
-against `SUM(pg_column_size(value) + pg_column_size(old_value))`:
+**Measured.** `TestKubehzP2P3Postgres` on PostgreSQL 17.11, the estimate
+against `SUM(pg_column_size(value) + pg_column_size(old_value))`. PostgreSQL
+18.4 gives the same ratios (it passes there too):
 
 | Data | Estimate / actual | Ratio |
 |---|---|---|
@@ -176,14 +192,15 @@ with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
   `TestKubehzP2ReliefHeadOnlyWhenItHelps`, `TestKubehzP2ReliefRefreshPause`,
   `TestKubehzP2ReliefPausedCompacts`, `TestKubehzP2ReliefOwedWhileNotFull`,
   `TestKubehzP2ReliefStatsOwed`, `TestKubehzP2ReliefNoStats`,
-  `TestKubehzP2ReliefBudgets`, `TestKubehzP2ReliefTimestampAfterRead`.
+  `TestKubehzP2ReliefBudgets`, `TestKubehzP2ReliefStaleOnError`,
+  `TestKubehzP2ReliefPauseExpiry`, `TestKubehzP2ReliefTimestampAfterRead`.
   The fake relief clamps to the row before the head and reports the
   backend's current revision as the head, as the real one does.
 - on a fake dialect: `TestKubehzP2ReliefBounds`,
   `TestKubehzP2ReliefStartsPoller`, `TestKubehzP2ReliefRefreshOnly`,
   `TestKubehzP2ReliefNotStaleWithoutRefresher`,
   `TestKubehzP2ReliefCancelled`, `TestKubehzP2ReliefCancelledInBatch`,
-  `TestKubehzP2ReliefPollerRetry`
+  `TestKubehzP2ReliefPollerRetry`, `TestKubehzP2ReliefLostCommitAck`
 - `TestKubehzP2ListenRelief`: a real kine on sqlite fills to the limit. A
   Lease update and a no-growth update pass, a new key is refused, and kine
   recovers by itself within 15 s after the deletes (relief lag 1 s here)
@@ -194,7 +211,9 @@ with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
   reset log line), a VACUUM that skipped a held table
   (`errVacuumSkipped`, also through the refresh pass, and the reset stays
   owed), a reset while the insert counters already read 0 (the vacuum
-  counts see it), and a VACUUM from elsewhere that settles it. Autovacuum
+  counts see it), a reset right after a refresh and before the next sample
+  (the refresh's baseline sees it), and a VACUUM from elsewhere that
+  settles it. After every refresh pass `StatsOwed` is false at once. Autovacuum
   is off for the later ones, so only a VACUUM the test or the quota runs
   brings `reltuples` up to date.
 
@@ -211,9 +230,12 @@ Each of these mutations makes a test fail:
   statistics refresh on 0 rows, a pass that goes on after an error.
 
 The mutations of the first two revisions (25, then 13, all caught) were
-rebuilt for the third, since its passes changed. The third revision's
-mutations, MUT-COUNT-PENDING (each applied to a backup copy, the named test
-run, the file restored and compared):
+rebuilt for the third, since its passes changed. The mutations of the
+third and fourth revisions, MUT-COUNT-PENDING (each applied to a
+backup copy, the named test run, the file restored and compared). Two
+missed the first run of the third: a first-sample check that ignores a
+VACUUM behaves the same except for one log line, so the test now fails on
+that line; one mutation did not compile. Both are caught since:
 - accounting and lanes: the marks read the written bytes, the base stored
   before the live figure, a create error refunded, an existing key
   counted, an update error refunded, a lost compare-and-swap counted,
@@ -242,7 +264,11 @@ run, the file restored and compared):
   a VACUUM (caught by the reset log lines), no settle by the vacuum
   counts, no table-size fallback, the reset not kept between samples,
   `StatsOwed` always false, a skipped VACUUM not checked, `reltuples`
-  only, no `reltuples` floor.
+  only, no `reltuples` floor
+- the fourth revision: a failed commit that owes no refresh, a stale pass
+  ignored after an error, the settle not set while paused, a refresh
+  budget of hours, a stopped refresh counted as failed, a refresh that
+  does not settle the reset, a refresh that sets no baseline.
 
 Not covered by a test: the reader's load order in `figure` (base, then
 live). A wrong order opens a window of two atomic loads; a seam there
