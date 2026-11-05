@@ -20,8 +20,8 @@ Adds `pkg/logstructured/sqllog/kubehz_relief.go`. Touches
 `pkg/logstructured/logstructured.go`, `pkg/app/app.go` (the flag text) and
 `go.mod` (`golang.org/x/time` is direct now).
 
-**Why.** B481 (kubehz-cluster `BUGS-FOUND.md`, found 2026-11-05 in the
-managed-state prototype: k3s v1.36.6 on PostgreSQL 17, limit 48 MiB). At
+**Why.** B481, found 2026-11-05 on k3s v1.36.6 against PostgreSQL 17 with
+a limit of 48 MiB. At
 the limit the first P2 refused every put, as etcd's capped applier does.
 On k3s that loses the cluster: the leader-election Lease update fails and
 k3s exits (twice in 23 minutes). A delete raised the figure from 138 MiB to
