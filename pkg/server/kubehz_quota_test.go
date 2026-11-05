@@ -781,21 +781,34 @@ type reliefFake struct {
 	refreshes []bool
 	rows      int64
 	refreshed bool
+	err       error
+	short     bool // the pass stops 10 revisions short of its target
 }
 
 func (r *reliefFake) RelieveQuota(_ context.Context, target int64, refresh bool) (ReliefResult, error) {
 	r.targets = append(r.targets, target)
 	r.refreshes = append(r.refreshes, refresh)
-	return ReliefResult{Rows: r.rows, CompactedTo: target, Refreshed: r.refreshed}, nil
+	to := target
+	if r.short {
+		to -= 10
+	}
+	return ReliefResult{Rows: r.rows, CompactedTo: to, Refreshed: r.refreshed}, r.err
 }
 
-// revFake is a backend whose current revision the test sets.
+// revFake is a backend whose current revision the test sets. onRev, when
+// set, runs inside each read (a stalled read moves the fake clock).
 type revFake struct {
 	*quotaFake
-	rev atomic.Int64
+	rev   atomic.Int64
+	onRev func()
 }
 
-func (f *revFake) CurrentRevision(context.Context) (int64, error) { return f.rev.Load(), nil }
+func (f *revFake) CurrentRevision(context.Context) (int64, error) {
+	if f.onRev != nil {
+		f.onRev()
+	}
+	return f.rev.Load(), nil
+}
 
 // reliefSetup is a quota with relief, a fake clock and a 60 s lag.
 func reliefSetup(t *testing.T, relief QuotaRelief) (*Quota, *revFake, *time.Time) {
@@ -829,9 +842,10 @@ func TestKubehzP2ReliefTick(t *testing.T) {
 	}
 	size.Store(10)
 	fake.rev.Store(95)
-	quota.tick(ctx, live, nil) // below the limit
-	if len(relief.targets) != 1 || relief.targets[0] != 50 {
-		t.Fatalf("relief targets %v, want [50] (the revision of the tick 60 s back)", relief.targets)
+	relief.rows = 0
+	quota.tick(ctx, live, nil) // below the limit: only the owed refresh, target 0
+	if len(relief.targets) != 2 || relief.targets[0] != 50 || relief.targets[1] != 0 {
+		t.Fatalf("relief targets %v, want [50 0] (the revision of the tick 60 s back, then the owed refresh)", relief.targets)
 	}
 	if reads.Load() != 5 {
 		t.Fatalf("%d live reads, want 5 (four ticks and one after the relief pass)", reads.Load())
@@ -911,5 +925,125 @@ func TestKubehzP2ReliefRefreshOwed(t *testing.T) {
 	}
 	if !slices.Equal(relief.refreshes, want) {
 		t.Fatalf("refresh flags %v, want %v", relief.refreshes, want)
+	}
+}
+
+// TestKubehzP2ReliefHeadOnlyWhenItHelps: no head marker after a pass that
+// failed or stopped short of the row before the newest. A marker only helps
+// when the newest row is all that keeps the deleted rows back.
+func TestKubehzP2ReliefHeadOnlyWhenItHelps(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		relief *reliefFake
+	}{
+		{"a failed pass", &reliefFake{err: errors.New("compact failed")}},
+		{"a pass that stopped short", &reliefFake{short: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			live := func(context.Context) (int64, error) { return 2000, nil }
+			quota, fake, clock := reliefSetup(t, tc.relief)
+			fake.rev.Store(100)
+			quota.tick(ctx, live, nil)
+			*clock = clock.Add(time.Minute)
+			quota.tick(ctx, live, nil)
+			if len(tc.relief.targets) != 1 {
+				t.Fatalf("relief targets %v, want one pass", tc.relief.targets)
+			}
+			if len(fake.updates) != 0 {
+				t.Fatalf("head marker written after %s: %v", tc.name, fake.updates)
+			}
+		})
+	}
+}
+
+// TestKubehzP2ReliefRefreshSettle: the refresh waits quotaRefreshSettle after
+// the pass that deleted rows, also when the next tick comes at once (a slow
+// tick makes the ticker deliver the next one right away).
+func TestKubehzP2ReliefRefreshSettle(t *testing.T) {
+	ctx := context.Background()
+	live := func(context.Context) (int64, error) { return 2000, nil }
+	relief := &reliefFake{rows: 5}
+	quota, fake, clock := reliefSetup(t, relief)
+	// ticks at 0 s, 60 s, 61 s and 76 s; the pass at 60 s deletes rows
+	for i, step := range []time.Duration{time.Minute, time.Second, quotaRefreshSettle, 0} {
+		fake.rev.Store(int64(10 * (i + 1)))
+		quota.tick(ctx, live, nil)
+		if len(relief.targets) > 0 {
+			relief.rows = 0
+		}
+		*clock = clock.Add(step)
+	}
+	if want := []bool{false, false, true}; !slices.Equal(relief.refreshes, want) {
+		t.Fatalf("refresh flags %v, want %v (1 s after the delete is too early)", relief.refreshes, want)
+	}
+}
+
+// TestKubehzP2ReliefRefreshPause: after quotaRefreshTries failed refreshes in a
+// row the refresh pauses for quotaRefreshPause, then tries again.
+func TestKubehzP2ReliefRefreshPause(t *testing.T) {
+	ctx := context.Background()
+	live := func(context.Context) (int64, error) { return 2000, nil }
+	relief := &reliefFake{rows: 5} // refreshed stays false: every refresh fails
+	quota, fake, clock := reliefSetup(t, relief)
+	tick := func() {
+		fake.rev.Add(10)
+		quota.tick(ctx, live, nil)
+		if len(relief.targets) > 0 {
+			relief.rows = 0
+		}
+		*clock = clock.Add(time.Minute)
+	}
+	for range 6 { // passes 1 to 5; the third failed refresh is in pass 4
+		tick()
+	}
+	*clock = clock.Add(quotaRefreshPause)
+	tick() // pass 6, after the pause
+	if want := []bool{false, true, true, true, false, true}; !slices.Equal(relief.refreshes, want) {
+		t.Fatalf("refresh flags %v, want %v", relief.refreshes, want)
+	}
+}
+
+// TestKubehzP2ReliefOwedWhileNotFull: an owed refresh runs after the quota is
+// no longer full, in a pass that compacts nothing (target 0).
+func TestKubehzP2ReliefOwedWhileNotFull(t *testing.T) {
+	ctx := context.Background()
+	var size atomic.Int64
+	size.Store(2000)
+	live := func(context.Context) (int64, error) { return size.Load(), nil }
+	relief := &reliefFake{rows: 5}
+	quota, fake, clock := reliefSetup(t, relief)
+	fake.rev.Store(10)
+	quota.tick(ctx, live, nil)
+	*clock = clock.Add(time.Minute)
+	fake.rev.Store(20)
+	quota.tick(ctx, live, nil) // deletes rows
+	relief.rows = 0
+	size.Store(10)
+	*clock = clock.Add(time.Minute)
+	fake.rev.Store(30)
+	quota.tick(ctx, live, nil) // not full
+	if len(relief.targets) != 2 || relief.targets[1] != 0 || !relief.refreshes[1] {
+		t.Fatalf("targets %v, refresh flags %v; want a second pass with target 0 and a refresh", relief.targets, relief.refreshes)
+	}
+}
+
+// TestKubehzP2ReliefTimestampAfterRead: a revision read that stalls is dated
+// when it returns, so the next tick does not compact that revision before it
+// is the lag old.
+func TestKubehzP2ReliefTimestampAfterRead(t *testing.T) {
+	ctx := context.Background()
+	live := func(context.Context) (int64, error) { return 2000, nil }
+	relief := &reliefFake{}
+	quota, fake, clock := reliefSetup(t, relief)
+	fake.onRev = func() { *clock = clock.Add(90 * time.Second) } // the read stalls 90 s
+	fake.rev.Store(10)
+	quota.tick(ctx, live, nil)
+	fake.onRev = nil
+	*clock = clock.Add(time.Second)
+	fake.rev.Store(20)
+	quota.tick(ctx, live, nil)
+	if len(relief.targets) != 0 {
+		t.Fatalf("relief targets %v 1 s after a stalled read; want none, revision 10 is 1 s old", relief.targets)
 	}
 }

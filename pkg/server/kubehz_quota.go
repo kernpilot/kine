@@ -15,10 +15,10 @@ package server
 //   - a small create or update of a control key (Leases, master leases, the
 //     compaction key) passes in its own rate limit;
 //   - the sampler compacts history by itself while full (QuotaRelief), to
-//     revisions at least QuotaReliefLag old, so a delete frees space within
-//     the lag plus up to three intervals (about 3.5 min) without staff: one
-//     to reach the next tick, one pass compacts, the next refreshes the
-//     statistics.
+//     revisions at least QuotaReliefLag old, so a delete frees space without
+//     staff within the lag plus about three intervals (about 3.5 min) when
+//     the refresh succeeds: one to reach the next tick, one pass compacts,
+//     and a pass at least quotaRefreshSettle later refreshes the statistics.
 //
 // INVARIANT: the size is sampled, never queried on the write path. A write
 //   below the limit costs atomic loads and two atomic adds. The
@@ -47,8 +47,9 @@ package server
 //   bytes written, less the key's first value) and key + new + old value
 //   exactly when full, because the check reads the key anyway. An update
 //   below the limit that shrinks a value is charged less than it writes, by
-//   at most the old value. That value already counts in the live figure, so
-//   the stored data stays below about 2L, inside the ceiling. A delete is
+//   at most the old value. Until the next sample reads the stored data, it
+//   can thus reach the ceiling plus up to L, plus what the lanes write in
+//   one sample window (accepted, see the guide's "Bounds"). A delete is
 //   never refused and not counted; its row keeps the old value until
 //   compaction, so the next sample shows it.
 //
@@ -79,12 +80,21 @@ package server
 //     deleted since the last relief pass.
 //   - The relief compacts to the newest tick revision that is at least
 //     QuotaReliefLag old, never past this process's poller and never the
-//     newest row. If no revision was written during the lag, it writes
-//     kine's health key, so the deleted rows fall behind the newest row.
-//   - Each kine process counts only its own writes. Two processes on one
-//     database (a rolling update) see each other's writes at the next good
-//     sample, so together they can pass L by what both write in about two
-//     intervals. The lag keeps each relief behind the other's poller.
+//     newest row. If no revision was written during the lag, and the pass
+//     compacted up to the newest row with no error, it writes kine's health
+//     key, so the deleted rows fall behind the newest row. A pass that failed
+//     writes no marker, so markers cannot pile up. The statistics refresh
+//     runs in a later pass, quotaRefreshSettle after the last delete, also
+//     while not full, and pauses after quotaRefreshTries failures in a row.
+//   - Each kine process counts only its own writes, and nothing fences a
+//     second writer. Two processes on one database (a rolling update) see
+//     each other's writes at the next good sample, so together they can pass
+//     L by what both write in about two intervals. The lag keeps each relief
+//     behind the other's poller while neither stalls for longer than the lag.
+//   - kine's own TTL deletes run with no request deadline. One that stalls
+//     for longer than the lag can pass its compare-and-swap after a relief
+//     pass and delete a newer value of its key. Only keys with a lease take
+//     that path, and the effect stays in the tenant's own data.
 //   - A tenant that spends the lanes' rate on its own keys can starve its own
 //     controllers' renewals. That harms only its own cluster.
 //   This bounds retained rows, not the physical file or the WAL; those are
@@ -127,6 +137,18 @@ const (
 	// quotaReliefBudget bounds one relief pass (compaction and statistics),
 	// so a pass ends before the next sample is due.
 	quotaReliefBudget = 20 * time.Second
+	// quotaRefreshSettle is how long after a pass that deleted rows the
+	// statistics refresh waits. PostgreSQL flushes an idle backend's counters
+	// within 10 s; a VACUUM before that subtracts the deleted rows twice
+	// (sqllog's RelieveQuota). A slow tick can come right after a pass, so
+	// the wait is measured, not assumed from the interval.
+	quotaRefreshSettle = 15 * time.Second
+	// quotaRefreshTries failed refreshes in a row pause the refresh for
+	// quotaRefreshPause. A table whose VACUUM never fits the budget then
+	// costs a few attempts an hour, and autovacuum, which the relief's
+	// deletes start, brings the statistics up to date.
+	quotaRefreshTries = 3
+	quotaRefreshPause = 10 * time.Minute
 	// quotaGrowthSlack is how much larger a value may get in an update while
 	// full. A Lease renewal changes renewTime, whose encoding can grow by a
 	// byte or two; deletionTimestamp and a finalizer removal add a few bytes
@@ -257,14 +279,18 @@ type Quota struct {
 	// the sampler goroutine only. backend is the unwrapped backend (the
 	// current revision and the head marker). revs is the current revision
 	// at recent ticks, the oldest first. refreshOwed is set while rows were
-	// compacted and the statistics were not refreshed since; the next pass
-	// refreshes them.
-	relief      QuotaRelief
-	backend     Backend
-	lag         time.Duration
-	revs        []tickRev
-	refreshOwed bool
-	now         func() time.Time
+	// compacted and the statistics were not refreshed since; a pass at least
+	// quotaRefreshSettle after lastDelete refreshes them. refreshFails counts
+	// failed refreshes in a row; refreshPaused is when they may start again.
+	relief        QuotaRelief
+	backend       Backend
+	lag           time.Duration
+	revs          []tickRev
+	refreshOwed   bool
+	lastDelete    time.Time
+	refreshFails  int
+	refreshPaused time.Time
+	now           func() time.Time
 }
 
 // tickRev is the current revision at one tick.
@@ -502,7 +528,6 @@ func (q *Quota) tick(ctx context.Context, live, physical SizeSource) {
 	if q.relief == nil {
 		return
 	}
-	now := q.now()
 	current, err := q.backend.CurrentRevision(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -510,12 +535,30 @@ func (q *Quota) tick(ctx context.Context, live, physical SizeSource) {
 		}
 		return
 	}
+	// after the read: a read that stalled must not date the revision early,
+	// or a later tick would compact it before it is QuotaReliefLag old
+	now := q.now()
 	target := q.reliefTarget(now)
 	q.revs = append(q.revs, tickRev{at: now, rev: current})
-	if !q.Full() || target <= 0 {
+	if !q.Full() {
+		// an owed refresh still runs, so the figure does not keep a stale
+		// floor until the quota is full again; target 0 compacts nothing
+		if q.refreshDue(now) {
+			q.relieve(ctx, live, physical, 0, current)
+		}
 		return
 	}
-	q.relieve(ctx, live, physical, target, current)
+	if target <= 0 && !q.refreshDue(now) {
+		return
+	}
+	q.relieve(ctx, live, physical, max(target, 0), current)
+}
+
+// refreshDue reports whether this pass refreshes the statistics: rows were
+// compacted and not refreshed since, the deletes are quotaRefreshSettle old,
+// and the refresh is not paused after failures.
+func (q *Quota) refreshDue(now time.Time) bool {
+	return q.refreshOwed && now.Sub(q.lastDelete) >= quotaRefreshSettle && !now.Before(q.refreshPaused)
 }
 
 // reliefTarget is the newest revision recorded at least q.lag before now, or
@@ -545,10 +588,25 @@ func (q *Quota) relieve(ctx context.Context, live, physical SizeSource, target, 
 	defer cancel()
 	start := time.Now()
 	before := q.Figure()
-	res, err := q.relief.RelieveQuota(rctx, target, q.refreshOwed)
+	refresh := q.refreshDue(q.now())
+	res, err := q.relief.RelieveQuota(rctx, target, refresh)
 	// a refresh covers the rows of earlier passes; this pass's rows are owed
-	// to the next one (see QuotaRelief)
+	// to a pass that comes quotaRefreshSettle after it (see QuotaRelief)
 	q.refreshOwed = q.refreshOwed && !res.Refreshed || res.Rows > 0
+	if res.Rows > 0 {
+		q.lastDelete = q.now()
+	}
+	switch {
+	case res.Refreshed:
+		q.refreshFails = 0
+	case refresh:
+		q.refreshFails++
+		if q.refreshFails >= quotaRefreshTries {
+			q.refreshFails = 0
+			q.refreshPaused = q.now().Add(quotaRefreshPause)
+			logrus.Warnf("quota: the statistics refresh failed %d times in a row; it pauses for %s, and autovacuum brings the statistics up to date meanwhile", quotaRefreshTries, quotaRefreshPause)
+		}
+	}
 	metrics.QuotaReliefPasses.Inc()
 	metrics.QuotaReliefRows.Add(float64(res.Rows))
 	if res.Rows > 0 || res.Refreshed {
@@ -563,7 +621,11 @@ func (q *Quota) relieve(ctx context.Context, live, physical SizeSource, target, 
 		metrics.QuotaLastRelief.SetToCurrentTime()
 		logrus.Infof("quota: relief compacted %d rows to revision %d in %s. Live data was %d bytes and is %d bytes, the limit is %d bytes.", res.Rows, res.CompactedTo, took, before, q.Figure(), q.limit)
 	}
-	if target >= current && q.Full() && ctx.Err() == nil {
+	// The head marker, only when it is what keeps rows back: no revision came
+	// during the lag, and this pass compacted all but the newest row. A pass
+	// that failed or stopped short gets no marker, so failed passes cannot
+	// pile markers up.
+	if target >= current && err == nil && res.CompactedTo >= current-1 && q.Full() && ctx.Err() == nil {
 		if err := q.markHead(ctx); err != nil && ctx.Err() == nil {
 			logrus.Warnf("quota: cannot write the head marker: %v", err)
 		}

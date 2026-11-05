@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -24,6 +25,8 @@ import (
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 func TestKubehzP2P3Postgres(t *testing.T) {
@@ -175,6 +178,93 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	inBand(t, "a new source after a reset", server.LiveSizeOf(backend), actualOf(db))
+
+	// B481: no false reset at a start. After a reset and a VACUUM the insert
+	// counters stay below the catalog row count, as they do for a moment on
+	// a busy table. A VACUUM ran since the counters began, so a new source
+	// sees no reset, runs no VACUUM and logs no reset.
+	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM kine"); err != nil {
+		t.Fatal(err)
+	}
+	heapBefore, toastBefore, _, err := vacuumCounts(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &logtest.Hook{}
+	hooks := logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{})
+	logrus.AddHook(logs)
+	inBand(t, "a new source after a reset and a VACUUM", server.LiveSizeOf(backend), actualOf(db))
+	logrus.StandardLogger().ReplaceHooks(hooks)
+	if heap, toast, _, err := vacuumCounts(ctx, db); err != nil || heap != heapBefore || toast != toastBefore {
+		t.Fatalf("vacuum counts %d/%d, were %d/%d (err %v): the new source ran a VACUUM for a reset that a VACUUM had settled", heap, toast, heapBefore, toastBefore, err)
+	}
+	for _, e := range logs.AllEntries() {
+		if strings.Contains(e.Message, "were reset") {
+			t.Fatalf("the new source logged %q for a reset that a VACUUM had settled", e.Message)
+		}
+	}
+
+	// B481: VACUUM (SKIP_LOCKED) skips a table another process holds and
+	// reports no error; RefreshStats must report that it did not run.
+	lock, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Rollback() }()
+	if _, err := lock.ExecContext(ctx, "LOCK TABLE kine IN SHARE UPDATE EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := refresher.RefreshStats(ctx); !errors.Is(err, errVacuumSkipped) {
+		t.Fatalf("RefreshStats with the table held: %v, want %v", err, errVacuumSkipped)
+	}
+
+	// B481: a reset while no VACUUM can run. The figure is the table's size
+	// on disk, an upper bound, until a VACUUM runs; then the estimate again.
+	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
+		t.Fatal(err)
+	}
+	var onDisk int64
+	if err := db.QueryRowContext(ctx, "SELECT pg_table_size('kine')").Scan(&onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := live(ctx); err != nil || got != onDisk {
+		t.Fatalf("the figure after a reset with the table held: %d (err %v), want the table size %d", got, err, onDisk)
+	}
+	// Any VACUUM settles the reset, also one from elsewhere (autovacuum, the
+	// relief's): run one with the table free, then hold the table again, so
+	// the source cannot refresh by itself. The figure is the estimate.
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM kine"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = again.Rollback() }()
+	if _, err := again.ExecContext(ctx, "LOCK TABLE kine IN SHARE UPDATE EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := live(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	est, err := estimateOf(db)(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != est || got == onDisk {
+		t.Fatalf("after a VACUUM from elsewhere the figure is %d, want the estimate %d (the table size is %d)", got, est, onDisk)
+	}
+	t.Logf("after a VACUUM from elsewhere: the estimate %d (the table size was %d)", got, onDisk)
+	if err := again.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 
 	// The same statistics reset with values small enough to stay inline, so
 	// the heap term carries the figure and its reltuples floor is the one

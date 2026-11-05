@@ -49,15 +49,19 @@ In short:
 - After each sample that finds the quota full, also after a failed one,
   kine compacts the history up to the newest tick revision that is at
   least 2 min old (bounded by the poller's revision and the newest row),
-  in transactions that never end the process. It starts the poller when no
-  watch did, and writes its health key when no revision came during the
-  lag. One tick later it runs `VACUUM (ANALYZE, SKIP_LOCKED) kine` and
-  samples again.
+  in transactions that never end the process. It starts the poller in the
+  background when no watch did, and writes its health key when no revision
+  came during the lag and the pass reached the newest row. In a later
+  pass, at least 15 s after its last delete, it runs
+  `VACUUM (ANALYZE, SKIP_LOCKED) kine` with 10 s of the pass's 20 s, and
+  checks that the VACUUM ran. Three failed refreshes in a row pause the
+  refresh for 10 min.
 - The PostgreSQL estimate uses `GREATEST(n_live_tup, reltuples)`, so a
   crash or a CNPG failover (both reset `n_live_tup`) does not lift the
   limit. The source watches the insert counters for a reset and then
   refreshes the statistics, because `reltuples` misses the rows written
-  after the last VACUUM.
+  after the last VACUUM. While a reset is owed, the figure is the table
+  size, an upper bound, until a VACUUM ran.
 - New metrics: `kine_quota_full`, `kine_quota_pending_bytes`,
   `kine_quota_refused_total{reason}`, `kine_quota_lane_writes_total{lane}`,
   `kine_quota_relief_passes_total`, `kine_quota_relief_rows_total`,
@@ -70,12 +74,35 @@ load order, the lane caps, the relief lag and head marker, the relief
 after a failed sample, the owed refresh, the poller start, the settle
 rules and the reset watch.
 
+A second Astra review, of `7a3f8e6`, found nine more (N1-N9) and called
+five of the 17 only partly fixed. This revision answers the nine:
+- N1: the refresh waits 15 s after the last deleting pass, measured, not
+  one tick, because a slow tick can come right after a pass.
+- N2 and N9: any VACUUM since the reset settles it, also autovacuum's or
+  the relief's; the inline refresh is followed by one background refresh
+  at a time; a first sample after a VACUUM is no reset.
+- N3: the refresh has a 10 s sub-budget, so the compaction keeps its time.
+- N4: a refresh counts only when `vacuum_count` of the table and its TOAST
+  table went up (`SKIP_LOCKED` skips a held table with no error).
+- N5: the poller starts in the background, one start at a time per log.
+- N6: a health-key marker only after a pass with no error that reached
+  the newest row.
+- N7: an owed refresh also runs while the quota is not full.
+- N8: a tick takes its timestamp after it read the revision.
+Also new: three failed refreshes in a row pause the refresh for 10 min.
+Accepted, with their bounds in [MERGE-GUIDE.md](MERGE-GUIDE.md#p2): a
+shrinking update below the limit is undercharged (the stored data can
+reach the ceiling plus one limit until the next sample), kine's own TTL
+deletes have no request deadline, two writers are not fenced, a lost
+acknowledgement on an update gives its bytes back until the next sample,
+and a tenant can ratchet its own Leases through the control lane.
+
 The new PostgreSQL phase found one more: a VACUUM right after a delete
 reads low. PostgreSQL sets `n_live_tup` to an absolute value in the VACUUM,
 and the deleting backend's counters reach the shared statistics up to
 10 s later, so the deleted rows are subtracted twice. Measured: 100 rows
 written after such a refresh read 0.865 of the actual size for 15 s. The
-relief now refreshes one tick after its delete.
+relief now refreshes at least 15 s after its delete.
 
 **Measured.** `TestKubehzP2P3Postgres` on PostgreSQL 17, the estimate
 against `SUM(pg_column_size(value) + pg_column_size(old_value))`:
@@ -84,9 +111,13 @@ against `SUM(pg_column_size(value) + pg_column_size(old_value))`:
 |---|---|---|
 | 200 TOAST rows of 65,536 bytes | 13,187,400 / 13,107,400 | 1.006 (in band after `pg_stat_reset()` too) |
 | half of them deleted, then `RefreshStats` | 6,593,700 / 6,553,700 | 1.006 |
-| 100 rows written after the last VACUUM | 13,187,400 / 13,107,400 | 1.006 |
+| 100 rows written after the last VACUUM | 13,055,526 / 13,107,400 | 0.996 |
 | a reset after those rows (the source refreshes) | 13,188,600 / 13,107,400 | 1.006 |
-| 100 more rows, then a reset, a new source | 19,783,800 / 19,661,100 | 1.006 |
+| 100 more rows written after the last VACUUM | 19,914,786 / 19,661,100 | 1.013 |
+| then a reset and a new source | 19,783,800 / 19,661,100 | 1.006 |
+| a new source after a reset and a VACUUM (no reset to see) | 19,783,800 / 19,661,100 | 1.006 |
+| a reset while another process holds the table (the VACUUM skips it) | 20,701,184 (`pg_table_size`) / 19,661,100 | 1.053, the upper bound |
+| then a VACUUM from elsewhere | 19,783,800 / 19,661,100 | 1.006 |
 | 4,000 inline rows of 1 KiB, after a statistics reset | 4,348,000 / 4,116,000 | 1.056 (the old query read 0) |
 
 The B481 scenario on k3s v1.36.6 against PostgreSQL 17 (isolated docker
@@ -108,16 +139,23 @@ with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
   `TestKubehzP2ReservationAcrossSamples`, `TestKubehzP2SampleOrder`,
   `TestKubehzP2LaneCaps`, `TestKubehzP2PendingWindow`,
   `TestKubehzP2ReliefTick`, `TestKubehzP2ReliefHead`,
-  `TestKubehzP2ReliefAfterFailedSample`, `TestKubehzP2ReliefRefreshOwed`
+  `TestKubehzP2ReliefAfterFailedSample`, `TestKubehzP2ReliefRefreshOwed`,
+  `TestKubehzP2ReliefHeadOnlyWhenItHelps`,
+  `TestKubehzP2ReliefRefreshSettle`, `TestKubehzP2ReliefRefreshPause`,
+  `TestKubehzP2ReliefOwedWhileNotFull`,
+  `TestKubehzP2ReliefTimestampAfterRead`
 - on a fake dialect: `TestKubehzP2ReliefBounds`,
-  `TestKubehzP2ReliefStartsPoller`
+  `TestKubehzP2ReliefStartsPoller`, `TestKubehzP2ReliefRefreshBudget`,
+  `TestKubehzP2ReliefCancelled`
 - `TestKubehzP2ListenRelief`: a real kine on sqlite fills to the limit. A
   Lease update and a no-growth update pass, a new key is refused, and kine
   recovers by itself within 15 s after the deletes (relief lag 1 s here)
-- six new phases in `TestKubehzP2P3Postgres`: the floor after a reset, the
-  refresh after a relief, rows written after the last VACUUM, and both
-  reset checks. Autovacuum is off for the last ones, so only the source
-  can bring `reltuples` up to date.
+- nine new phases in `TestKubehzP2P3Postgres`: the floor after a reset,
+  the refresh after a relief, rows written after the last VACUUM, both
+  reset checks, a new source after a VACUUM (no reset), a VACUUM that
+  skipped a held table (`errVacuumSkipped`), the table size while a reset
+  is owed, and a VACUUM from elsewhere that settles it. Autovacuum is off
+  for the later ones, so only the source can bring `reltuples` up to date.
 
 Each of these mutations makes a test fail:
 - quota: no update lane, the reservation after the write, the base one
@@ -145,6 +183,18 @@ the named test run, the file restored and compared):
   compaction, the post-compaction step on 0 rows
 - PostgreSQL: no reset check on a counter that went down, no first-sample
   check, `reltuples` only, no `reltuples` floor.
+
+The second revision's mutations, 13 of 13 caught. Three survived the first
+run (a poller start that is not one at a time, a batch that ignores the
+cancellation, a first-sample check that ignores a VACUUM); the tests now
+count the goroutines, the transactions begun and the reset log lines:
+- relief timing: no settle wait, no pause, no refresh while not full, the
+  timestamp before the revision read, a marker after any pass
+- relief: the refresh with the whole budget, a poller start in the pass,
+  a poller start that is not one at a time, a batch that ignores the
+  cancellation
+- PostgreSQL: a skipped VACUUM not checked, a first-sample check that
+  ignores a VACUUM, no settle by the vacuum counts, no table-size fallback.
 
 Not covered by a test: the reader's load order in `figure` (base, then
 live). A wrong order opens a window of two atomic loads; a seam there

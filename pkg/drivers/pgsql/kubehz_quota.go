@@ -6,7 +6,9 @@ package pgsql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
@@ -82,24 +84,47 @@ const statsExistSQL = `
 // compile-time check: the dialect handed to sqllog.New offers a live figure.
 var _ server.LiveSizer = (*notifyingDialect)(nil)
 
-// statsCountersSQL reads the cumulative insert counters of the kine table and
-// of its TOAST relation, and their catalog row counts. The counters only
-// grow, except when the statistics are reset.
+// statsCountersSQL reads, for the kine table and its TOAST relation, the
+// cumulative insert counters, the catalog row counts and the vacuum counts
+// (manual and autovacuum). The counters only grow, except when the
+// statistics are reset, which also sets the vacuum counts to 0.
 const statsCountersSQL = `
 	SELECT
-		COALESCE((SELECT s.n_tup_ins FROM pg_stat_user_tables AS s
-			WHERE s.schemaname = current_schema() AND s.relname = 'kine'), 0),
-		COALESCE((SELECT t.n_tup_ins FROM pg_class AS c
-			JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
-			WHERE c.oid = 'kine'::regclass), 0),
-		(SELECT GREATEST(c.reltuples, 0)::bigint FROM pg_class AS c WHERE c.oid = 'kine'::regclass),
-		COALESCE((SELECT GREATEST(tc.reltuples, 0)::bigint FROM pg_class AS c
-			JOIN pg_class AS tc ON tc.oid = c.reltoastrelid
-			WHERE c.oid = 'kine'::regclass), 0)`
+		COALESCE(s.n_tup_ins, 0),
+		COALESCE(t.n_tup_ins, 0),
+		GREATEST(c.reltuples, 0)::bigint,
+		COALESCE(GREATEST(tc.reltuples, 0), 0)::bigint,
+		COALESCE(s.vacuum_count + s.autovacuum_count, 0),
+		COALESCE(t.vacuum_count + t.autovacuum_count, 0),
+		c.reltoastrelid <> 0
+	FROM pg_class AS c
+	LEFT JOIN pg_stat_all_tables AS s ON s.relid = c.oid
+	LEFT JOIN pg_class AS tc ON tc.oid = c.reltoastrelid
+	LEFT JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
+	WHERE c.oid = 'kine'::regclass`
 
-// statsRefreshTimeout bounds the refresh after a reset, so the size read that
-// follows still has time inside the sample's own deadline.
-const statsRefreshTimeout = 5 * time.Second
+// vacuumCountsSQL reads the manual vacuum counts of the kine table and of its
+// TOAST relation, and whether it has one.
+const vacuumCountsSQL = `
+	SELECT COALESCE(s.vacuum_count, 0), COALESCE(t.vacuum_count, 0), c.reltoastrelid <> 0
+	FROM pg_class AS c
+	LEFT JOIN pg_stat_all_tables AS s ON s.relid = c.oid
+	LEFT JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
+	WHERE c.oid = 'kine'::regclass`
+
+// statsRefreshTimeout bounds the refresh inside a sample, so the size read
+// that follows still has time inside the sample's own deadline. A refresh
+// that does not fit continues in the background for up to
+// statsRefreshBackground.
+const (
+	statsRefreshTimeout    = 5 * time.Second
+	statsRefreshBackground = 2 * time.Minute
+)
+
+// errVacuumSkipped is RefreshStats' error when the VACUUM did not process
+// the table: SKIP_LOCKED skips a relation that another process holds
+// (autovacuum, a manual VACUUM, DDL) and reports no error for it.
+var errVacuumSkipped = errors.New("the VACUUM skipped the kine table or its TOAST table, which another process holds")
 
 // LiveSize implements server.LiveSizer. Each call returns a source with its
 // own reset watch; the quota's sampler is its only caller.
@@ -110,54 +135,95 @@ func (d *notifyingDialect) LiveSize() server.SizeSource {
 
 // statsWatch remembers the counters of the last sample. A counter that went
 // down means the statistics were reset since. At the first sample there is
-// no last value: there a counter below its table's catalog row count means
-// rows exist that the counters never saw, which also means a reset.
+// no last value: there a counter below its table's catalog row count, with
+// no vacuum since the counters began, means rows exist that the counters
+// never saw, which also means a reset. A vacuum count of 0 on the table or
+// its TOAST relation is the other half: a reset sets them to 0, and any
+// VACUUM after it (this one, the relief's, autovacuum) sets the live row
+// counts again, so the reset is settled once both counts are above 0.
 type statsWatch struct {
 	d                 *notifyingDialect
-	heapIns, toastIns int64
-	owed              bool // a reset was seen and no refresh succeeded yet
+	heapIns, toastIns int64 // -1 before the first sample
+	owed              bool  // a reset was seen and no VACUUM ran since
+	warned            bool  // the fallback was logged for this reset
+	running           atomic.Bool
 }
 
 // liveSize reads the figure. A table without statistics is analyzed first; if
 // that fails the sample fails, so the quota keeps its last figure and the
 // bytes written since instead of reading a heap term of 0. After a reset it
-// refreshes the statistics first. If that fails, the figure is the table's
-// size on disk, an upper bound of its live data, until a refresh succeeds.
+// refreshes the statistics first, within statsRefreshTimeout; a refresh that
+// does not fit continues in the background, one at a time. Until a VACUUM
+// settles the reset, the figure is the table's size on disk, an upper bound
+// of its live data.
 func (w *statsWatch) liveSize(ctx context.Context) (int64, error) {
 	db := w.d.DB
 	if err := analyzeIfNoStats(ctx, db); err != nil {
 		return 0, err
 	}
-	var heapIns, toastIns, heapRel, toastRel int64
-	if err := db.QueryRowContext(ctx, statsCountersSQL).Scan(&heapIns, &toastIns, &heapRel, &toastRel); err != nil {
+	var heapIns, toastIns, heapRel, toastRel, heapVac, toastVac int64
+	var hasToast bool
+	if err := db.QueryRowContext(ctx, statsCountersSQL).Scan(&heapIns, &toastIns, &heapRel, &toastRel, &heapVac, &toastVac, &hasToast); err != nil {
 		return 0, fmt.Errorf("reading the table counters: %w", err)
 	}
+	vacuumed := heapVac > 0 && (!hasToast || toastVac > 0)
 	if w.heapIns < 0 {
-		w.owed = heapIns < heapRel || toastIns < toastRel
+		w.owed = (heapIns < heapRel || toastIns < toastRel) && !vacuumed
 	} else if heapIns < w.heapIns || toastIns < w.toastIns {
 		w.owed = true
 	}
 	w.heapIns, w.toastIns = heapIns, toastIns
-	if w.owed {
+	if w.owed && vacuumed {
+		w.settled()
+	}
+	if w.owed && !w.running.Load() {
 		rctx, cancel := context.WithTimeout(ctx, statsRefreshTimeout)
 		err := w.d.RefreshStats(rctx)
 		cancel()
-		if err != nil {
-			var size int64
-			if serr := db.QueryRowContext(ctx, "SELECT pg_table_size('kine')").Scan(&size); serr != nil {
-				return 0, fmt.Errorf("the statistics were reset and refreshing them failed (%v); reading the table size: %w", err, serr)
+		if err == nil {
+			w.settled()
+		} else {
+			w.refreshInBackground()
+			if !w.warned {
+				w.warned = true
+				logrus.Warnf("quota: the table statistics were reset, and refreshing them failed: %v. The table size is the figure until a VACUUM ran.", err)
 			}
-			logrus.Warnf("quota: the table statistics were reset, and refreshing them failed: %v. The table size, %d bytes, is the figure until a refresh succeeds.", err, size)
-			return size, nil
 		}
-		w.owed = false
-		logrus.Infof("quota: the table statistics were reset (a crash, a failover or pg_stat_reset); refreshed them for the live-data figure")
+	}
+	if w.owed {
+		var size int64
+		if err := db.QueryRowContext(ctx, "SELECT pg_table_size('kine')").Scan(&size); err != nil {
+			return 0, fmt.Errorf("the statistics were reset and no VACUUM ran since; reading the table size: %w", err)
+		}
+		return size, nil
 	}
 	var size int64
 	if err := db.QueryRowContext(ctx, liveSizeSQL).Scan(&size); err != nil {
 		return 0, err
 	}
 	return size, nil
+}
+
+// settled ends the reset: a VACUUM ran since it.
+func (w *statsWatch) settled() {
+	w.owed, w.warned = false, false
+	logrus.Infof("quota: the table statistics were reset (a crash, a failover or pg_stat_reset); a VACUUM refreshed them for the live-data figure")
+}
+
+// refreshInBackground runs one refresh with statsRefreshBackground, unless
+// one runs. The next sample sees its VACUUM in the vacuum counts.
+func (w *statsWatch) refreshInBackground() {
+	if !w.running.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer w.running.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), statsRefreshBackground)
+		defer cancel()
+		if err := w.d.RefreshStats(ctx); err != nil {
+			logrus.Warnf("quota: the background statistics refresh failed: %v", err)
+		}
+	}()
 }
 
 // compile-time check: the dialect refreshes the statistics after the quota's
@@ -168,13 +234,44 @@ var _ server.StatsRefresher = (*notifyingDialect)(nil)
 // relief deleted rows: ANALYZE for the widths and the heap's row count,
 // VACUUM for the TOAST relation's reltuples (ANALYZE does not visit it) and
 // to make the freed space reusable. SKIP_LOCKED, so a running autovacuum is
-// not waited for; that one updates the same figures. VACUUM cannot run in a
-// transaction, so this is a plain statement under ctx.
+// not waited for. A skipped relation is no error to PostgreSQL, so the
+// manual vacuum counts must go up on both, or this returns errVacuumSkipped
+// and the caller tries again later. VACUUM cannot run in a transaction, so
+// this is a plain statement under ctx.
 func (d *notifyingDialect) RefreshStats(ctx context.Context) error {
+	heapBefore, toastBefore, _, err := vacuumCounts(ctx, d.DB)
+	if err != nil {
+		return err
+	}
 	if _, err := d.DB.ExecContext(ctx, "VACUUM (ANALYZE, SKIP_LOCKED) kine"); err != nil {
 		return fmt.Errorf("vacuuming the kine table: %w", err)
 	}
-	return nil
+	// PostgreSQL 15 and later write the counts at once; older ones send
+	// them to the statistics collector, so give them a moment
+	for range 10 {
+		heap, toast, hasToast, err := vacuumCounts(ctx, d.DB)
+		if err != nil {
+			return err
+		}
+		if heap > heapBefore && (!hasToast || toast > toastBefore) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return errVacuumSkipped
+}
+
+// vacuumCounts reads the manual vacuum counts of the kine table and its TOAST
+// relation.
+func vacuumCounts(ctx context.Context, db *sql.DB) (heap, toast int64, hasToast bool, err error) {
+	if err = db.QueryRowContext(ctx, vacuumCountsSQL).Scan(&heap, &toast, &hasToast); err != nil {
+		err = fmt.Errorf("reading the vacuum counts: %w", err)
+	}
+	return heap, toast, hasToast, err
 }
 
 // analyzeIfNoStats runs ANALYZE once on a table pg_stats does not know yet

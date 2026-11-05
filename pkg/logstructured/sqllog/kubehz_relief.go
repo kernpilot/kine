@@ -10,6 +10,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
@@ -17,6 +19,14 @@ import (
 
 // compile-time check: the log offers the quota its relief.
 var _ server.QuotaRelief = (*SQLLog)(nil)
+
+// reliefRefreshBudget is the part of a pass's budget the statistics refresh
+// may use, so a slow VACUUM leaves the compaction its time. A var for tests.
+var reliefRefreshBudget = 10 * time.Second
+
+// pollerStarts holds the logs whose poller start is running, so a pass that
+// comes while one runs does not start another.
+var pollerStarts sync.Map // *SQLLog -> struct{}
 
 // RelieveQuota compacts to target, lowered so that it never passes the
 // revision this log's poller has sent to its watchers (a row it has not sent
@@ -31,20 +41,24 @@ var _ server.QuotaRelief = (*SQLLog)(nil)
 // PostgreSQL a VACUUM sets the live row count to an absolute value, and the
 // deleting backend's counter changes reach the shared statistics up to 10 s
 // later, so a VACUUM right after the delete subtracts the deleted rows twice
-// and the live figure then reads low. A refresh failure does not stop the
-// compaction. Every query runs under ctx.
+// and the live figure then reads low. The refresh has reliefRefreshBudget of
+// the pass, and its failure does not stop the compaction. Every query runs
+// under ctx.
 func (s *SQLLog) RelieveQuota(ctx context.Context, target int64, refresh bool) (server.ReliefResult, error) {
 	var res server.ReliefResult
 	polled := s.polledRev.Load()
 	if polled <= 0 {
-		return res, s.startPolling()
+		s.startPolling()
+		return res, nil
 	}
 	var errs error
 	if refresh {
 		if r, ok := s.d.(server.StatsRefresher); ok {
-			if err := r.RefreshStats(ctx); err != nil {
+			rctx, cancel := context.WithTimeout(ctx, reliefRefreshBudget)
+			if err := r.RefreshStats(rctx); err != nil {
 				errs = fmt.Errorf("refreshing the statistics: %w", err)
 			}
+			cancel()
 		}
 		res.Refreshed = errs == nil
 	}
@@ -83,20 +97,29 @@ func joinRelief(first, then error) error {
 // startPolling starts the poll loop when no watch has started it yet: the
 // relief never compacts past the poller, so without one it would never
 // compact. The poller starts at the current revision and runs until the log
-// stops (pkg/broadcaster), so this pass compacts nothing and the next one can.
-// The subscription is drained and never read; a slow reader is dropped by the
-// broadcaster, which leaves the poller running.
-func (s *SQLLog) startPolling() error {
-	values, err := s.broadcaster.Subscribe(s.ctx, s.startWatch)
-	if err != nil {
-		return fmt.Errorf("the poller is not running, and starting it failed: %w", err)
+// stops (pkg/broadcaster), so this pass compacts nothing and a later one can.
+// The start runs in its own goroutine, one at a time per log: its revision
+// read runs under the log's context with no deadline and holds the
+// broadcaster's lock, and the sampler must not wait for it. The subscription
+// is drained and never read; a slow reader is dropped by the broadcaster,
+// which leaves the poller running.
+func (s *SQLLog) startPolling() {
+	if _, running := pollerStarts.LoadOrStore(s, struct{}{}); running {
+		return
 	}
 	go func() {
+		defer pollerStarts.Delete(s)
+		values, err := s.broadcaster.Subscribe(s.ctx, s.startWatch)
+		if err != nil {
+			if s.ctx.Err() == nil {
+				logrus.Warnf("quota: the relief needs the poller, and starting it failed: %v", err)
+			}
+			return
+		}
+		logrus.Infof("quota: started the poller for the relief, which needs it")
 		for range values {
 		}
 	}()
-	logrus.Infof("quota: started the poller for the relief, which needs it")
-	return nil
 }
 
 // reliefBatch compacts one batch toward target. done is true when there is
