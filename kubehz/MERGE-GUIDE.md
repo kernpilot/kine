@@ -128,7 +128,7 @@ a correctness fix.
 `pkg/drivers/pgsql/kubehz_quota.go` and `pkg/logstructured/sqllog/kubehz_relief.go`
 (new, conflict-free). Edits: `pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go`
 (the config field, the wiring and two test seams), `pkg/server/kv.go` (two log
-conditions), `pkg/logstructured/logstructured.go` (two forwarding methods) and
+conditions), `pkg/logstructured/logstructured.go` (three forwarding methods) and
 `pkg/logstructured/sqllog/sql.go` (one forwarding method), and `go.mod`
 (`golang.org/x/time` is a direct dependency now). Tests
 `pkg/server/kubehz_quota_test.go`, `pkg/app/kubehz_quota_test.go`,
@@ -199,47 +199,61 @@ which only feeds a gauge. The rules:
    never passes the revision the poller has sent to watchers, and never the
    newest row. With no watch yet the poller has not run, so the pass starts
    it and compacts nothing. The start runs in the background, one at a time
-   per log, so the sampler never waits for its revision read. If no
-   revision came during the lag, and the pass compacted up to the newest
-   row with no error, it writes kine's health key, so the deleted rows fall
-   behind the newest row. A pass that failed or stopped early writes no
-   marker, so markers cannot pile up while the compaction does not keep up.
+   per log, so the sampler never waits for its revision read; a start that
+   failed lets a later pass try again. If no revision came during the lag
+   (the target is the newest row), and the pass compacted up to the row
+   before it with no error, it writes kine's health key, so the deleted rows
+   fall behind the newest row. The newest row is the one the pass read in
+   its transaction (`MAX(id)`), not the cached current revision: a marker
+   whose write lost its acknowledgement moved the head, and the cache need
+   not show that. A pass that failed or stopped early writes no marker, so
+   markers cannot pile up while the compaction does not keep up.
    It does not go through `compact()`, whose
    `--compact-min-retain` floor would keep the deleted rows while no new
    revision comes. Each batch is its own transaction that commits or rolls
    back (never `MustCommit`), under the pass's 20 s budget.
 5. The statistics refresh (PostgreSQL: `VACUUM (ANALYZE, SKIP_LOCKED)
-   kine`) runs in a later pass than the one that deleted rows, at least
-   15 s (`quotaRefreshSettle`) after the last deleting pass, at the start
-   of the pass and before its compaction. A VACUUM sets `n_live_tup` to an
-   absolute value, and the deleting backend's counter changes reach the
-   shared statistics up to 10 s later. So a VACUUM right after the delete
-   subtracts the deleted rows twice, and the figure then reads low. The
-   wait is measured from the delete, because a slow tick can come right
-   after a pass. An owed refresh also runs while the quota is not full (a
-   pass with target 0). The refresh has 10 s of the pass's 20 s, so the
-   compaction keeps its time. On PostgreSQL a refresh counts only when the
-   manual `vacuum_count` of the table and of its TOAST table went up:
-   `SKIP_LOCKED` skips a table that another process holds and reports no
-   error. A failed refresh stays owed and does not stop the compaction.
-   After three failed refreshes in a row it pauses for 10 min, with a
-   warning. A VACUUM that never fits the budget then costs a few attempts
-   an hour, and autovacuum, which the deletes start, updates the
-   statistics meanwhile.
+   kine`) is a pass of its own. A tick runs one refresh pass or one
+   compaction pass, never both, and a refresh pass compacts nothing. A
+   compaction pass that deleted rows on a dialect that keeps statistics
+   (PostgreSQL, `ReliefResult.Stale`) makes a refresh owed. The refresh
+   runs at least 15 s (`quotaRefreshSettle`) after the END of the last
+   deleting pass. A VACUUM sets `n_live_tup` to an absolute value, and the
+   deleting backend's counter changes reach the shared statistics later
+   (an idle backend tries every 10 s). So a VACUUM that overlaps the delete
+   or follows it too closely subtracts the deleted rows twice, and the
+   figure then reads low. While an owed refresh waits for the 15 s, the
+   tick runs no pass (a quiet tick): a compaction on every tick would move
+   the last delete each time and put the refresh off for as long as there
+   is history to delete. With 30 s ticks and passes of up to 20 s the order
+   is compaction, quiet tick, refresh, compaction. The 15 s is a margin,
+   not a proof: PostgreSQL gives no flush deadline under contention. An
+   owed refresh also runs while the quota is not full. A refresh pass has
+   2 min (`quotaRefreshBudget`), a compaction pass 20 s. On PostgreSQL a
+   refresh counts only when the manual `vacuum_count` of the table and of
+   its TOAST table went up: `SKIP_LOCKED` skips a table that another
+   process holds and reports no error. A failed refresh stays owed. After
+   three failed refreshes in a row it pauses for 10 min, with a warning.
+   The compaction then runs on every tick, and autovacuum, which the
+   deletes start, updates the statistics meanwhile. SQLite keeps no such
+   statistics: there a delete owes no refresh and no tick is quiet.
 6. The PostgreSQL estimate uses `GREATEST(n_live_tup, reltuples)` for the
    heap and TOAST row counts, because a crash and a promoted standby reset
    `n_live_tup`, and analyzes the table first when `pg_stats` has no row
    for it. `reltuples` misses the rows written after the last VACUUM or
-   ANALYZE, so the source also watches for a reset: an insert counter that
-   went down since the last sample, or, at the first sample, a counter
-   below the catalog row count while no VACUUM ran since the reset (an
-   ANALYZE can see committed rows before their insert counters flushed, so
-   a low counter alone is no proof). While a reset is owed, the figure is
-   `pg_table_size('kine')`, an upper bound. Any VACUUM of both the table
-   and its TOAST table settles the reset, also one by autovacuum or by the
-   relief. The source refreshes inline first (5 s). If that fails, it
-   starts one background refresh at a time (2 min budget). Each size query
-   has its own 10 s deadline.
+   ANALYZE, so the source also watches for a reset: an insert or vacuum
+   count that went down since the last sample, or, at the first sample, an
+   insert counter below the catalog row count while no VACUUM ran since the
+   reset (an ANALYZE can see committed rows before their insert counters
+   flushed, so a low counter alone is no proof). The vacuum counts catch a
+   reset that comes while the insert counters still read 0 from the reset
+   before. While a reset is owed, the figure is `pg_table_size('kine')`, an
+   upper bound. Any VACUUM of both the table and its TOAST table settles
+   the reset, also one by autovacuum. The source runs no VACUUM itself: it
+   reports the reset (`StatsOwed`), and the quota runs the refresh pass on
+   the sampler goroutine, like every pass, so no VACUUM the quota asks for
+   overlaps the relief's deletes. Each size query has its own 10 s
+   deadline.
 
 INFO lines on each transition and on each relief pass. The metrics
 (`metrics.QuotaMetrics()`) are registered only with a limit. `kv.go`
@@ -268,8 +282,8 @@ optional interface `server.LiveSizer`, asserted at the call site like
 and `LogStructured` forward it, `endpoint.Listen` asks for it and falls
 back to `DbSize` when it gets nil (sqlite, the others). The relief travels
 the same way as `server.QuotaRelief` (`SQLLog` implements it,
-`LogStructured` forwards it), and the statistics refresh as
-`server.StatsRefresher` on the dialect.
+`LogStructured` forwards it, with `StatsOwed`), and the statistics refresh
+as `server.StatsRefresher` on the dialect.
 
 **Bounds, for a tenant that is hostile.** Above the limit only the two
 lanes put, at their rates, and a lane value grows by 64 bytes per update
@@ -277,34 +291,52 @@ at most. The lane caps and the ceiling bound where that ends. The known
 gaps, accepted with their bounds:
 
 - An update below the limit that shrinks a value is charged
-  `key + 2 × new`, so less than it writes, by at most the old value. The
-  figure can then trail the stored data by up to one limit until the next
-  sample reads it. Until then the stored data can reach the ceiling plus
-  up to one limit, plus what the lanes write in one sample window.
+  `key + 2 × new`, so less than it writes, by at most the old value. This
+  gap alone lets the stored data pass the figure by up to one limit while
+  no good sample shows it. That is an envelope for this gap alone, with
+  every other write charged correctly. A good sample need not show the
+  missing bytes at once (the statistics lag), so there is no time bound.
+  The other gaps here (stale widths, a missed reset, lost
+  acknowledgements, uncharged deletes) are separate allowances. Together
+  they give no hard bound on the database.
 - A tenant that spends the control lane on its own keys can starve its own
   controllers' renewals, or grow its Leases by 64 bytes per update until
   the ceiling stops the renewals. That harms only its own cluster.
-- kine's own TTL deletes run with no request deadline. One that stalls for
-  longer than the lag between its read and its insert can pass its
-  compare-and-swap after a relief pass removed the row it conflicts with,
-  and delete a newer value of that key. Only keys with a lease take this
-  path (in Kubernetes: Events and master leases), it needs the kine
-  process itself to stall for over 2 min, and the effect stays in the
-  tenant's own data.
+- kine's own TTL deletes run with no request deadline. One TTL operation
+  can wait between its read and its insert for longer than the lag while
+  the rest of the process, the relief too, goes on. Its compare-and-swap
+  can then pass after a relief pass removed the row it conflicts with, and
+  it deletes a newer value of that key. Only a key queued from a leased
+  revision takes this path (in Kubernetes: Events and master leases); the
+  newer value need not have a lease. The effect stays in the tenant's own
+  data.
 - Each kine process counts only its own writes, and nothing fences a
   second writer. Two processes on one database (a rolling update) see
-  each other's writes at the next good sample, so together they can pass
-  the limit by what both write in about two intervals. The relief lag
-  keeps each relief behind the other's poller while neither stalls for
-  longer than the lag.
+  each other's writes when a good sample shows them, with no time bound.
+  The relief stays behind its own poller only. A second process's poller
+  can fall behind by more than the lag, through a stall or through too
+  little throughput. A row the relief then removes is a gap to that
+  poller: it fills the revision (`Fill`) and goes on, as for any gap, so
+  its watchers miss that event (a delete too) until they list again.
+  Upstream's compactor has the same exposure for a poller that falls
+  `--compact-min-retain` revisions behind.
 - When an update's insert fails after its commit (a lost acknowledgement)
   and the reread finds the row, `LogStructured` reports a lost
-  compare-and-swap, and the quota gives the bytes back. The row shows in
-  the next sample, so the figure is short by that one write for up to two
-  intervals.
-- The reset watch's first-sample check misses a reset after which more
-  rows were inserted than the table holds. Autovacuum and autoanalyze then
-  bring `reltuples` back.
+  compare-and-swap, and the quota gives the bytes back. The figure is then
+  short by the sum of all such writes until a good sample shows them.
+  Below the limit no lane rate limits them, and there is no time bound.
+- The reset watch misses a reset in two cases. At the first sample: more
+  rows were inserted after the reset than the table holds. On a running
+  source: the counts still read 0 from a reset before (no VACUUM since),
+  and more rows were inserted between two samples than the last sample
+  counted. The estimate then misses the rows written after the last VACUUM
+  until autovacuum or autoanalyze brings `reltuples` back. That is no
+  stated time or byte bound.
+- kine's own compactor (`--compact-interval`) and autovacuum run outside
+  this coordination. A refresh pass can follow a delete of kine's
+  compactor too closely, and an autovacuum can follow a relief delete too
+  closely. Both read low the way item 5 describes, until the next VACUUM.
+  The relief's own passes never overlap each other.
 
 This bounds retained rows, not the physical file or the WAL, which are the
 PostgreSQL operator's (CNPG volume and WAL limits).
@@ -322,15 +354,21 @@ load-bearing, which is why `TestKubehzP2P3Postgres` measures the estimate
 against `pg_column_size` on a real PostgreSQL: after `pg_stat_reset()`,
 after a `RefreshStats`, for rows written after the last VACUUM, for both
 reset checks, for a VACUUM that skipped the table, and for the upper bound
-while a reset is owed. The timing of the refresh is load-bearing too: a
-refresh right after the delete reads low, and a refresh that takes the
-whole pass stops the compaction. `TestKubehzP2ReliefBounds`,
-`TestKubehzP2ReliefRefreshOwed`, `TestKubehzP2ReliefRefreshSettle`,
-`TestKubehzP2ReliefRefreshPause`, `TestKubehzP2ReliefOwedWhileNotFull` and
-`TestKubehzP2ReliefRefreshBudget` pin it. One rule has no test: a reader
-of the figure loads the base before the live sample (`figure()`), and no
-test hook can pause a reader between the two loads. Keep that order by
-reading the code.
+while a reset is owed (with `StatsOwed`, the quota's refresh pass and a
+refresh pass that the VACUUM skipped). The order of the passes is
+load-bearing too: a refresh right after the delete reads low, and a
+compaction on every tick starves the refresh. `TestKubehzP2ReliefPasses`,
+`TestKubehzP2ReliefNoStarvation`, `TestKubehzP2ReliefSettleFromPassEnd`,
+`TestKubehzP2ReliefRefreshPause`, `TestKubehzP2ReliefPausedCompacts`,
+`TestKubehzP2ReliefOwedWhileNotFull`, `TestKubehzP2ReliefStatsOwed`,
+`TestKubehzP2ReliefNoStats`, `TestKubehzP2ReliefBudgets`,
+`TestKubehzP2ReliefBounds` and `TestKubehzP2ReliefRefreshOnly` pin it.
+Some rules have no test. A reader of the figure loads the base before the
+live sample (`figure()`), and no test hook can pause a reader between the
+two loads: keep that order by reading the code. A VACUUM that skips only
+the TOAST table has no test (PostgreSQL cannot lock a TOAST table alone).
+The PostgreSQL phases take the first reading in the band, so they cannot
+show that the figure never read low for a moment.
 
 **Not an optimisation.** This is a safety bound. There is no benchmark to
 re-measure. The test suite is the check.
@@ -351,7 +389,8 @@ re-check `kubehz_relief.go` against the new contract. If upstream changes
 `ErrKeyExists` or how an update reports a lost compare-and-swap, re-check
 which errors `quotaBackend` settles as written. If the PostgreSQL
 statistics flush intervals change (`PGSTAT_IDLE_INTERVAL`, 10 s), re-check
-that `quotaRefreshSettle` (15 s) stays above them. If `pg_stat_user_tables`
+that `quotaRefreshSettle` (15 s) stays above them. If the statistics
+reset stops setting the vacuum counts to 0, re-check the reset watch. If `pg_stat_user_tables`
 renames `vacuum_count` or `autovacuum_count`, re-check `vacuumCountsSQL`
 and `statsCountersSQL`. If `startWatch` changes, keep the relief's poller
 start in the background and one at a time. If upstream adds its

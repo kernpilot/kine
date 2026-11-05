@@ -4,8 +4,8 @@ package sqllog
 // Hermetic: a fake dialect and transaction, no database. The relief must never
 // pass the poller's revision or reach the newest row, must work in batches of
 // compact-batch-size, each committed on its own, and must end the pass (not
-// the process) on an error. A refresh runs only when asked, before the
-// compaction, so it never follows this pass's own deletes.
+// the process) on an error. A refresh pass only refreshes: it compacts
+// nothing and begins no transaction, so no VACUUM overlaps the deletes.
 
 import (
 	"context"
@@ -39,8 +39,10 @@ type reliefDialect struct {
 	commitAt     int64 // the commit of the batch to this revision fails; 0 = never
 	foreignCtx   bool  // a query ran under a context that is not the caller's
 	refreshFails bool
-	refreshWaits bool          // RefreshStats waits for its context to end
+	owed         bool          // StatsOwed
 	revBlock     chan struct{} // CurrentRevision waits for it to close
+	revErr       error         // CurrentRevision fails with it
+	onBegin      func()        // runs in BeginTx after the transaction began
 	revCalls     atomic.Int32
 	calls        []string // "refresh" and "compact", in order
 	batches      []int64
@@ -56,6 +58,9 @@ func (d *reliefDialect) BeginTx(ctx context.Context, _ *sql.TxOptions) (server.T
 		return nil, err
 	}
 	d.begins++
+	if d.onBegin != nil {
+		d.onBegin()
+	}
 	return &reliefTx{d: d, compactRev: d.compactRev}, nil
 }
 func (d *reliefDialect) checkCtx(ctx context.Context) {
@@ -68,22 +73,19 @@ func (d *reliefDialect) CurrentRevision(context.Context) (int64, error) {
 	if d.revBlock != nil {
 		<-d.revBlock
 	}
-	return d.current, nil
+	return d.current, d.revErr
 }
 func (d *reliefDialect) PostCompact(context.Context) error { d.postCompacts++; return nil }
 func (d *reliefDialect) RefreshStats(ctx context.Context) error {
 	d.checkCtx(ctx)
 	d.refreshes++
 	d.calls = append(d.calls, "refresh")
-	if d.refreshWaits {
-		<-ctx.Done()
-		return ctx.Err()
-	}
 	if d.refreshFails {
 		return errRefresh
 	}
 	return nil
 }
+func (d *reliefDialect) StatsOwed() bool { return d.owed }
 
 // reliefTx stages SetCompactRevision until Commit, like a real transaction.
 // The Must* methods fail the test: the relief must never end the process.
@@ -168,18 +170,12 @@ func TestKubehzP2ReliefBounds(t *testing.T) {
 		{name: "a failed commit ends the pass and records nothing",
 			current: 100, polled: 100, target: 30, batch: 10, commitAt: 10,
 			wantBatches: []int64{10}, wantTo: 0, wantRows: 0, wantErr: []error{errCommit}, wantRoll: 1},
-		{name: "an owed refresh runs with nothing to compact",
-			current: 1, polled: 1, target: 1, batch: 10, refresh: true,
-			wantBatches: nil, wantTo: 0, wantRows: 0, wantRoll: 1},
-		{name: "an owed refresh runs before this pass's compaction",
+		{name: "a refresh pass refreshes and compacts nothing",
 			current: 100, polled: 100, target: 20, batch: 10, refresh: true,
-			wantBatches: []int64{10, 20}, wantTo: 20, wantRows: 20, wantPost: 1},
-		{name: "a failed refresh does not stop the compaction",
+			wantBatches: nil, wantTo: 0, wantRows: 0},
+		{name: "a failed refresh reports and compacts nothing",
 			current: 100, polled: 100, target: 20, batch: 10, refresh: true, refFails: true,
-			wantBatches: []int64{10, 20}, wantTo: 20, wantRows: 20, wantErr: []error{errRefresh}, wantPost: 1},
-		{name: "a failed refresh and a failed compaction both report",
-			current: 100, polled: 100, target: 30, batch: 10, failAt: 20, refresh: true, refFails: true,
-			wantBatches: []int64{10}, wantTo: 10, wantRows: 10, wantErr: []error{errRefresh, errCompact}, wantPost: 1, wantRoll: 1},
+			wantBatches: nil, wantTo: 0, wantRows: 0, wantErr: []error{errRefresh}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -210,8 +206,18 @@ func TestKubehzP2ReliefBounds(t *testing.T) {
 			if res.Refreshed != (tc.refresh && !tc.refFails) {
 				t.Errorf("Refreshed = %v, want %v", res.Refreshed, tc.refresh && !tc.refFails)
 			}
-			if tc.refresh && len(d.calls) > 0 && d.calls[0] != "refresh" {
-				t.Errorf("calls %v: the refresh must run before this pass's compaction", d.calls)
+			if tc.refresh && (d.begins != 0 || len(d.batches) != 0) {
+				t.Errorf("a refresh pass began %d transactions and compacted %v; want none", d.begins, d.batches)
+			}
+			if res.Stale != (res.Rows > 0) {
+				t.Errorf("Stale = %v with %d rows deleted; want it set exactly when rows went", res.Stale, res.Rows)
+			}
+			wantHead := tc.current // every compaction pass here reads MAX(id)
+			if tc.refresh {
+				wantHead = 0
+			}
+			if res.Head != wantHead {
+				t.Errorf("Head = %d, want %d", res.Head, wantHead)
 			}
 			if !slices.Equal(d.batches, tc.wantBatches) {
 				t.Errorf("batches = %v, want %v", d.batches, tc.wantBatches)
@@ -293,25 +299,82 @@ func TestKubehzP2ReliefStartsPoller(t *testing.T) {
 	}
 }
 
-// TestKubehzP2ReliefRefreshBudget: a refresh that runs out of its budget
-// leaves the compaction the rest of the pass.
-func TestKubehzP2ReliefRefreshBudget(t *testing.T) {
-	budget := reliefRefreshBudget
-	t.Cleanup(func() { reliefRefreshBudget = budget })
-	reliefRefreshBudget = 50 * time.Millisecond
+// TestKubehzP2ReliefRefreshOnly: a refresh pass with no poller yet starts
+// none and reads no revision: it only refreshes.
+func TestKubehzP2ReliefRefreshOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	d := &reliefDialect{current: 100, revBlock: make(chan struct{})}
+	t.Cleanup(func() { close(d.revBlock) })
+	s := New(d, 0, 0, 0, 0, 10, 0)
+	s.ctx = ctx
+	res, err := s.RelieveQuota(context.WithValue(ctx, reliefCtxKey{}, true), 20, true)
+	if err != nil || !res.Refreshed || d.refreshes != 1 {
+		t.Fatalf("err %v, refreshed %v, %d refreshes; want one refresh", err, res.Refreshed, d.refreshes)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, started := pollerStarts.Load(s); started || d.revCalls.Load() != 0 {
+		t.Fatalf("a refresh pass started the poller (%d revision reads)", d.revCalls.Load())
+	}
+}
 
-	d := &reliefDialect{current: 100, refreshWaits: true}
+// TestKubehzP2ReliefNotStaleWithoutRefresher: rows deleted on a dialect that
+// cannot refresh its statistics owe no refresh (SQLite, MySQL).
+func TestKubehzP2ReliefNotStaleWithoutRefresher(t *testing.T) {
+	d := &plainReliefDialect{reliefDialect: &reliefDialect{current: 100}}
 	s := New(d, 0, 0, 0, 0, 10, 0)
 	s.polledRev.Store(100)
-	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), reliefCtxKey{}, true), 2*time.Second)
+	res, err := s.RelieveQuota(context.WithValue(context.Background(), reliefCtxKey{}, true), 20, false)
+	if err != nil || res.Rows != 20 || res.Stale {
+		t.Fatalf("rows %d, stale %v, err %v; want 20 rows and nothing stale", res.Rows, res.Stale, err)
+	}
+	if s.StatsOwed() {
+		t.Fatal("StatsOwed on a dialect that cannot refresh")
+	}
+}
+
+// plainReliefDialect is reliefDialect without RefreshStats and StatsOwed: the
+// fields of those names hide the promoted methods.
+type plainReliefDialect struct {
+	*reliefDialect
+	RefreshStats, StatsOwed struct{}
+}
+
+// TestKubehzP2ReliefCancelledInBatch: a cancel that comes after the batch's
+// transaction began ends the pass before the delete: the transaction rolls
+// back and nothing is recorded.
+func TestKubehzP2ReliefCancelledInBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), reliefCtxKey{}, true))
 	defer cancel()
-	res, err := s.RelieveQuota(ctx, 20, true)
-	if !errors.Is(err, context.DeadlineExceeded) || res.Refreshed {
-		t.Fatalf("err %v, refreshed %v; want the refresh's deadline and no refresh", err, res.Refreshed)
+	d := &reliefDialect{current: 100, onBegin: cancel}
+	s := New(d, 0, 0, 0, 0, 10, 0)
+	s.polledRev.Store(100)
+	res, err := s.RelieveQuota(ctx, 20, false)
+	if !errors.Is(err, context.Canceled) || res.Rows != 0 || len(d.batches) != 0 || d.compactRev != 0 {
+		t.Fatalf("err %v, rows %d, batches %v, committed %d; want context.Canceled and nothing compacted", err, res.Rows, d.batches, d.compactRev)
 	}
-	if !slices.Equal(d.batches, []int64{10, 20}) || res.Rows != 20 {
-		t.Fatalf("batches %v, rows %d; want [10 20] and 20: the compaction runs after the refresh's budget", d.batches, res.Rows)
+	if d.begins != 1 || d.rollbacks != 1 || d.postCompacts != 0 {
+		t.Fatalf("%d transactions, %d rollbacks, %d post-compaction steps; want 1, 1 and 0", d.begins, d.rollbacks, d.postCompacts)
 	}
+}
+
+// TestKubehzP2ReliefPollerRetry: a poller start that failed lets a later
+// pass try again.
+func TestKubehzP2ReliefPollerRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	d := &reliefDialect{current: 50, revErr: errors.New("connection refused")}
+	s := New(d, 0, 0, 0, 0, 10, 0)
+	s.ctx = ctx
+	rctx := context.WithValue(ctx, reliefCtxKey{}, true)
+	if _, err := s.RelieveQuota(rctx, 40, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { _, running := pollerStarts.Load(s); return d.revCalls.Load() == 1 && !running }, "the first start to fail")
+	if _, err := s.RelieveQuota(rctx, 40, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return d.revCalls.Load() == 2 }, "a second start after the failed one")
 }
 
 // TestKubehzP2ReliefCancelled: a cancelled pass compacts nothing and begins

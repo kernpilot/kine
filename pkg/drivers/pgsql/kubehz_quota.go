@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,7 +50,8 @@ const toastChunkBytes = 1996
 // first one. After a large delete it stays high until the next VACUUM, which
 // only refuses early; the quota's relief runs one. But reltuples misses the
 // rows written after the last VACUUM or ANALYZE, so the source also watches
-// for a reset (statsWatch) and refreshes the statistics when it sees one.
+// for a reset (statsWatch): it then reads the table size until a VACUUM ran,
+// and reports the reset so that the quota schedules one.
 //
 // A few catalog lookups and no table scan. Indexes and page overhead are not
 // counted. Before the first ANALYZE pg_stats has no rows and the heap term
@@ -112,50 +114,56 @@ const vacuumCountsSQL = `
 	LEFT JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
 	WHERE c.oid = 'kine'::regclass`
 
-// statsRefreshTimeout bounds the refresh inside a sample, so the size read
-// that follows still has time inside the sample's own deadline. A refresh
-// that does not fit continues in the background for up to
-// statsRefreshBackground.
-const (
-	statsRefreshTimeout    = 5 * time.Second
-	statsRefreshBackground = 2 * time.Minute
-)
-
 // errVacuumSkipped is RefreshStats' error when the VACUUM did not process
 // the table: SKIP_LOCKED skips a relation that another process holds
 // (autovacuum, a manual VACUUM, DDL) and reports no error for it.
 var errVacuumSkipped = errors.New("the VACUUM skipped the kine table or its TOAST table, which another process holds")
 
+// statsWatches holds the newest reset watch of each dialect, for StatsOwed.
+// A map here keeps the dialect's struct (pgsql.go) as upstream has it.
+var statsWatches sync.Map // *notifyingDialect -> *statsWatch
+
 // LiveSize implements server.LiveSizer. Each call returns a source with its
 // own reset watch; the quota's sampler is its only caller.
 func (d *notifyingDialect) LiveSize() server.SizeSource {
 	w := &statsWatch{d: d, heapIns: -1}
+	statsWatches.Store(d, w)
 	return w.liveSize
 }
 
-// statsWatch remembers the counters of the last sample. A counter that went
-// down means the statistics were reset since. At the first sample there is
+// StatsOwed implements server.StatsRefresher: the newest source saw a reset
+// that no VACUUM settled yet.
+func (d *notifyingDialect) StatsOwed() bool {
+	w, ok := statsWatches.Load(d)
+	return ok && w.(*statsWatch).owed.Load()
+}
+
+// statsWatch remembers the counters of the last sample. An insert or vacuum
+// count that went down means the statistics were reset since. The vacuum
+// counts show a reset that the insert counts miss: one that comes while they
+// still read 0 from the reset before, with rows written since the last
+// sample. At the first sample there is
 // no last value: there a counter below its table's catalog row count, with
 // no vacuum since the counters began, means rows exist that the counters
 // never saw, which also means a reset. A vacuum count of 0 on the table or
 // its TOAST relation is the other half: a reset sets them to 0, and any
-// VACUUM after it (this one, the relief's, autovacuum) sets the live row
-// counts again, so the reset is settled once both counts are above 0.
+// VACUUM after it (the quota's refresh, autovacuum) sets the live row counts
+// again, so the reset is settled once both counts are above 0. The watch
+// runs no VACUUM itself: it reports the reset (StatsOwed), and the quota
+// schedules the refresh with the rest of its maintenance, so that no VACUUM
+// overlaps or closely follows the relief's deletes.
 type statsWatch struct {
 	d                 *notifyingDialect
-	heapIns, toastIns int64 // -1 before the first sample
-	owed              bool  // a reset was seen and no VACUUM ran since
-	warned            bool  // the fallback was logged for this reset
-	running           atomic.Bool
+	heapIns, toastIns int64       // -1 before the first sample; sampler goroutine only
+	heapVac, toastVac int64       // sampler goroutine only
+	owed              atomic.Bool // a reset was seen and no VACUUM ran since
 }
 
 // liveSize reads the figure. A table without statistics is analyzed first; if
 // that fails the sample fails, so the quota keeps its last figure and the
-// bytes written since instead of reading a heap term of 0. After a reset it
-// refreshes the statistics first, within statsRefreshTimeout; a refresh that
-// does not fit continues in the background, one at a time. Until a VACUUM
-// settles the reset, the figure is the table's size on disk, an upper bound
-// of its live data.
+// bytes written since instead of reading a heap term of 0. Until a VACUUM
+// settles a reset, the figure is the table's size on disk, an upper bound of
+// its live data.
 func (w *statsWatch) liveSize(ctx context.Context) (int64, error) {
 	db := w.d.DB
 	if err := analyzeIfNoStats(ctx, db); err != nil {
@@ -167,30 +175,22 @@ func (w *statsWatch) liveSize(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("reading the table counters: %w", err)
 	}
 	vacuumed := heapVac > 0 && (!hasToast || toastVac > 0)
+	owed := w.owed.Load()
 	if w.heapIns < 0 {
-		w.owed = (heapIns < heapRel || toastIns < toastRel) && !vacuumed
-	} else if heapIns < w.heapIns || toastIns < w.toastIns {
-		w.owed = true
+		owed = (heapIns < heapRel || toastIns < toastRel) && !vacuumed
+	} else if heapIns < w.heapIns || toastIns < w.toastIns || heapVac < w.heapVac || toastVac < w.toastVac {
+		owed = true
 	}
-	w.heapIns, w.toastIns = heapIns, toastIns
-	if w.owed && vacuumed {
-		w.settled()
+	w.heapIns, w.toastIns, w.heapVac, w.toastVac = heapIns, toastIns, heapVac, toastVac
+	if owed && vacuumed {
+		owed = false
+		logrus.Infof("quota: a VACUUM settled the statistics reset; the live-data figure is the estimate again")
 	}
-	if w.owed && !w.running.Load() {
-		rctx, cancel := context.WithTimeout(ctx, statsRefreshTimeout)
-		err := w.d.RefreshStats(rctx)
-		cancel()
-		if err == nil {
-			w.settled()
-		} else {
-			w.refreshInBackground()
-			if !w.warned {
-				w.warned = true
-				logrus.Warnf("quota: the table statistics were reset, and refreshing them failed: %v. The table size is the figure until a VACUUM ran.", err)
-			}
-		}
+	if owed && !w.owed.Load() {
+		logrus.Warnf("quota: the table statistics were reset (a crash, a failover or pg_stat_reset). The table size is the figure until a VACUUM ran; the quota schedules one.")
 	}
-	if w.owed {
+	w.owed.Store(owed)
+	if owed {
 		var size int64
 		if err := db.QueryRowContext(ctx, "SELECT pg_table_size('kine')").Scan(&size); err != nil {
 			return 0, fmt.Errorf("the statistics were reset and no VACUUM ran since; reading the table size: %w", err)
@@ -204,34 +204,13 @@ func (w *statsWatch) liveSize(ctx context.Context) (int64, error) {
 	return size, nil
 }
 
-// settled ends the reset: a VACUUM ran since it.
-func (w *statsWatch) settled() {
-	w.owed, w.warned = false, false
-	logrus.Infof("quota: the table statistics were reset (a crash, a failover or pg_stat_reset); a VACUUM refreshed them for the live-data figure")
-}
-
-// refreshInBackground runs one refresh with statsRefreshBackground, unless
-// one runs. The next sample sees its VACUUM in the vacuum counts.
-func (w *statsWatch) refreshInBackground() {
-	if !w.running.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		defer w.running.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), statsRefreshBackground)
-		defer cancel()
-		if err := w.d.RefreshStats(ctx); err != nil {
-			logrus.Warnf("quota: the background statistics refresh failed: %v", err)
-		}
-	}()
-}
-
-// compile-time check: the dialect refreshes the statistics after the quota's
-// relief compaction.
+// compile-time check: the dialect refreshes the statistics when the quota
+// schedules it (after the relief's deletes settled, or after a reset).
 var _ server.StatsRefresher = (*notifyingDialect)(nil)
 
-// RefreshStats runs VACUUM (ANALYZE) on the kine table after the quota's
-// relief deleted rows: ANALYZE for the widths and the heap's row count,
+// RefreshStats runs VACUUM (ANALYZE) on the kine table when the quota asks
+// (after its relief deleted rows, or after a statistics reset): ANALYZE for
+// the widths and the heap's row count,
 // VACUUM for the TOAST relation's reltuples (ANALYZE does not visit it) and
 // to make the freed space reusable. SKIP_LOCKED, so a running autovacuum is
 // not waited for. A skipped relation is no error to PostgreSQL, so the

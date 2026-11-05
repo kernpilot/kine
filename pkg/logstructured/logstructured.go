@@ -309,6 +309,12 @@ func (l *LogStructured) RelieveQuota(ctx context.Context, target int64, refresh 
 	return server.ReliefResult{}, nil
 }
 
+// StatsOwed forwards the log's statistics debt (server.QuotaRelief).
+func (l *LogStructured) StatsOwed() bool {
+	r, ok := l.log.(server.QuotaRelief)
+	return ok && r.StatsOwed()
+}
+
 // KUBEHZ-PATCH P2 END
 
 func (l *LogStructured) CurrentRevision(ctx context.Context) (int64, error) {

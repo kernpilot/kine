@@ -8,7 +8,8 @@ package pgsql
 // tracks the real compressed size of 200 rows with 64 KB incompressible
 // values, which live in TOAST (P2, the TOAST term). Then the B481 cases: the
 // estimate's floor after a statistics reset, the refresh after a relief, rows
-// written after the last VACUUM, and the source's own reset watch.
+// written after the last VACUUM, and the source's reset watch, which reports
+// a reset (StatsOwed) and the table size until the quota's refresh pass ran.
 
 import (
 	"context"
@@ -112,16 +113,53 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		t.Fatal("the pgsql backend offers no live-size source")
 	}
 	inBand(t, "200 TOAST rows", live, func() (int64, error) { return want, nil })
+	relief, ok := backend.(server.QuotaRelief)
+	if !ok {
+		t.Fatal("the pgsql backend offers no quota relief")
+	}
+	// owedAtTableSize: after a reset the source reports it (StatsOwed) and its
+	// figure is the table size, until a VACUUM ran.
+	owedAtTableSize := func(what string, src server.SizeSource) {
+		t.Helper()
+		got, err := src(ctx)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		var onDisk int64
+		if err := db.QueryRowContext(ctx, "SELECT pg_table_size('kine')").Scan(&onDisk); err != nil {
+			t.Fatal(err)
+		}
+		if got != onDisk || !relief.StatsOwed() {
+			t.Fatalf("%s: the figure is %d and StatsOwed %v; want the table size %d and true", what, got, relief.StatsOwed(), onDisk)
+		}
+	}
+	// refreshPass is the quota's refresh pass after a reset.
+	refreshPass := func(what string) {
+		t.Helper()
+		if res, err := relief.RelieveQuota(ctx, 0, true); err != nil || !res.Refreshed || res.Rows != 0 {
+			t.Fatalf("%s: the refresh pass: refreshed %v, rows %d, err %v; want a refresh and no rows", what, res.Refreshed, res.Rows, err)
+		}
+	}
 
 	// B481: a crash or a promoted standby resets the cumulative statistics, so
 	// n_live_tup reads 0. The estimate must not drop with it (that would lift
-	// the limit); reltuples in the catalog carries it. The query alone, before
-	// the source's reset watch refreshes the statistics.
+	// the limit); reltuples in the catalog carries it. The query alone.
+	// The source sees the reset only when its last sample had the inserts, so
+	// wait for their counters first.
+	waitInserts(t, db, rows)
+	if _, err := live(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
 		t.Fatal(err)
 	}
 	inBand(t, "the estimate after a statistics reset", estimateOf(db), func() (int64, error) { return want, nil })
-	inBand(t, "the source after a statistics reset", live, func() (int64, error) { return want, nil })
+	owedAtTableSize("the source after a statistics reset", live)
+	refreshPass("after a statistics reset")
+	inBand(t, "the source after a statistics reset and the refresh", live, func() (int64, error) { return want, nil })
+	if relief.StatsOwed() {
+		t.Fatal("StatsOwed after the refresh settled the reset")
+	}
 
 	// B481: after the quota's relief deletes rows, RefreshStats brings the
 	// estimate down to what is left (reltuples alone would keep it high). The
@@ -161,13 +199,15 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	insertRandom(t, db, "/kubehz/p2/after-vacuum/", 0, 100, valueBytes)
 	inBand(t, "100 rows written after the last VACUUM", live, actualOf(db))
 
-	// B481: a reset after those writes. reltuples alone misses them, so the
-	// source must see the reset (its counter went down since the last sample)
-	// and refresh the statistics.
+	// B481: a reset after those writes. reltuples alone misses them (the
+	// estimate would read low), so the source must see the reset (its counter
+	// went down since the last sample) and report it until the refresh.
 	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
 		t.Fatal(err)
 	}
-	inBand(t, "the source after a reset that follows new rows", live, actualOf(db))
+	owedAtTableSize("the source after a reset that follows new rows", live)
+	refreshPass("after a reset that follows new rows")
+	inBand(t, "the source after a reset that follows new rows and the refresh", live, actualOf(db))
 
 	// The same for a source that starts after the reset (a kine restart after
 	// a failover): with no last sample, a counter below the catalog row count
@@ -177,33 +217,33 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
 		t.Fatal(err)
 	}
-	inBand(t, "a new source after a reset", server.LiveSizeOf(backend), actualOf(db))
+	fresh := server.LiveSizeOf(backend)
+	owedAtTableSize("a new source after a reset", fresh)
+	refreshPass("a new source after a reset")
+	inBand(t, "a new source after a reset and the refresh", fresh, actualOf(db))
 
 	// B481: no false reset at a start. After a reset and a VACUUM the insert
 	// counters stay below the catalog row count, as they do for a moment on
 	// a busy table. A VACUUM ran since the counters began, so a new source
-	// sees no reset, runs no VACUUM and logs no reset.
+	// sees no reset, owes no refresh and logs no reset.
 	if _, err := db.ExecContext(ctx, "SELECT pg_stat_reset()"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, "VACUUM kine"); err != nil {
 		t.Fatal(err)
 	}
-	heapBefore, toastBefore, _, err := vacuumCounts(ctx, db)
-	if err != nil {
-		t.Fatal(err)
-	}
 	logs := &logtest.Hook{}
 	hooks := logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{})
 	logrus.AddHook(logs)
-	inBand(t, "a new source after a reset and a VACUUM", server.LiveSizeOf(backend), actualOf(db))
+	src := server.LiveSizeOf(backend) // the newest source from here on, as the quota has one
+	inBand(t, "a new source after a reset and a VACUUM", src, actualOf(db))
 	logrus.StandardLogger().ReplaceHooks(hooks)
-	if heap, toast, _, err := vacuumCounts(ctx, db); err != nil || heap != heapBefore || toast != toastBefore {
-		t.Fatalf("vacuum counts %d/%d, were %d/%d (err %v): the new source ran a VACUUM for a reset that a VACUUM had settled", heap, toast, heapBefore, toastBefore, err)
+	if relief.StatsOwed() {
+		t.Fatal("a new source owes a refresh for a reset that a VACUUM had settled")
 	}
 	for _, e := range logs.AllEntries() {
-		if strings.Contains(e.Message, "were reset") {
-			t.Fatalf("the new source logged %q for a reset that a VACUUM had settled", e.Message)
+		if strings.Contains(e.Message, "were reset") || strings.Contains(e.Message, "settled the statistics reset") {
+			t.Fatalf("the new source logged %q, but it saw no reset: a VACUUM had settled it", e.Message)
 		}
 	}
 
@@ -230,8 +270,16 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT pg_table_size('kine')").Scan(&onDisk); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := live(ctx); err != nil || got != onDisk {
-		t.Fatalf("the figure after a reset with the table held: %d (err %v), want the table size %d", got, err, onDisk)
+	if got, err := src(ctx); err != nil || got != onDisk || !relief.StatsOwed() {
+		t.Fatalf("the figure after a reset with the table held: %d (err %v, StatsOwed %v), want the table size %d and owed", got, err, relief.StatsOwed(), onDisk)
+	}
+	// The quota's refresh pass reports that the VACUUM skipped the table, and
+	// the refresh stays owed.
+	if res, err := relief.RelieveQuota(ctx, 0, true); !errors.Is(err, errVacuumSkipped) || res.Refreshed {
+		t.Fatalf("the refresh pass with the table held: refreshed %v, err %v; want %v", res.Refreshed, err, errVacuumSkipped)
+	}
+	if _, err := src(ctx); err != nil || !relief.StatsOwed() {
+		t.Fatalf("after a skipped refresh: err %v, StatsOwed %v; want still owed", err, relief.StatsOwed())
 	}
 	// Any VACUUM settles the reset, also one from elsewhere (autovacuum, the
 	// relief's): run one with the table free, then hold the table again, so
@@ -250,9 +298,12 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	if _, err := again.ExecContext(ctx, "LOCK TABLE kine IN SHARE UPDATE EXCLUSIVE MODE"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := live(ctx)
+	got, err := src(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if relief.StatsOwed() {
+		t.Fatal("StatsOwed after a VACUUM from elsewhere")
 	}
 	est, err := estimateOf(db)(ctx)
 	if err != nil {
@@ -361,6 +412,26 @@ func deleteCounters(t *testing.T, db *sql.DB) (heap, toast int64) {
 		t.Fatal(err)
 	}
 	return heap, toast
+}
+
+// waitInserts waits until the kine table's insert counter shows at least n
+// rows: a backend sends its counters to the shared statistics with a lag.
+func waitInserts(t *testing.T, db *sql.DB, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(statsWait)
+	for {
+		var ins int64
+		if err := db.QueryRow(`SELECT n_tup_ins FROM pg_stat_all_tables WHERE relid = 'kine'::regclass`).Scan(&ins); err != nil {
+			t.Fatal(err)
+		}
+		if ins >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the insert counter shows %d rows after %s, want %d", ins, statsWait, n)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // toastChunks is the number of TOAST rows of one incompressible value.
