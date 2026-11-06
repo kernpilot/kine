@@ -135,6 +135,19 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 		bcancel()
 	}()
 
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: with --quota-bytes > 0, every delete of the backend's TTL loop
+	//   gets server.QuotaTTLDeleteTimeout. The relief compacts with no
+	//   --compact-min-retain floor, so a TTL delete that paused between its
+	//   read and its insert for longer than QuotaReliefLag could remove a
+	//   newer value. A backend without the option (no relief) is unchanged.
+	// CONFLICT: keep it directly before backend.Start, which starts the TTL
+	//   loop.
+	if config.QuotaBytes > 0 {
+		ttlDeleteTimeoutOf(backend, server.QuotaTTLDeleteTimeout)
+	}
+	// KUBEHZ-PATCH P2 END
+
 	if err := backend.Start(bctx); err != nil {
 		return ETCDConfig{}, fmt.Errorf("starting kine backend: %w", err)
 	}
@@ -367,6 +380,10 @@ func (l *loggingServerStream) RecvMsg(m any) error {
 // Listen uses; a variable so the Listen test can hand it a failing source
 // without a driver that fails. Never set outside tests.
 var liveSizeOf = server.LiveSizeOf
+
+// ttlDeleteTimeoutOf sets the TTL delete timeout before Start; a variable so
+// the Listen test can see the call and its order. Never set outside tests.
+var ttlDeleteTimeoutOf = server.SetTTLDeleteTimeout
 
 // quotaSampleInterval is how often Listen's quota samples and, while full,
 // compacts. A variable so the relief test can tick fast. Never set outside

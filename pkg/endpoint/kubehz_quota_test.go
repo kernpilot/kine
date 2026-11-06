@@ -94,6 +94,49 @@ func TestKubehzP2ListenFailsOnFirstSample(t *testing.T) {
 	}
 }
 
+// TestKubehzP2ListenTTLDeleteTimeout: with a quota, Listen gives the TTL
+// loop's deletes server.QuotaTTLDeleteTimeout, and does it before Start
+// (Start writes the health key and starts the TTL loop, so the key must not
+// exist yet). Without a quota it leaves the TTL loop as upstream.
+func TestKubehzP2ListenTTLDeleteTimeout(t *testing.T) {
+	seam := ttlDeleteTimeoutOf
+	t.Cleanup(func() { ttlDeleteTimeoutOf = seam })
+	for _, tc := range []struct {
+		name  string
+		quota int64
+		calls int
+	}{
+		{"a quota sets the timeout", 1, 1},
+		{"no quota sets nothing", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			ttlDeleteTimeoutOf = func(b server.Backend, d time.Duration) bool {
+				calls++
+				if d != server.QuotaTTLDeleteTimeout {
+					t.Errorf("TTL delete timeout %s, want %s", d, server.QuotaTTLDeleteTimeout)
+				}
+				// Before Start the log has no rows, and Get fails or finds
+				// nothing. Only a started backend has the health key.
+				if _, kv, err := b.Get(context.Background(), server.HealthKey, 0, false); err == nil && kv != nil {
+					t.Errorf("TTL delete timeout set after Start (the health key exists at revision %d)", kv.ModRevision)
+				}
+				ok := seam(b, d)
+				if !ok {
+					t.Errorf("the sqlite backend %T takes no TTL delete timeout", b)
+				}
+				return ok
+			}
+			if _, err := listenSQLite(t, tc.quota); err != nil {
+				t.Fatal(err)
+			}
+			if calls != tc.calls {
+				t.Fatalf("QuotaBytes=%d: %d calls to set the TTL delete timeout, want %d", tc.quota, calls, tc.calls)
+			}
+		})
+	}
+}
+
 // TestKubehzP2ListenRelief: B481 end to end on a real kine (sqlite). Fill the
 // database to its limit. A new key is then refused, while an update of an
 // existing Lease and an update that does not grow a value still pass. Delete

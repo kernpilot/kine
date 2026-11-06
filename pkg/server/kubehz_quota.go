@@ -128,11 +128,13 @@ var ErrNoSpace = rpctypes.ErrGRPCNoSpace
 const QuotaSampleInterval = 30 * time.Second
 
 // QuotaReliefLag is how old a revision must be before the relief compacts up
-// to it. It is longer than the apiserver's request timeout (60 s) and far
-// behind any running poller, also the one of a second kine on the same
-// database during a rolling update. Compaction that is too recent lets a
-// write that paused between its read and its insert pass its
-// compare-and-swap, because the row it conflicted with is gone.
+// to it. It is longer than the apiserver's request timeout (60 s) and than
+// QuotaTTLDeleteTimeout, and far behind this process's poller. Compaction
+// that is too recent lets a write that paused between its read and its
+// insert pass its compare-and-swap, because the row it conflicted with is
+// gone. The lag does not protect a second kine process on the same database:
+// a poller of that process can stall for longer. Run one kine process per
+// database, also during a rollout (kubehz/MERGE-GUIDE.md#p2, "Bounds").
 const QuotaReliefLag = 2 * time.Minute
 
 const (
@@ -254,6 +256,31 @@ func QuotaReliefOf(backend Backend) QuotaRelief {
 		return r
 	}
 	return nil
+}
+
+// QuotaTTLDeleteTimeout bounds one delete of the TTL loop (the read and the
+// insert together) while the quota is on. The relief compacts with no
+// --compact-min-retain floor, so a TTL delete that paused between its read
+// and its insert for longer than QuotaReliefLag could pass its
+// compare-and-swap and remove a newer value. The apiserver bounds its own
+// requests the same way (60 s). On a timeout the TTL loop tries the key
+// again.
+const QuotaTTLDeleteTimeout = 60 * time.Second
+
+// TTLDeleteDeadline is an optional interface a backend can offer: a timeout
+// on every delete its TTL loop makes. It must be set before Start.
+type TTLDeleteDeadline interface {
+	SetTTLDeleteTimeout(d time.Duration)
+}
+
+// SetTTLDeleteTimeout sets d on backend when it offers TTLDeleteDeadline and
+// reports whether it did.
+func SetTTLDeleteTimeout(backend Backend, d time.Duration) bool {
+	t, ok := backend.(TTLDeleteDeadline)
+	if ok {
+		t.SetTTLDeleteTimeout(d)
+	}
+	return ok
 }
 
 // StatsRefresher is an optional interface a dialect can offer to bring the

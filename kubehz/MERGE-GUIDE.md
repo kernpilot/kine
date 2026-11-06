@@ -125,15 +125,21 @@ a correctness fix.
 ### P2 — per-database size limit (`--quota-bytes`)
 
 **Files** `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
-`pkg/drivers/pgsql/kubehz_quota.go` and `pkg/logstructured/sqllog/kubehz_relief.go`
-(new, conflict-free). Edits: `pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go`
-(the config field, the wiring and two test seams), `pkg/server/kv.go` (two log
-conditions), `pkg/logstructured/logstructured.go` (three forwarding methods) and
-`pkg/logstructured/sqllog/sql.go` (one forwarding method), and `go.mod`
-(`golang.org/x/time` is a direct dependency now). Tests
-`pkg/server/kubehz_quota_test.go`, `pkg/app/kubehz_quota_test.go`,
-`pkg/endpoint/kubehz_quota_test.go` (a real kine on sqlite through
-`Listen`, the B481 relief end to end), `pkg/drivers/pgsql/kubehz_quota_test.go`,
+`pkg/drivers/pgsql/kubehz_quota.go`, `pkg/logstructured/sqllog/kubehz_relief.go`
+and `pkg/logstructured/kubehz_ttl.go` (new, conflict-free). Edits:
+`pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go` (the config field,
+the wiring, the TTL delete timeout before `backend.Start`, and the test
+seams), `pkg/server/kv.go` (two log conditions),
+`pkg/logstructured/logstructured.go` (three forwarding methods, the TTL
+delete timeout field, and the TTL loop start: upstream's
+`go ttl.Run(ctx, l)` is `go ttlRun(ctx, l.ttlBackend())`, so the `ttl`
+import moved to `kubehz_ttl.go`) and `pkg/logstructured/sqllog/sql.go` (one
+forwarding method), and `go.mod` (`golang.org/x/time` is a direct
+dependency now). Tests `pkg/server/kubehz_quota_test.go`,
+`pkg/app/kubehz_quota_test.go`, `pkg/endpoint/kubehz_quota_test.go` (a
+real kine on sqlite through `Listen`, the B481 relief end to end),
+`pkg/drivers/pgsql/kubehz_quota_test.go`,
+`pkg/logstructured/kubehz_ttl_test.go` (the TTL delete timeout),
 `pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain) and
 `pkg/logstructured/sqllog/kubehz_relief_test.go` (the relief bounds),
 and `pkg/drivers/pgsql/kubehz_pgsql_test.go` against the PostgreSQL
@@ -212,6 +218,14 @@ which only feeds a gauge. The rules:
    `--compact-min-retain` floor would keep the deleted rows while no new
    revision comes. Each batch is its own transaction that commits or rolls
    back (never `MustCommit`), under the pass's 20 s budget.
+   kine's own TTL deletes have no request deadline upstream. With a limit,
+   `Listen` sets `server.QuotaTTLDeleteTimeout` (60 s, below the lag) on
+   the backend before `Start`, and each TTL delete (its read and its
+   insert) must finish in that time. `LogStructured.Delete` reports a
+   failed insert as "not deleted" with no error, and the TTL loop then
+   drops the key. So a delete that the timeout ended returns the context
+   error instead, and the loop tries the key again. Without a limit the
+   TTL loop is upstream's.
 5. The statistics refresh (PostgreSQL: `VACUUM (ANALYZE, SKIP_LOCKED,
    TRUNCATE false) kine`) is a pass of its own. `TRUNCATE false` keeps the
    VACUUM away from the ACCESS EXCLUSIVE lock of its truncation phase,
@@ -321,14 +335,16 @@ gaps, accepted with their bounds:
 - A tenant that spends the control lane on its own keys can starve its own
   controllers' renewals, or grow its Leases by 64 bytes per update until
   the ceiling stops the renewals. That harms only its own cluster.
-- kine's own TTL deletes run with no request deadline. One TTL operation
-  can wait between its read and its insert for longer than the lag while
-  the rest of the process, the relief too, goes on. Its compare-and-swap
-  can then pass after a relief pass removed the row it conflicts with, and
-  it deletes a newer value of that key. Only a key queued from a leased
-  revision takes this path (in Kubernetes: Events and master leases); the
-  newer value need not have a lease. The effect stays in the tenant's own
-  data.
+- A TTL delete that paused between its read and its insert for longer
+  than the lag could pass its compare-and-swap after a relief pass removed
+  the row it conflicts with, and delete a newer value of that key. The 60 s
+  timeout (rule 4) ends the delete before that. The timeout is on the
+  client: the insert stops when PostgreSQL acts on the cancel request. An
+  insert that the server still runs more than 60 s later (a lost cancel
+  request) is not bounded. The apiserver's own requests rest on the same
+  cancel. Only a key queued from a leased revision takes this path (in
+  Kubernetes: Events and master leases). The effect stays in the tenant's
+  own data.
 - Each kine process counts only its own writes, and nothing fences a
   second writer. Two processes on one database (a rolling update) see
   each other's writes when a good sample shows them, with no time bound.
@@ -339,8 +355,14 @@ gaps, accepted with their bounds:
   it, as for any gap. Either way its watchers miss that event (a delete
   too) until they list again.
   Upstream's compactor has the same exposure for a poller that falls
-  `--compact-min-retain` revisions behind. A deployment that runs one kine
-  process per database (for example a Recreate rollout) avoids it.
+  `--compact-min-retain` revisions behind.
+  **Condition for `--quota-bytes`: one active kine process per database,
+  also during the handoff.** Use a Recreate rollout, or stop or drain the
+  old process before the new one starts. A rolling update with an overlap
+  does not meet this, because a stalled poller of the old process during
+  the overlap is exactly this case. k3s with several servers on one
+  external datastore runs several kine processes on one database all the
+  time, so it does not meet it either.
 - When an update's insert fails after its commit (a lost acknowledgement)
   and the reread finds the row, `LogStructured` reports a lost
   compare-and-swap, and the quota gives the bytes back. The figure is then

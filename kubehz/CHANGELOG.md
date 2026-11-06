@@ -219,10 +219,24 @@ VACUUM as its control still truncates. The live-size bands of
 `TestKubehzP2P3Postgres` are unchanged on both.
 
 The same review restated two documented limits (MERGE-GUIDE.md P2,
-"Limits"): a TTL delete that stalls for longer than the relief lag, and the
-poller of a second kine process that falls behind. They stay limits.
+"Bounds"): a TTL delete that stalls for longer than the relief lag, and the
+poller of a second kine process that falls behind.
 
-**Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`,
+**Seventh revision (final review, 2026-11-06).** The review did not accept
+the first limit. With a limit, every TTL delete now has 60 s
+(`server.QuotaTTLDeleteTimeout`, below the 2 min lag) for its read and its
+insert. `Listen` sets it before `Start`. A delete that the timeout ended
+returns the context error, and the TTL loop tries the key again. Before,
+`LogStructured.Delete` reported it as "not deleted", and the loop dropped
+the key. `TestKubehzP2TTLDeleteTimeout` stalls an insert after its read,
+then writes two newer values and compacts. With no timeout, the stalled
+insert deletes the newest value. `TestKubehzP2TTLStart` and
+`TestKubehzP2ListenTTLDeleteTimeout` pin the wiring, also its order before
+`Start`. Nine mutations: each one makes a test fail. The second limit is
+now a condition for `--quota-bytes`: one active kine process per database,
+also during the handoff.
+
+**Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/ ./pkg/logstructured/sqllog/`,
 with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
 - on a fake backend: `TestKubehzP2Lanes`, `TestKubehzP2Ceiling`,
   `TestKubehzP2LaneRate`, `TestKubehzP2Reservation`,
