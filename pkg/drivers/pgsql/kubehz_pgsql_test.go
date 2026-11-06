@@ -31,40 +31,7 @@ import (
 )
 
 func TestKubehzP2P3Postgres(t *testing.T) {
-	dsn := os.Getenv("KINE_TEST_PGSQL_DSN")
-	if dsn == "" {
-		t.Skip("KINE_TEST_PGSQL_DSN is not set; this test needs a PostgreSQL")
-	}
-	// New() takes the DSN without its scheme, as the driver registry hands it
-	// over (prepareConfig prepends "postgres://" again)
-	_, source, found := strings.Cut(dsn, "://")
-	if !found {
-		t.Fatalf("KINE_TEST_PGSQL_DSN %q has no scheme; want postgres://user:pass@host:port/db", dsn)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	wg := &sync.WaitGroup{}
-	t.Cleanup(func() {
-		cancel()
-		wg.Wait()
-	})
-	_, backend, err := New(ctx, wg, &drivers.Config{
-		DataSourceName:       source,
-		ConnectionPoolConfig: generic.ConnectionPoolConfig{MaxIdle: 2, MaxOpen: 4, MaxIdleTime: time.Minute},
-		CompactTimeout:       5 * time.Second,
-		CompactMinRetain:     1000,
-		CompactBatchSize:     1000,
-		PollBatchSize:        500,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, backend, db := kubehzPostgres(t)
 
 	// P3: the table carries both storage parameters after one start
 	var reloptions string
@@ -367,6 +334,106 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	inBand(t, "the estimate for inline rows after a statistics reset", estimateOf(db), func() (int64, error) { return want, nil })
+}
+
+// B481: the quota's refresh VACUUM does not truncate the table. The
+// truncation phase takes an ACCESS EXCLUSIVE lock, which SKIP_LOCKED does
+// not avoid, so it would block reads and writes behind it (and replay on a
+// standby). Autovacuum still truncates, with its own back-off.
+func TestKubehzP2RefreshKeepsTrailingPages(t *testing.T) {
+	ctx, _, db := kubehzPostgres(t)
+	if _, err := db.ExecContext(ctx, "TRUNCATE kine"); err != nil {
+		t.Fatal(err)
+	}
+	// no autovacuum may truncate behind the test's back
+	if _, err := db.ExecContext(ctx, "ALTER TABLE kine SET (autovacuum_enabled = off, toast.autovacuum_enabled = off)"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := db.ExecContext(context.Background(), "ALTER TABLE kine RESET (autovacuum_enabled, toast.autovacuum_enabled)"); err != nil {
+			t.Errorf("restoring autovacuum on the kine table: %v", err)
+		}
+	})
+	// 4000 inline rows of 1 KiB, then the newest 3000 deleted: they fill the
+	// pages at the end of the heap, so those pages are empty after a VACUUM
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT '/kubehz/p2/tail/' || g, 1, 0, 0, 0, 0,
+			decode((SELECT string_agg(md5(random()::text || g || k), '') FROM generate_series(1, 64) AS k), 'hex'),
+			''::bytea
+		FROM generate_series(1, 4000) AS g`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM kine WHERE id > (SELECT MIN(id) + 999 FROM kine)`); err != nil {
+		t.Fatal(err)
+	}
+	heapBytes := func() int64 {
+		t.Helper()
+		var size int64
+		if err := db.QueryRowContext(ctx, `SELECT pg_relation_size('kine')`).Scan(&size); err != nil {
+			t.Fatal(err)
+		}
+		return size
+	}
+	before := heapBytes()
+	refresher := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	if err := refresher.RefreshStats(ctx); err != nil {
+		t.Fatalf("RefreshStats: %v", err)
+	}
+	if after := heapBytes(); after != before {
+		t.Fatalf("RefreshStats truncated the heap from %d to %d bytes; its VACUUM must not take the truncation lock", before, after)
+	}
+	// The control: a plain VACUUM truncates the same empty pages, so the
+	// pages were there to truncate
+	if _, err := db.ExecContext(ctx, "VACUUM kine"); err != nil {
+		t.Fatal(err)
+	}
+	if after := heapBytes(); after >= before {
+		t.Fatalf("the control VACUUM left the heap at %d bytes (it was %d): the test made no empty trailing pages", after, before)
+	}
+}
+
+// kubehzPostgres opens the PostgreSQL in KINE_TEST_PGSQL_DSN through the
+// driver (which creates the table and sets its storage parameters) and as a
+// plain connection. It skips the test when the variable is unset.
+func kubehzPostgres(t *testing.T) (context.Context, server.Backend, *sql.DB) {
+	t.Helper()
+	dsn := os.Getenv("KINE_TEST_PGSQL_DSN")
+	if dsn == "" {
+		t.Skip("KINE_TEST_PGSQL_DSN is not set; this test needs a PostgreSQL")
+	}
+	// New() takes the DSN without its scheme, as the driver registry hands it
+	// over (prepareConfig prepends "postgres://" again)
+	_, source, found := strings.Cut(dsn, "://")
+	if !found {
+		t.Fatalf("KINE_TEST_PGSQL_DSN %q has no scheme; want postgres://user:pass@host:port/db", dsn)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	_, backend, err := New(ctx, wg, &drivers.Config{
+		DataSourceName:       source,
+		ConnectionPoolConfig: generic.ConnectionPoolConfig{MaxIdle: 2, MaxOpen: 4, MaxIdleTime: time.Minute},
+		CompactTimeout:       5 * time.Second,
+		CompactMinRetain:     1000,
+		CompactBatchSize:     1000,
+		PollBatchSize:        500,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return ctx, backend, db
 }
 
 // estimateOf is the live-size query alone, without the source's reset watch.

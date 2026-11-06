@@ -209,6 +209,19 @@ On `5a7d308` (the third revision) the same runs took 231 s and 260 s.
 There, one reading differs from the table above: "100 rows written after
 the last VACUUM" read 0.971 (inside the test's band of 0.9 to 1.3).
 
+**Sixth revision (final review, 2026-11-06).** The refresh VACUUM runs
+with `TRUNCATE false`. Before, its truncation phase took an ACCESS
+EXCLUSIVE lock on the kine table: on PostgreSQL 17 the refresh shrank a
+test heap from 4,685,824 to 1,171,456 bytes, so reads and writes could
+queue behind it. `TestKubehzP2RefreshKeepsTrailingPages` fails on the old
+statement and passes on the new one, on PostgreSQL 17 and 18.4. A plain
+VACUUM as its control still truncates. The live-size bands of
+`TestKubehzP2P3Postgres` are unchanged on both.
+
+The same review restated two documented limits (MERGE-GUIDE.md P2,
+"Limits"): a TTL delete that stalls for longer than the relief lag, and the
+poller of a second kine process that falls behind. They stay limits.
+
 **Re-check** `go test -tags=test -race -run TestKubehzP2 ./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/`,
 with `KINE_TEST_PGSQL_DSN` set for the PostgreSQL part. The new tests:
 - on a fake backend: `TestKubehzP2Lanes`, `TestKubehzP2Ceiling`,

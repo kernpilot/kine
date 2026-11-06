@@ -215,16 +215,21 @@ var _ server.StatsRefresher = (*notifyingDialect)(nil)
 // the widths and the heap's row count,
 // VACUUM for the TOAST relation's reltuples (ANALYZE does not visit it) and
 // to make the freed space reusable. SKIP_LOCKED, so a running autovacuum is
-// not waited for. A skipped relation is no error to PostgreSQL, so the
-// manual vacuum counts must go up on both, or this returns errVacuumSkipped
-// and the caller tries again later. VACUUM cannot run in a transaction, so
-// this is a plain statement under ctx.
+// not waited for. TRUNCATE false: the truncation of empty trailing pages
+// takes an ACCESS EXCLUSIVE lock on the table, which SKIP_LOCKED does not
+// avoid; reads and writes would queue behind it, and a standby replays it.
+// The live-data figure does not need the file to shrink, and autovacuum
+// still truncates later. A skipped relation is no error to PostgreSQL, so
+// the manual vacuum counts must go up on both, or this returns
+// errVacuumSkipped and the caller tries again later. VACUUM cannot run in a
+// transaction, so this is a plain statement under ctx. Both options need
+// PostgreSQL 12 or later.
 func (d *notifyingDialect) RefreshStats(ctx context.Context) error {
 	heapBefore, toastBefore, _, err := vacuumCounts(ctx, d.DB)
 	if err != nil {
 		return err
 	}
-	if _, err := d.DB.ExecContext(ctx, "VACUUM (ANALYZE, SKIP_LOCKED) kine"); err != nil {
+	if _, err := d.DB.ExecContext(ctx, "VACUUM (ANALYZE, SKIP_LOCKED, TRUNCATE false) kine"); err != nil {
 		return fmt.Errorf("vacuuming the kine table: %w", err)
 	}
 	// PostgreSQL 15 and later write the counts at once; older ones send

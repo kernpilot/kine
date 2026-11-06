@@ -212,8 +212,11 @@ which only feeds a gauge. The rules:
    `--compact-min-retain` floor would keep the deleted rows while no new
    revision comes. Each batch is its own transaction that commits or rolls
    back (never `MustCommit`), under the pass's 20 s budget.
-5. The statistics refresh (PostgreSQL: `VACUUM (ANALYZE, SKIP_LOCKED)
-   kine`) is a pass of its own. A tick runs one refresh pass or one
+5. The statistics refresh (PostgreSQL: `VACUUM (ANALYZE, SKIP_LOCKED,
+   TRUNCATE false) kine`) is a pass of its own. `TRUNCATE false` keeps the
+   VACUUM away from the ACCESS EXCLUSIVE lock of its truncation phase,
+   which `SKIP_LOCKED` does not avoid: reads and writes would queue behind
+   it. Autovacuum still truncates. A tick runs one refresh pass or one
    compaction pass, never both, and a refresh pass compacts nothing. A
    compaction pass that deleted rows on a dialect that keeps statistics
    (PostgreSQL, `ReliefResult.Stale`) makes a refresh owed; so does a pass
@@ -336,7 +339,8 @@ gaps, accepted with their bounds:
   it, as for any gap. Either way its watchers miss that event (a delete
   too) until they list again.
   Upstream's compactor has the same exposure for a poller that falls
-  `--compact-min-retain` revisions behind.
+  `--compact-min-retain` revisions behind. A deployment that runs one kine
+  process per database (for example a Recreate rollout) avoids it.
 - When an update's insert fails after its commit (a lost acknowledgement)
   and the reread finds the row, `LogStructured` reports a lost
   compare-and-swap, and the quota gives the bytes back. The figure is then
