@@ -9,5 +9,5 @@ import "github.com/prometheus/client_golang/prometheus"
 
 var TLSHandshakeFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "kine_tls_handshake_failures_total",
-	Help: "TLS handshakes on the client listener that failed, by reason: no_client_cert, unknown_authority, expired, bad_certificate, client_alert, not_tls, closed, timeout, other, and limit (closed before the handshake, --listen-max-connections).",
+	Help: "TLS handshakes on the client listener that failed, by reason: no_client_cert, unknown_authority, expired, bad_certificate, client_alert, not_tls, closed, timeout, other, limit (closed because --listen-max-connections connections were open) and pending_limit (closed before the handshake because --listen-max-pending-handshakes connections were in theirs).",
 }, []string{"reason"})

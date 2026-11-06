@@ -21,8 +21,8 @@ package server
 //     compaction pass, a quiet tick, and a refresh pass at least
 //     quotaRefreshSettle after the compaction ended. That is no bound: a
 //     refresh that fails or does not fit its budget delays it.
-//   quotaSampleFailLimit failed samples in a row also count as full, whatever
-//   the figure, until a sample succeeds.
+//   quotaSampleFailLimit failed live-size reads in a row also count as full,
+//   whatever the figure, until a read succeeds.
 //
 // INVARIANT: the size is sampled, never queried on the write path. A write
 //   below the limit costs atomic loads and two atomic adds. The
@@ -40,8 +40,8 @@ package server
 //   adding up: a sampler that keeps failing refuses writes after (L - live)
 //   bytes, it fails closed. Only a good sample shows the bytes the figure
 //   does not count (the gaps below, another process's writes), so after
-//   quotaSampleFailLimit failed samples in a row the quota counts as full
-//   until a sample succeeds. Without that, those bytes could add up with
+//   quotaSampleFailLimit failed live-size reads in a row the quota counts as
+//   full until a read succeeds. Without that, those bytes could add up with
 //   no time bound while the samples fail.
 //
 // INVARIANT: every put reserves its bytes BEFORE the check, so concurrent
@@ -147,13 +147,16 @@ const (
 	// quotaQueryTimeout bounds one size query, so a hung query cannot stop
 	// the sampler; a timed-out sample counts as a failed one.
 	quotaQueryTimeout = 10 * time.Second
-	// quotaSampleFailLimit failed samples in a row make the quota count as
-	// full, with the lanes and the relief of a full quota, until a sample
-	// succeeds. Every live read of a sample counts, also the read again
-	// after a pass; a read that failed because the sampler stops does not.
-	// At QuotaSampleInterval that is about 90 s after the last good sample
-	// at the earliest. The relief then compacts while the database may not
-	// be full. That is no new risk: it is the compaction kine's own
+	// quotaSampleFailLimit failed live-size reads in a row make the quota
+	// count as full, with the lanes and the relief of a full quota, until a
+	// read succeeds. Every live read counts: the sample of a tick, and the
+	// read again after a refresh or a compaction pass; a read that failed
+	// because the sampler stops does not. With only the samples of the ticks,
+	// that is about 90 s after the last good read at QuotaSampleInterval. It
+	// is no minimum and no deadline: the reads after a pass can make it
+	// shorter, down to about one interval, and a slow pass that delays a
+	// tick makes it longer. The relief then compacts while the database may
+	// not be full. That is no new risk: it is the compaction kine's own
 	// compactor (--compact-interval) does, of history at least
 	// QuotaReliefLag old and never past this process's poller.
 	quotaSampleFailLimit = 3
@@ -332,8 +335,8 @@ type Quota struct {
 	committed atomic.Int64
 	base      atomic.Int64
 	full      atomic.Bool
-	// sizeUnknown is set after quotaSampleFailLimit failed samples in a row,
-	// and a good sample clears it. While it is set the quota counts as full.
+	// sizeUnknown is set after quotaSampleFailLimit failed live-size reads in
+	// a row, and a good read clears it. While it is set the quota counts as full.
 	sizeUnknown atomic.Bool
 	// marks are committed at the start of the previous two good samples, the
 	// older first. sampleFails is the number of failed samples in a row.
@@ -426,7 +429,7 @@ func (q *Quota) figure(add int64) int64 {
 }
 
 // Full reports whether the figure is at or above the limit, or the size is
-// unknown (quotaSampleFailLimit failed samples in a row). etcd refuses a
+// unknown (quotaSampleFailLimit failed live-size reads in a row). etcd refuses a
 // write when size + cost would pass the quota, and every put has a cost, so
 // "at the limit" already refuses.
 func (q *Quota) Full() bool {
@@ -437,11 +440,21 @@ func (q *Quota) Full() bool {
 // failed in a row, so the quota counts as full whatever the figure.
 func (q *Quota) SizeUnknown() bool { return q.sizeUnknown.Load() }
 
-// reserveBelow reserves cost and keeps it when the figure without this write
-// (other writes' reservations included) is below the limit and the size is
-// known.
+// reserveBelow reserves cost and keeps it when the size is known and the
+// figure without this write (other writes' reservations included) is below
+// the limit. It reads the unknown state first. A sample stores its figure
+// before it makes the size known, so a write that sees the size known also
+// reads that figure. In the other order a write could compare the figure from
+// before a sample and then see the size known by that sample, which can be
+// at the limit.
 func (q *Quota) reserveBelow(cost int64) bool {
-	if q.figure(cost)-cost < q.limit && !q.sizeUnknown.Load() {
+	if q.sizeUnknown.Load() {
+		return false
+	}
+	if quotaReserveHook != nil {
+		quotaReserveHook()
+	}
+	if q.figure(cost)-cost < q.limit {
 		return true
 	}
 	q.written.Add(-cost)
@@ -601,6 +614,10 @@ func (q *Quota) sampleSucceeded() {
 // quotaSampleHook runs between the two stores of a sample. A test seam for
 // the store order; nil outside tests.
 var quotaSampleHook func()
+
+// quotaReserveHook runs in reserveBelow between the read of the unknown state
+// and the read of the figure. A test seam for that order; nil outside tests.
+var quotaReserveHook func()
 
 func query(ctx context.Context, src SizeSource) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, quotaQueryTimeout)

@@ -212,7 +212,7 @@ func New() *cli.App {
 		// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
 		&cli.Int64Flag{
 			Name:        "quota-bytes",
-			Usage:       "Maximum live data in bytes. At or above it, a new key gets the etcd no-space error until live data is smaller again. Reads, deletes, watches and compaction continue, and so do rate-limited updates that do not grow a value (Leases, finalizer removal) and small Lease creates, up to twice the limit plus 64 MiB. While at the limit kine compacts its history by itself. Three failed size samples in a row count as the limit until a sample succeeds. On PostgreSQL live data is estimated from the table statistics; other drivers use their database size. 0 means no limit. Default is 0.",
+			Usage:       "Maximum live data in bytes. At or above it, a new key gets the etcd no-space error until live data is smaller again. Reads, deletes, watches and compaction continue, and so do rate-limited updates that do not grow a value (Leases, finalizer removal) and small Lease creates, up to twice the limit plus 64 MiB. While at the limit kine compacts its history by itself. Three failed live-size reads in a row count as the limit until a read succeeds. On PostgreSQL live data is estimated from the table statistics; other drivers use their database size. 0 means no limit. Default is 0.",
 			Destination: &config.QuotaBytes,
 			Value:       0,
 			EnvVars:     []string{"KINE_QUOTA_BYTES"},
@@ -228,10 +228,17 @@ func New() *cli.App {
 		},
 		&cli.IntFlag{
 			Name:        "listen-max-connections",
-			Usage:       "Maximum open client connections, also those still in their handshake. Kine closes a connection over the limit before its handshake. 0 means no limit. Default is 0.",
+			Usage:       "Maximum open client connections, also those still in their handshake. Kine closes a connection over the limit before its handshake. With --listen-max-pending-handshakes, only connections whose handshake ended count, and kine closes one over the limit after its handshake. 0 means no limit. Default is 0.",
 			Destination: &config.ListenMaxConnections,
 			Value:       0,
 			EnvVars:     []string{"KINE_LISTEN_MAX_CONNECTIONS"},
+		},
+		&cli.IntFlag{
+			Name:        "listen-max-pending-handshakes",
+			Usage:       "Maximum client connections in their TLS handshake. Kine closes a connection over it before its handshake. A connection whose handshake ended counts against --listen-max-connections instead, so stalled handshakes cannot take those slots. Needs --cert-file and --key-file. 0 means off. Default is 0.",
+			Destination: &config.ListenMaxPendingHandshakes,
+			Value:       0,
+			EnvVars:     []string{"KINE_LISTEN_MAX_PENDING_HANDSHAKES"},
 		},
 		// KUBEHZ-PATCH P5 END
 		&cli.StringFlag{

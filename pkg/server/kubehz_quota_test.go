@@ -903,6 +903,65 @@ func TestKubehzP2FailedSamplesFull(t *testing.T) {
 	}
 }
 
+// TestKubehzP2RecoveryRace: a sample that makes the size known again, with a
+// figure above the limit, comes between the two reads of a write. The write
+// must not pass on the figure from before that sample. The write reads the
+// unknown state first: while the size is unknown it is refused before the
+// seam between the reads, and while the size is known it reads the figure
+// after the seam. A refused write keeps no reservation.
+func TestKubehzP2RecoveryRace(t *testing.T) {
+	out := logrus.StandardLogger().Out
+	logrus.SetOutput(io.Discard)
+	t.Cleanup(func() { logrus.SetOutput(out) })
+
+	ctx := context.Background()
+	quota := NewQuota(1000)
+	b := WithQuota(&quotaFake{}, quota)
+	low := func(context.Context) (int64, error) { return 100, nil }
+	high := func(context.Context) (int64, error) { return 2000, nil }
+	failed := func(context.Context) (int64, error) { return 0, errors.New("connection refused") }
+	if err := quota.Sample(ctx, low, nil); err != nil {
+		t.Fatal(err)
+	}
+	for range quotaSampleFailLimit {
+		_ = quota.Sample(ctx, failed, nil)
+	}
+	if !quota.SizeUnknown() || quota.Figure() >= quota.Limit() {
+		t.Fatalf("size unknown %v, figure %d; the test needs an unknown size and a figure below the limit", quota.SizeUnknown(), quota.Figure())
+	}
+	ran := false
+	quotaReserveHook = func() {
+		ran = true
+		if err := quota.Sample(ctx, high, nil); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { quotaReserveHook = nil })
+	create := func(when string) {
+		t.Helper()
+		pending := quota.Pending()
+		if _, err := b.Create(ctx, "/registry/configmaps/default/new", bytesOf(10), 0); !isNoSpace(err) {
+			t.Fatalf("%s: a new key got %v, want %v (the sample made the size known at 2000 bytes, the limit is 1000)", when, err, ErrNoSpace)
+		}
+		if quota.Pending() != pending {
+			t.Fatalf("%s: the refused write changed the pending bytes from %d to %d", when, pending, quota.Pending())
+		}
+	}
+
+	create("size unknown")
+	if ran || !quota.SizeUnknown() {
+		t.Fatal("size unknown: the write read past the unknown state before it was refused")
+	}
+
+	if err := quota.Sample(ctx, low, nil); err != nil {
+		t.Fatal(err)
+	}
+	create("size known")
+	if !ran {
+		t.Fatal("size known: the seam between the two reads did not run")
+	}
+}
+
 // TestKubehzP2FailedSamplesTick: through the sampler's tick, three failed
 // samples in a row set the full gauge and start the relief of a full quota,
 // and a good sample below the limit ends both.

@@ -63,15 +63,19 @@ const (
 	// handshakeOther: any other failure, also one after a complete TLS
 	// handshake, such as gRPC's check for the h2 protocol (ALPN).
 	handshakeOther = "other"
-	// handshakeLimit: P5 closed the connection before its handshake, because
-	// --listen-max-connections connections were open.
+	// handshakeLimit: P5 closed the connection, because
+	// --listen-max-connections connections were open: before its handshake,
+	// or after it with --listen-max-pending-handshakes.
 	handshakeLimit = "limit"
+	// handshakePendingLimit: P5 closed the connection before its handshake,
+	// because --listen-max-pending-handshakes connections were in theirs.
+	handshakePendingLimit = "pending_limit"
 )
 
 var handshakeFailureReasons = []string{
 	handshakeNoClientCert, handshakeUnknownAuthority, handshakeExpired, handshakeBadCertificate,
 	handshakeClientAlert, handshakeNotTLS, handshakeClosed, handshakeTimeout, handshakeOther,
-	handshakeLimit,
+	handshakeLimit, handshakePendingLimit,
 }
 
 // countHandshakeFailures wraps creds so that each failed server handshake is

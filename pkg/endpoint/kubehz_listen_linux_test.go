@@ -68,7 +68,7 @@ func TestKubehzP5UserTimeout(t *testing.T) {
 	if got := userTimeoutOf(t, accept(l)); got != 0 {
 		t.Fatalf("a plain accepted connection has TCP_USER_TIMEOUT %d ms; the test needs 0", got)
 	}
-	c := accept(limitConnections(l, 1, 20*time.Second))
+	c := accept(limitConnections(l, 1, 0, 20*time.Second))
 	lc, ok := c.(*limitConn)
 	if !ok {
 		t.Fatalf("the limit accepted a %T, want *limitConn", c)

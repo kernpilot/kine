@@ -67,6 +67,10 @@ type Config struct {
 	// ListenMaxConnections is the most open client connections. 0 means no
 	// limit.
 	ListenMaxConnections int
+	// ListenMaxPendingHandshakes is the most client connections in their TLS
+	// handshake. Above 0, ListenMaxConnections counts only connections whose
+	// handshake ended. 0 means off. It needs TLS.
+	ListenMaxPendingHandshakes int
 	// KUBEHZ-PATCH P5 END
 }
 
@@ -211,7 +215,7 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 		return ETCDConfig{}, fmt.Errorf("creating listener: %w", err)
 	}
 	// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
-	listener = limitConnections(listener, config.ListenMaxConnections, embed.DefaultGRPCKeepAliveTimeout)
+	listener = limitConnections(listener, config.ListenMaxConnections, config.ListenMaxPendingHandshakes, embed.DefaultGRPCKeepAliveTimeout)
 	// KUBEHZ-PATCH P5 END
 
 	wg.Add(1)
@@ -348,6 +352,14 @@ func grpcServer(config Config) (*grpc.Server, error) {
 		// CONFLICT: keep the wrap between credentials.NewTLS and grpc.Creds.
 		creds = countHandshakeFailures(creds, config.MetricsRegisterer)
 		// KUBEHZ-PATCH P4 END
+		// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+		// After a handshake that succeeded, a connection moves from the
+		// pending budget to the connection limit. Outside P4's wrap, so P4
+		// counts the TLS result and P5 its own refusals.
+		if config.ListenMaxPendingHandshakes > 0 {
+			creds = admitHandshakes{TransportCredentials: creds}
+		}
+		// KUBEHZ-PATCH P5 END
 		gopts = append(gopts, grpc.Creds(creds))
 	}
 

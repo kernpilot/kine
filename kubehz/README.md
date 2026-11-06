@@ -49,12 +49,13 @@ adds `pkg/endpoint/kubehz_tls.go` and `pkg/metrics/kubehz_tls.go`, and
 carries one marker-wrapped line in `grpcServer` in
 `pkg/endpoint/endpoint.go`.
 
-P5 (`--listen-handshake-timeout` and `--listen-max-connections`, both off
-by default) adds `pkg/endpoint/kubehz_listen.go`,
-`pkg/endpoint/kubehz_listen_linux.go` and
+P5 (`--listen-handshake-timeout`, `--listen-max-connections` and
+`--listen-max-pending-handshakes`, all off by default) adds
+`pkg/endpoint/kubehz_listen.go`, `pkg/endpoint/kubehz_listen_linux.go` and
 `pkg/endpoint/kubehz_listen_other.go`, and carries marker-wrapped edits in
 `pkg/app/app.go` (the flags) and `pkg/endpoint/endpoint.go` (the config
-fields, the check, the listener wrap and the gRPC option). It makes
+fields, the check, the listener wrap, the gRPC option and the credentials
+wrap of the pending budget). It makes
 `golang.org/x/sys` a direct dependency in `go.mod`.
 
 Beside those source files, the fork carries its own tests (every

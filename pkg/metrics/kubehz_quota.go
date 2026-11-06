@@ -25,7 +25,7 @@ var (
 
 	QuotaFull = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "kine_quota_full",
-		Help: "1 while the figure is at or above --quota-bytes, or while the size is unknown after 3 failed samples in a row: new keys are refused, the lanes still write.",
+		Help: "1 while the figure is at or above --quota-bytes, or while the size is unknown after 3 failed live-size reads in a row: new keys are refused, the lanes still write.",
 	})
 
 	QuotaPendingBytes = prometheus.NewGauge(prometheus.GaugeOpts{

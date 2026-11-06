@@ -178,15 +178,21 @@ which only feeds a gauge. The rules:
    2 × value (the row also carries the old value). A failed sample changes
    nothing, so the bytes keep adding up and a sampler that keeps failing
    refuses writes (fail closed). Only a good sample shows the bytes the
-   figure does not count (the gaps under "Bounds"). So three failed samples
-   in a row (`quotaSampleFailLimit`) make the quota full, whatever the
-   figure, until a sample succeeds: new keys are refused, and the lanes and
-   the relief of items 2 to 4 work as at the limit. Every live read counts,
-   also the read again after a pass. A read that failed because kine stops
-   does not count. At the 30 s interval the quota is full about 90 s after
-   the last good sample at the earliest. A WARN line starts the state, an
+   figure does not count (the gaps under "Bounds"). So three failed
+   live-size reads in a row (`quotaSampleFailLimit`) make the quota full,
+   whatever the figure, until a read succeeds: new keys are refused, and
+   the lanes and the relief of items 2 to 4 work as at the limit. Every
+   live read counts: the sample of a tick, and the read again after a
+   refresh or a compaction pass. A read that failed because kine stops does
+   not count. With only the samples of the ticks, that is about 90 s after
+   the last good read at the 30 s interval. That is no minimum and no
+   deadline: the reads after a pass can make it shorter, down to about one
+   interval, and a slow pass that delays a tick makes it longer. A write
+   reads this state before the figure, so a read that makes the size known
+   again with a figure at the limit cannot let through a write that
+   compared the figure from before it. A WARN line starts the state, an
    INFO line ends it, and `kine_quota_consecutive_sample_errors` shows the
-   failed samples in a row (`kine_quota_full` is 1 from the third).
+   failed reads in a row (`kine_quota_full` is 1 from the third).
 2. At or above the limit ("full") a new key is refused, except a small
    control key. Deletes, reads, watches and `Compact` pass. An update
    passes only if it does not grow the value by more than 64 bytes; it is
@@ -298,7 +304,7 @@ which only feeds a gauge. The rules:
    10 s deadline.
 
 INFO lines on each transition and on each relief pass, and a WARN line when
-three failed samples make the quota full. The metrics
+three failed live-size reads make the quota full. The metrics
 (`metrics.QuotaMetrics()`) are registered only with a limit. `kv.go`
 skips the per-request error log for the no-space error: the apiserver
 answers 500, its clients and controllers retry, and that line prints the
@@ -390,11 +396,12 @@ gaps, accepted with their bounds:
   the last VACUUM until autovacuum or autoanalyze brings `reltuples` back.
   That is no stated time or byte bound.
 - While samples fail, no sample shows the bytes these gaps leave out.
-  Three failed samples in a row make the quota full (item 1). So the
-  writes below the limit that no good sample followed are those until the
-  third failed sample: about 90 s of writes at the 30 s interval, more
-  when a slow pass delays a tick. After that only the lanes write, as at
-  the limit.
+  Three failed live-size reads in a row make the quota full (item 1). So
+  the writes below the limit that no good read followed are those until
+  the third failed read: with only the samples of the ticks, about 90 s
+  of writes at the 30 s interval; less when the reads after a pass fail
+  too, more when a slow pass delays a tick. After that only the lanes
+  write, as at the limit.
 - kine's own compactor (`--compact-interval`) and autovacuum run outside
   this coordination. A refresh pass can follow a delete of kine's
   compactor too closely, and an autovacuum can follow a relief delete too
@@ -407,8 +414,10 @@ operator's (CNPG volume and WAL limits).
 **Invariant.** The sizes are sampled, never queried on the write path
 while below the limit: a write costs atomic operations. Only a write while
 full reads its key. A failed sample keeps the last value and never clears
-the limit. Three failed samples in a row make the quota full until a good
-sample (`TestKubehzP2FailedSamplesFull`, `TestKubehzP2FailedSamplesTick`).
+the limit. Three failed live-size reads in a row make the quota full until
+a good read (`TestKubehzP2FailedSamplesFull`,
+`TestKubehzP2FailedSamplesTick`); a write reads that state before the
+figure (`TestKubehzP2RecoveryRace`).
 The first sample must succeed or kine does not start. On
 PostgreSQL the compared figure is live data: if a rebase loses a
 forwarding method the limit silently becomes a file-size limit, which is
@@ -564,21 +573,22 @@ builds. If upstream builds the gRPC server TLS some other way (for example
 `grpc.Creds` with other credentials, or TLS on the listener), wrap the
 handshake there, or drop P4: it is an observation, not a correctness or
 safety fix. If upstream adds its own handshake metric, drop P4. P5 counts
-its refusals in this counter (`limit`); keep that reason if P4 stays.
+its refusals in this counter (`limit`, `pending_limit`); keep those
+reasons if P4 stays.
 
 **Re-verify** `go test -tags=test -race -run TestKubehzP4 ./pkg/endpoint/`.
 
-### P5 — a handshake timeout and a connection limit on the client listener
+### P5 — a handshake timeout and connection limits on the client listener
 
 **Files** `pkg/endpoint/kubehz_listen.go`,
 `pkg/endpoint/kubehz_listen_linux.go` and
 `pkg/endpoint/kubehz_listen_other.go` (new, conflict-free).
-`pkg/endpoint/endpoint.go`: two `Config` fields, a check at the start of
-`Listen`, one line after `createListener` and one option in `grpcServer`,
-each marker-wrapped. `pkg/app/app.go`: two flags.
-`pkg/endpoint/kubehz_tls.go` (P4): the reason `limit`. `go.mod`:
-`golang.org/x/sys` is a direct dependency. Tests
-`pkg/endpoint/kubehz_listen_test.go`,
+`pkg/endpoint/endpoint.go`: three `Config` fields, a check at the start of
+`Listen`, one line after `createListener`, one option in `grpcServer` and
+one credentials wrap after P4's, each marker-wrapped. `pkg/app/app.go`:
+three flags. `pkg/endpoint/kubehz_tls.go` (P4): the reasons `limit` and
+`pending_limit`. `go.mod`: `golang.org/x/sys` is a direct dependency.
+Tests `pkg/endpoint/kubehz_listen_test.go`,
 `pkg/endpoint/kubehz_listen_linux_test.go` and
 `pkg/app/kubehz_listen_test.go`. `unit.yml` fails when they are missing.
 
@@ -588,45 +598,74 @@ preface, and kine accepts any number of connections. In front of kine, a
 TLS passthrough gateway cannot bound a handshake it does not terminate,
 and some gateways cannot limit connections. So slow or idle connections
 can hold file descriptors and goroutines for 120 s each, with no limit.
+A single limit alone is not enough: clients with no valid certificate can
+fill it with handshakes they never end, and then a valid client cannot
+connect until one of them times out.
 
-**Approach.** Two flags, both off by default.
+**Approach.** Three flags, all off by default.
 - `--listen-handshake-timeout` (default 0: gRPC's 120 s) sets gRPC's
-  `ConnectionTimeout`: the deadline gRPC puts on a new connection until
-  it has read the HTTP/2 preface, with or without TLS. A TLS handshake
-  that runs out of it counts as `timeout` in P4's counter.
-- `--listen-max-connections` (default 0: no limit) wraps the listener. A
-  connection counts from `Accept` until its first `Close`, also during
-  its handshake. Over the limit, `Accept` closes the new connection before
-  kine reads from it, counts it as `limit` in
-  `kine_tls_handshake_failures_total` (the counter is registered only
-  with TLS), and waits for the next one. With `--debug`, one DEBUG line
-  per refusal.
+  `ConnectionTimeout`: an absolute deadline that gRPC puts on a new
+  connection before the TLS handshake and clears when the HTTP/2
+  transport is set up (the client preface and the first SETTINGS). Bytes
+  that trickle in do not extend it, and an established connection does
+  not keep it. A TLS handshake that runs out of it counts as `timeout` in
+  P4's counter; an HTTP/2 setup that runs out of it is not counted.
+- `--listen-max-connections` (default 0: no limit) wraps the listener.
+  Without a pending budget, a connection counts from `Accept` until its
+  first `Close`, also during its handshake. Over the limit, `Accept`
+  closes the new connection before kine reads from it, counts it as
+  `limit` in `kine_tls_handshake_failures_total` (the counter is
+  registered only with TLS), and waits for the next one.
+- `--listen-max-pending-handshakes` (default 0: off; needs TLS) splits
+  that budget. A connection whose TLS handshake has not ended counts
+  against it. Over it, `Accept` closes the new connection before kine
+  reads from it and counts it as `pending_limit`. A credentials wrapper
+  outside P4's moves a connection to `--listen-max-connections` when its
+  handshake succeeds; when that limit is full it closes the connection
+  and counts it as `limit`. So handshakes that stall cannot take the
+  slots of connections that ended one (with `--trusted-ca-file`: of
+  authenticated clients). With `--debug`, one DEBUG line per refusal.
 - gRPC sets `TCP_USER_TIMEOUT` (its keepalive timeout, 20 s in kine) only
   on a `*net.TCPConn`, and the wrapper hides that type. So on Linux the
   wrapper sets the same value itself; elsewhere gRPC sets nothing either.
-- A negative value, or either limit with `Config.GRPCServer` set (a
-  server that the caller built), makes `Listen` fail.
+  It bounds unacknowledged writes; it is no idle limit.
+- A negative value, a pending budget without `--cert-file` and
+  `--key-file`, or any of the three with `Config.GRPCServer` set (a server
+  that the caller built), makes `Listen` fail.
+- The keepalive settings stay etcd's, with no flag: client pings no more
+  often than every 5 s and none without an active stream; server pings
+  after 2 h idle, with a 20 s timeout.
 
-**Invariant.** With both at 0, kine builds the same gRPC server and serves
-the same listener as upstream. Each accepted connection frees its slot
-once. gRPC closes the accepted connection on every path (a failed
-handshake, a failed transport setup, the end of the transport), so no
-slot leaks. The limit counts all client connections, not the connections
-of one source: one source can still take every slot. A limit per source
-belongs in front of kine (a firewall, or a gateway that can count).
+**Invariant.** With all three at 0, kine builds the same gRPC server and
+serves the same listener as upstream. Each accepted connection counts
+against exactly one budget and frees it once: the move after the
+handshake and `Close` swap one atomic state, so a `Close` during the move,
+or two `Close` calls at once, free one slot. gRPC closes the accepted
+connection on every path (a failed handshake, a failed transport setup,
+the end of the transport), so no slot leaks. The limits count all client
+connections, not the connections of one source: one source can still
+take every pending slot, and while the pending budget is full no new
+client gets in, valid or not. The limits protect the resources and the
+connections that are up; they cannot admit an unknown client during an
+attack. A limit per source belongs in front of kine (a firewall, or a
+gateway that keeps the source address, for example with PROXY protocol).
 
 **Not an optimisation.** This is a safety bound, off by default. The test
 suite is the check.
 
 **If it conflicts.** The new files never conflict. If upstream adds its
 own handshake timeout or connection limit, take upstream's and drop that
-half of P5; say in the changelog what happens to the flag names. If
+part of P5; say in the changelog what happens to the flag names. If
 upstream wraps the listener itself (for example with `cmux`), keep the
-limit as the outer wrapper, so that it counts every connection. If gRPC
-stops setting `TCP_USER_TIMEOUT`, or finds the socket through an
-interface the wrapper can pass on, drop `setUserTimeout`. If gRPC removes
+limit as the outer wrapper, so that it counts every connection. Keep the
+credentials wrap of the pending budget outside P4's, so P4 counts the TLS
+result and P5 its own refusals; it needs the connection gRPC hands to
+`ServerHandshake` to be the one `Accept` returned. If gRPC stops setting
+`TCP_USER_TIMEOUT`, or finds the socket through an interface the wrapper
+can pass on, drop `setUserTimeout`. If gRPC removes
 `grpc.ConnectionTimeout` (it is experimental), set the deadline in the
-wrapper instead.
+wrapper instead, and clear it once the transport is up
+(`TestKubehzP5WatchOutlivesTimeout`).
 
 **Re-verify** `go test -tags=test -race -run TestKubehzP5 ./pkg/endpoint/ ./pkg/app/`.
 
