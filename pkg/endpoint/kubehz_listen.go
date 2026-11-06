@@ -25,12 +25,16 @@ package endpoint
 // INVARIANT: with all three at 0 (the defaults) kine builds the same gRPC
 //   server and serves the same listener as upstream.
 //
-// INVARIANT: a connection counts against exactly one budget from Accept
-//   until its first Close, also while its handshake runs, so slow handshakes
-//   cannot get past the limits. The move after the handshake and Close are
-//   atomic with each other: the state is swapped once, and only the budget it
-//   held is freed. gRPC closes the accepted connection on every path: a
-//   failed handshake, a failed transport setup and the end of the transport.
+// INVARIANT: a connection counts against a budget from Accept until its
+//   first Close, also while its handshake runs, so slow handshakes cannot get
+//   past the limits. Its state names one budget. During the move after the
+//   handshake it briefly counts against both: the move reserves its slot of
+//   the connection limit before it frees its pending slot, so it can refuse
+//   early but never pass a limit. The move and Close are atomic with each
+//   other: the state is swapped once, Close frees only the budget the state
+//   names, and a move that loses to Close gives back its reservation. gRPC
+//   closes the accepted connection on every path: a failed handshake, a
+//   failed transport setup and the end of the transport.
 //
 // INVARIANT: gRPC sets TCP_USER_TIMEOUT (the keepalive timeout) only on a
 //   *net.TCPConn, and the wrapper of the limit hides that type. So the

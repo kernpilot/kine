@@ -638,9 +638,11 @@ connect until one of them times out.
 
 **Invariant.** With all three at 0, kine builds the same gRPC server and
 serves the same listener as upstream. Each accepted connection counts
-against exactly one budget and frees it once: the move after the
-handshake and `Close` swap one atomic state, so a `Close` during the move,
-or two `Close` calls at once, free one slot. gRPC closes the accepted
+against a budget and frees it once. During the move after the handshake
+it briefly counts against both: the move reserves its slot of the limit
+before it frees its pending slot, so it can refuse early but never pass a
+limit. The move and `Close` swap one atomic state, so a `Close` during the
+move, or two `Close` calls at once, free one slot. gRPC closes the accepted
 connection on every path (a failed handshake, a failed transport setup,
 the end of the transport), so no slot leaks. The limits count all client
 connections, not the connections of one source: one source can still
