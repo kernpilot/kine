@@ -287,6 +287,22 @@ which only feeds a gauge. The rules:
    its vacuum counts become the watch's baseline, so a reset before the
    next sample still shows as a decrease. Each size query has its own
    10 s deadline.
+   The estimate can read high after a VACUUM. A VACUUM, also one by
+   autovacuum, sets `n_live_tup` to an absolute value, and a backend sends
+   its insert counters to the shared statistics at most once a second (an
+   idle backend 10 s later, and at most 60 s later when the shared entries
+   are busy). Inserts whose counters arrive after the VACUUM count twice,
+   until the next VACUUM for the TOAST row count and the next ANALYZE or
+   VACUUM for the heap row count. That is about the last second of inserts
+   of each busy backend, and it only refuses early. Measured on PostgreSQL
+   17.11 and 18.4: of 200 inserts of 64 KiB, up to 95 had not sent their
+   counters when a VACUUM ran, and the TOAST row count then read 6,600 plus
+   33 for each of them (CHANGELOG.md, "P2 test"). The estimate cannot tell
+   these rows from new ones without a table scan, which it does not do
+   ("Which bytes, and why" below), so it stays as it is. For the same
+   reason `TestKubehzP2P3Postgres` flushes the counters of its inserting
+   session (`pg_stat_force_next_flush()`) before a VACUUM that it reads
+   after, and checks that they arrived. So it needs PostgreSQL 15 or later.
 
 INFO lines on each transition and on each relief pass. The metrics
 (`metrics.QuotaMetrics()`) are registered only with a limit. `kv.go`
