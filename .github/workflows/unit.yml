@@ -16,14 +16,20 @@ permissions:
 
 jobs:
   unit-tests:
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # kubehz fork: a real PostgreSQL for the P2/P3 integration test
-    # (pkg/drivers/pgsql/kubehz_pgsql_test.go, gated on KINE_TEST_PGSQL_DSN).
+    # (pkg/drivers/pgsql/kubehz_pgsql_test.go, gated on KINE_TEST_PGSQL_DSN),
+    # once per supported major. Every step runs on both, so the whole
+    # suite does too.
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['postgres:17.11', 'postgres:18.4']
     services:
       postgres:
-        image: postgres:16
+        image: ${{ matrix.postgres }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -94,3 +100,23 @@ jobs:
         grep -q '^TestKubehzP3' <<<"$names" \
           || { echo "::error::no TestKubehzP3* test in ./pkg/drivers/pgsql/ (see kubehz/MERGE-GUIDE.md)"; exit 1; }
         go test -tags=test -count=1 -race -run 'TestKubehzP3' ./pkg/drivers/pgsql/
+
+    # kubehz fork: same guard for the P4 tests (kubehz/MERGE-GUIDE.md#p4).
+    - name: kubehz P4 tests exist and pass
+      run: |
+        set -euo pipefail
+        names=$(go test -tags=test -list 'TestKubehzP4' ./pkg/endpoint/)
+        grep -q '^TestKubehzP4' <<<"$names" \
+          || { echo "::error::no TestKubehzP4* test in ./pkg/endpoint/ (see kubehz/MERGE-GUIDE.md)"; exit 1; }
+        go test -tags=test -count=1 -race -run 'TestKubehzP4' ./pkg/endpoint/
+
+    # kubehz fork: same guard for the P5 tests (kubehz/MERGE-GUIDE.md#p5).
+    - name: kubehz P5 tests exist and pass
+      run: |
+        set -euo pipefail
+        for pkg in ./pkg/endpoint/ ./pkg/app/; do
+          names=$(go test -tags=test -list 'TestKubehzP5' "$pkg")
+          grep -q '^TestKubehzP5' <<<"$names" \
+            || { echo "::error::no TestKubehzP5* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
+        done
+        go test -tags=test -count=1 -race -run 'TestKubehzP5' ./pkg/endpoint/ ./pkg/app/

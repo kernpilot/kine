@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/k3s-io/kine/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -753,9 +755,13 @@ func TestKubehzP2LaneCaps(t *testing.T) {
 }
 
 // TestKubehzP2PendingWindow: the written bytes stay in the figure until the
-// good sample two samples after them, because the statistics may not show
-// them before that; a failed sample moves nothing, so a sampler that keeps
-// failing refuses writes once they add up to the limit (fail closed).
+// good sample two good samples after them, because the statistics may not
+// show them before that. A failed sample moves nothing: the writes add up to
+// the limit with no good sample (fail closed), and a good sample after
+// failed ones keeps the bytes written since the mark of the good sample two
+// good samples back. Three failed samples in a row make the quota full
+// before the figure does (TestKubehzP2FailedSamplesFull); here there are
+// two.
 func TestKubehzP2PendingWindow(t *testing.T) {
 	out := logrus.StandardLogger().Out
 	logrus.SetOutput(io.Discard)
@@ -778,18 +784,215 @@ func TestKubehzP2PendingWindow(t *testing.T) {
 	}
 
 	failed := func(context.Context) (int64, error) { return 0, errors.New("connection refused") }
-	for i := 0; i < 9; i++ {
+	for i := 0; i < 10; i++ { // 1000 bytes, the last create reaches the limit
 		if _, err := b.Create(ctx, "/b", bytesOf(98), 0); err != nil {
 			t.Fatalf("create %d below the limit: %v", i, err)
 		}
-		_ = quota.Sample(ctx, failed, nil)
+		if i == 4 || i == 8 {
+			_ = quota.Sample(ctx, failed, nil)
+		}
 	}
-	if _, err := b.Create(ctx, "/b", bytesOf(98), 0); err != nil {
-		t.Fatalf("the create that reaches the limit: %v", err)
+	if quota.SizeUnknown() {
+		t.Fatal("two failed samples made the size unknown")
 	}
-	_ = quota.Sample(ctx, failed, nil)
 	if _, err := b.Create(ctx, "/b", bytesOf(98), 0); !isNoSpace(err) {
 		t.Fatalf("a create after 1000 bytes and only failed samples: got %v, want %v", err, ErrNoSpace)
+	}
+	// the statistics do not show the writes yet: the bytes stay in the figure
+	if err := quota.Sample(ctx, live, nil); err != nil {
+		t.Fatal(err)
+	}
+	if quota.Pending() != 1000 {
+		t.Fatalf("pending %d after a good sample that followed two failed ones, want 1000", quota.Pending())
+	}
+	if _, err := b.Create(ctx, "/b", bytesOf(98), 0); !isNoSpace(err) {
+		t.Fatalf("a create after the good sample: got %v, want %v", err, ErrNoSpace)
+	}
+}
+
+// TestKubehzP2FailedSamplesFull: quotaSampleFailLimit failed samples in a row
+// make the quota full whatever the figure, with the lanes of a full quota;
+// two do not, and neither does a sample that failed because the sampler
+// stops. One good sample clears it, and the row starts again from 0. The
+// gauges and the two log lines follow.
+func TestKubehzP2FailedSamplesFull(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	out := logrus.StandardLogger().Out
+	logrus.SetOutput(io.Discard)
+	t.Cleanup(func() { logrus.SetOutput(out) })
+
+	ctx := context.Background()
+	fake := &quotaFake{current: bytesOf(100)}
+	quota := NewQuota(1000)
+	b := WithQuota(fake, quota)
+	good := func(context.Context) (int64, error) { return 100, nil }
+	failed := func(context.Context) (int64, error) { return 0, errors.New("connection refused") }
+	if err := quota.Sample(ctx, good, nil); err != nil {
+		t.Fatal(err)
+	}
+	create := func(key string) error {
+		_, err := b.Create(ctx, key, bytesOf(10), 0)
+		return err
+	}
+	check := func(when string, wantFull bool, wantRow float64) {
+		t.Helper()
+		if quota.Full() != wantFull || quota.SizeUnknown() != wantFull {
+			t.Fatalf("%s: full %v, size unknown %v; want %v", when, quota.Full(), quota.SizeUnknown(), wantFull)
+		}
+		if got := testutil.ToFloat64(metrics.QuotaFull); got != boolGauge(wantFull) {
+			t.Fatalf("%s: kine_quota_full %v, want %v", when, got, boolGauge(wantFull))
+		}
+		if got := testutil.ToFloat64(metrics.QuotaConsecutiveSampleErrors); got != wantRow {
+			t.Fatalf("%s: kine_quota_consecutive_sample_errors %v, want %v", when, got, wantRow)
+		}
+		err := create("/registry/configmaps/default/new")
+		if wantFull && !isNoSpace(err) {
+			t.Fatalf("%s: a new key got %v, want %v", when, err, ErrNoSpace)
+		}
+		if !wantFull && err != nil {
+			t.Fatalf("%s: a new key: %v", when, err)
+		}
+	}
+
+	_ = quota.Sample(ctx, failed, nil)
+	_ = quota.Sample(ctx, failed, nil)
+	stopped, stop := context.WithCancel(ctx)
+	stop()
+	_ = quota.Sample(stopped, failed, nil) // the sampler stops: not a failed sample
+	check("after two failed samples and a stop", false, 2)
+
+	_ = quota.Sample(ctx, failed, nil)
+	check("after three failed samples", true, 3)
+	// the lanes of a full quota: an update that does not grow its value, and
+	// a small Lease create
+	if _, _, _, err := b.Update(ctx, "/registry/configmaps/default/a", bytesOf(100), 1, 0); err != nil {
+		t.Fatalf("a no-growth update while the size is unknown: %v", err)
+	}
+	if err := create("/registry/leases/default/n"); err != nil {
+		t.Fatalf("a small Lease create while the size is unknown: %v", err)
+	}
+	_ = quota.Sample(ctx, failed, nil)
+	check("after four failed samples", true, 4)
+
+	if err := quota.Sample(ctx, good, nil); err != nil {
+		t.Fatal(err)
+	}
+	check("after a good sample", false, 0)
+	_ = quota.Sample(ctx, failed, nil)
+	_ = quota.Sample(ctx, failed, nil)
+	check("after two failed samples that follow a good one", false, 2)
+
+	var warns, infos []string
+	for _, e := range hook.AllEntries() {
+		switch {
+		case e.Level == logrus.WarnLevel && strings.Contains(e.Message, "in a row failed"):
+			warns = append(warns, e.Message)
+		case e.Level == logrus.InfoLevel && strings.Contains(e.Message, "succeeded after"):
+			infos = append(infos, e.Message)
+		case strings.Contains(e.Message, "New keys are refused until live data is smaller"):
+			// the figure was never at the limit
+			t.Fatalf("a full line about the figure: %q", e.Message)
+		}
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "3 size samples in a row failed") {
+		t.Fatalf("warnings %q, want one for the third failed sample", warns)
+	}
+	if len(infos) != 1 || !strings.Contains(infos[0], "succeeded after 4 failed ones") {
+		t.Fatalf("info lines %q, want one for the good sample after four failed ones", infos)
+	}
+}
+
+// TestKubehzP2RecoveryRace: a sample that makes the size known again, with a
+// figure above the limit, comes between the two reads of a write. The write
+// must not pass on the figure from before that sample. The write reads the
+// unknown state first: while the size is unknown it is refused before the
+// seam between the reads, and while the size is known it reads the figure
+// after the seam. A refused write keeps no reservation.
+func TestKubehzP2RecoveryRace(t *testing.T) {
+	out := logrus.StandardLogger().Out
+	logrus.SetOutput(io.Discard)
+	t.Cleanup(func() { logrus.SetOutput(out) })
+
+	ctx := context.Background()
+	quota := NewQuota(1000)
+	b := WithQuota(&quotaFake{}, quota)
+	low := func(context.Context) (int64, error) { return 100, nil }
+	high := func(context.Context) (int64, error) { return 2000, nil }
+	failed := func(context.Context) (int64, error) { return 0, errors.New("connection refused") }
+	if err := quota.Sample(ctx, low, nil); err != nil {
+		t.Fatal(err)
+	}
+	for range quotaSampleFailLimit {
+		_ = quota.Sample(ctx, failed, nil)
+	}
+	if !quota.SizeUnknown() || quota.Figure() >= quota.Limit() {
+		t.Fatalf("size unknown %v, figure %d; the test needs an unknown size and a figure below the limit", quota.SizeUnknown(), quota.Figure())
+	}
+	ran := false
+	quotaReserveHook = func() {
+		ran = true
+		if err := quota.Sample(ctx, high, nil); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { quotaReserveHook = nil })
+	create := func(when string) {
+		t.Helper()
+		pending := quota.Pending()
+		if _, err := b.Create(ctx, "/registry/configmaps/default/new", bytesOf(10), 0); !isNoSpace(err) {
+			t.Fatalf("%s: a new key got %v, want %v (the sample made the size known at 2000 bytes, the limit is 1000)", when, err, ErrNoSpace)
+		}
+		if quota.Pending() != pending {
+			t.Fatalf("%s: the refused write changed the pending bytes from %d to %d", when, pending, quota.Pending())
+		}
+	}
+
+	create("size unknown")
+	if ran || !quota.SizeUnknown() {
+		t.Fatal("size unknown: the write read past the unknown state before it was refused")
+	}
+
+	if err := quota.Sample(ctx, low, nil); err != nil {
+		t.Fatal(err)
+	}
+	create("size known")
+	if !ran {
+		t.Fatal("size known: the seam between the two reads did not run")
+	}
+}
+
+// TestKubehzP2FailedSamplesTick: through the sampler's tick, three failed
+// samples in a row set the full gauge and start the relief of a full quota,
+// and a good sample below the limit ends both.
+func TestKubehzP2FailedSamplesTick(t *testing.T) {
+	ctx := context.Background()
+	relief := &reliefFake{}
+	quota, fake, clock := reliefSetup(t, relief)
+	var fail atomic.Bool
+	live := func(context.Context) (int64, error) {
+		if fail.Load() {
+			return 0, errors.New("connection refused")
+		}
+		return 10, nil
+	}
+	fail.Store(true)
+	ticksEvery30s(ctx, quota, fake, clock, live, 3, nil) // ticks at 0, 30 and 60 s; the lag is 60 s
+	if testutil.ToFloat64(metrics.QuotaFull) != 1 || !quota.Full() {
+		t.Fatal("three failed ticks: the quota is not full")
+	}
+	if !slices.Equal(relief.targets, []int64{10}) {
+		t.Fatalf("relief targets %v, want [10] (the third tick compacts to the revision of the first)", relief.targets)
+	}
+	fail.Store(false)
+	*clock = clock.Add(30 * time.Second)
+	fake.rev.Store(40)
+	quota.tick(ctx, live, nil)
+	if testutil.ToFloat64(metrics.QuotaFull) != 0 || quota.Full() {
+		t.Fatal("a good tick below the limit: the quota is still full")
+	}
+	if len(relief.targets) != 1 {
+		t.Fatalf("relief targets %v: a pass after the good sample below the limit", relief.targets)
 	}
 }
 
