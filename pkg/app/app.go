@@ -218,6 +218,22 @@ func New() *cli.App {
 			EnvVars:     []string{"KINE_QUOTA_BYTES"},
 		},
 		// KUBEHZ-PATCH P2 END
+		// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+		&cli.DurationFlag{
+			Name:        "listen-handshake-timeout",
+			Usage:       "Time a new client connection has for the TLS handshake and the HTTP/2 preface; then kine closes it. 0 keeps gRPC's default of 120s. Default is 0.",
+			Destination: &config.ListenHandshakeTimeout,
+			Value:       0,
+			EnvVars:     []string{"KINE_LISTEN_HANDSHAKE_TIMEOUT"},
+		},
+		&cli.IntFlag{
+			Name:        "listen-max-connections",
+			Usage:       "Maximum open client connections, also those still in their handshake. Kine closes a connection over the limit before its handshake. 0 means no limit. Default is 0.",
+			Destination: &config.ListenMaxConnections,
+			Value:       0,
+			EnvVars:     []string{"KINE_LISTEN_MAX_CONNECTIONS"},
+		},
+		// KUBEHZ-PATCH P5 END
 		&cli.StringFlag{
 			Name:        "peer-bind-address",
 			Usage:       "gRPC listen address (host:port) for the t4 peer WAL-streaming server. Empty means single-node mode. Example: 0.0.0.0:3380.",

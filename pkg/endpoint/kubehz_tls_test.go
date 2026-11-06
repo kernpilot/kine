@@ -510,8 +510,9 @@ func TestKubehzP4Listen(t *testing.T) {
 }
 
 // listenP4 starts a kine on sqlite on a loopback TCP port with server TLS
-// (none when serverTLS is empty) and reg as its metrics registerer.
-func listenP4(t *testing.T, serverTLS kinetls.Config, reg prometheus.Registerer) ETCDConfig {
+// (none when serverTLS is empty) and reg as its metrics registerer. Each
+// option changes the config before Listen.
+func listenP4(t *testing.T, serverTLS kinetls.Config, reg prometheus.Registerer, options ...func(*Config)) ETCDConfig {
 	t.Helper()
 	dir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -520,7 +521,7 @@ func listenP4(t *testing.T, serverTLS kinetls.Config, reg prometheus.Registerer)
 		cancel()
 		wg.Wait()
 	})
-	e, err := Listen(ctx, Config{
+	config := Config{
 		WaitGroup:         wg,
 		Listener:          "tcp://127.0.0.1:0",
 		Endpoint:          "sqlite://" + dir + "/state.db?" + sqlite.DefaultParams,
@@ -532,7 +533,11 @@ func listenP4(t *testing.T, serverTLS kinetls.Config, reg prometheus.Registerer)
 		CompactMinRetain: 1000,
 		CompactBatchSize: 1000,
 		PollBatchSize:    500,
-	})
+	}
+	for _, option := range options {
+		option(&config)
+	}
+	e, err := Listen(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,6 +12,58 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+### P5 — a handshake timeout and a connection limit on the client listener
+
+Adds `pkg/endpoint/kubehz_listen.go`, `pkg/endpoint/kubehz_listen_linux.go`
+and `pkg/endpoint/kubehz_listen_other.go`. Touches
+`pkg/endpoint/endpoint.go` (marker-wrapped), `pkg/app/app.go` (two flags),
+`pkg/endpoint/kubehz_tls.go` (P4's reason `limit`), and `go.mod`
+(`golang.org/x/sys` is direct).
+
+**Why.** kine had no flag for either. A new client connection has gRPC's
+120 s for the TLS handshake and the HTTP/2 preface, and kine accepts any
+number of connections. A TLS passthrough gateway in front of kine cannot
+bound a handshake it does not terminate, so kine must.
+
+**What.** `--listen-handshake-timeout` (default 0: gRPC's 120 s) sets
+gRPC's `ConnectionTimeout`. `--listen-max-connections` (default 0: no
+limit) closes a connection over the limit before kine reads from it and
+counts it as `limit` in `kine_tls_handshake_failures_total`; a connection
+counts until it is closed, also during its handshake. The wrapper sets
+`TCP_USER_TIMEOUT` itself on Linux, because gRPC sets it only on a
+`*net.TCPConn`. Both flags also read `KINE_LISTEN_HANDSHAKE_TIMEOUT` and
+`KINE_LISTEN_MAX_CONNECTIONS`. With both at 0 nothing changes. Before
+this, kine already had keepalive enforcement (etcd's defaults: pings no
+more often than every 5 s, none without a stream) and gRPC's
+`MaxConcurrentStreams` at etcd's default (no limit), both fixed, with no
+flags. The rules are in [MERGE-GUIDE.md](MERGE-GUIDE.md#p5).
+
+**Tests**:
+- `TestKubehzP5HandshakeTimeout` (a real kine with TLS): a client that
+  sends nothing, and one that starts a TLS record and stops, are closed
+  after 300 ms and count as `timeout`. With the default the second is
+  still open after 1 s. A valid etcd client writes with the timeout set.
+- `TestKubehzP5MaxConnections` (a real kine with TLS, limit 2): two etcd
+  clients write; connection 3 is refused before its handshake and counts
+  as `limit`; both clients still read. After one client closes, a new
+  connection is accepted, and while it waits for its HTTP/2 preface, the
+  next one is refused again.
+- `TestKubehzP5UserTimeout` (Linux): a connection the limit accepts has
+  `TCP_USER_TIMEOUT` 20 000 ms; a plain accepted one has 0.
+- `TestKubehzP5Checks`, `TestKubehzP5ListenFlags`: negative values and a
+  caller's gRPC server are refused, also by `Listen`; no limit returns the
+  listener itself; the flags default to 0 and fill the config.
+
+Each of these 14 mutations makes a test fail: no timeout option, the
+option also at 0, no limit wrap in `Listen`, no check in `Listen`, no
+limit in `Accept`, the limit one lower, a closed connection that keeps its
+slot, a refusal not counted, `limit` not among P4's reasons, no
+`TCP_USER_TIMEOUT`, a negative limit let through, a caller's server let
+through, the limit flag's default at 100, and the timeout flag's
+destination changed.
+
+**Re-check** `go test -tags=test -race -run TestKubehzP5 ./pkg/endpoint/ ./pkg/app/`.
+
 ### P4 — a counter of failed TLS handshakes on the client listener
 
 Adds `pkg/endpoint/kubehz_tls.go` and `pkg/metrics/kubehz_tls.go`. Touches

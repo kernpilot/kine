@@ -18,7 +18,7 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. It carries four patches.
+The fork is deliberately narrow. It carries five patches.
 
 P1 touches three files. `pkg/drivers/pgsql/notify.go` is new and cannot
 conflict. `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`
@@ -49,11 +49,20 @@ adds `pkg/endpoint/kubehz_tls.go` and `pkg/metrics/kubehz_tls.go`, and
 carries one marker-wrapped line in `grpcServer` in
 `pkg/endpoint/endpoint.go`.
 
+P5 (`--listen-handshake-timeout` and `--listen-max-connections`, both off
+by default) adds `pkg/endpoint/kubehz_listen.go`,
+`pkg/endpoint/kubehz_listen_linux.go` and
+`pkg/endpoint/kubehz_listen_other.go`, and carries marker-wrapped edits in
+`pkg/app/app.go` (the flags) and `pkg/endpoint/endpoint.go` (the config
+fields, the check, the listener wrap and the gRPC option). It makes
+`golang.org/x/sys` a direct dependency in `go.mod`.
+
 Beside those source files, the fork carries its own tests (every
 `kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
 provides, on 17 and 18), two workflow files (`unit.yml` gains a step per
-patch, that service and its matrix, `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the
-`kubehz/` and `benchmarks/` directories. Nothing else differs from
+patch, that service and its matrix, `publish-kubehz.yml` is ours), a few
+`.gitignore` lines, and the `kubehz/` and `benchmarks/` directories.
+Nothing else differs from
 upstream. The check, from the repository root, is
 
 ```bash
@@ -71,6 +80,9 @@ pkg/drivers/pgsql/kubehz_reloptions.go
 pkg/drivers/pgsql/notify.go
 pkg/drivers/pgsql/pgsql.go
 pkg/endpoint/endpoint.go
+pkg/endpoint/kubehz_listen.go
+pkg/endpoint/kubehz_listen_linux.go
+pkg/endpoint/kubehz_listen_other.go
 pkg/endpoint/kubehz_tls.go
 pkg/logstructured/kubehz_ttl.go
 pkg/logstructured/logstructured.go

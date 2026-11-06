@@ -109,3 +109,14 @@ jobs:
         grep -q '^TestKubehzP4' <<<"$names" \
           || { echo "::error::no TestKubehzP4* test in ./pkg/endpoint/ (see kubehz/MERGE-GUIDE.md)"; exit 1; }
         go test -tags=test -count=1 -race -run 'TestKubehzP4' ./pkg/endpoint/
+
+    # kubehz fork: same guard for the P5 tests (kubehz/MERGE-GUIDE.md#p5).
+    - name: kubehz P5 tests exist and pass
+      run: |
+        set -euo pipefail
+        for pkg in ./pkg/endpoint/ ./pkg/app/; do
+          names=$(go test -tags=test -list 'TestKubehzP5' "$pkg")
+          grep -q '^TestKubehzP5' <<<"$names" \
+            || { echo "::error::no TestKubehzP5* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
+        done
+        go test -tags=test -count=1 -race -run 'TestKubehzP5' ./pkg/endpoint/ ./pkg/app/

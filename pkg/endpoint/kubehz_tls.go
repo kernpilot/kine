@@ -58,16 +58,20 @@ const (
 	// handshake, for example a TCP probe.
 	handshakeClosed = "closed"
 	// handshakeTimeout: the handshake did not end in time (gRPC's connection
-	// timeout, 120 s by default).
+	// timeout: --listen-handshake-timeout, P5, else 120 s).
 	handshakeTimeout = "timeout"
 	// handshakeOther: any other failure, also one after a complete TLS
 	// handshake, such as gRPC's check for the h2 protocol (ALPN).
 	handshakeOther = "other"
+	// handshakeLimit: P5 closed the connection before its handshake, because
+	// --listen-max-connections connections were open.
+	handshakeLimit = "limit"
 )
 
 var handshakeFailureReasons = []string{
 	handshakeNoClientCert, handshakeUnknownAuthority, handshakeExpired, handshakeBadCertificate,
 	handshakeClientAlert, handshakeNotTLS, handshakeClosed, handshakeTimeout, handshakeOther,
+	handshakeLimit,
 }
 
 // countHandshakeFailures wraps creds so that each failed server handshake is

@@ -563,9 +563,72 @@ restructures `grpcServer`, keep the wrap on whatever server credentials it
 builds. If upstream builds the gRPC server TLS some other way (for example
 `grpc.Creds` with other credentials, or TLS on the listener), wrap the
 handshake there, or drop P4: it is an observation, not a correctness or
-safety fix. If upstream adds its own handshake metric, drop P4.
+safety fix. If upstream adds its own handshake metric, drop P4. P5 counts
+its refusals in this counter (`limit`); keep that reason if P4 stays.
 
 **Re-verify** `go test -tags=test -race -run TestKubehzP4 ./pkg/endpoint/`.
+
+### P5 — a handshake timeout and a connection limit on the client listener
+
+**Files** `pkg/endpoint/kubehz_listen.go`,
+`pkg/endpoint/kubehz_listen_linux.go` and
+`pkg/endpoint/kubehz_listen_other.go` (new, conflict-free).
+`pkg/endpoint/endpoint.go`: two `Config` fields, a check at the start of
+`Listen`, one line after `createListener` and one option in `grpcServer`,
+each marker-wrapped. `pkg/app/app.go`: two flags.
+`pkg/endpoint/kubehz_tls.go` (P4): the reason `limit`. `go.mod`:
+`golang.org/x/sys` is a direct dependency. Tests
+`pkg/endpoint/kubehz_listen_test.go`,
+`pkg/endpoint/kubehz_listen_linux_test.go` and
+`pkg/app/kubehz_listen_test.go`. `unit.yml` fails when they are missing.
+
+**Problem.** kine sets no bound of its own on its client listener. A new
+connection has gRPC's 120 s for the TLS handshake and the HTTP/2
+preface, and kine accepts any number of connections. In front of kine, a
+TLS passthrough gateway cannot bound a handshake it does not terminate,
+and some gateways cannot limit connections. So slow or idle connections
+can hold file descriptors and goroutines for 120 s each, with no limit.
+
+**Approach.** Two flags, both off by default.
+- `--listen-handshake-timeout` (default 0: gRPC's 120 s) sets gRPC's
+  `ConnectionTimeout`: the deadline gRPC puts on a new connection until
+  it has read the HTTP/2 preface, with or without TLS. A TLS handshake
+  that runs out of it counts as `timeout` in P4's counter.
+- `--listen-max-connections` (default 0: no limit) wraps the listener. A
+  connection counts from `Accept` until its first `Close`, also during
+  its handshake. Over the limit, `Accept` closes the new connection before
+  kine reads from it, counts it as `limit` in
+  `kine_tls_handshake_failures_total` (the counter is registered only
+  with TLS), and waits for the next one. With `--debug`, one DEBUG line
+  per refusal.
+- gRPC sets `TCP_USER_TIMEOUT` (its keepalive timeout, 20 s in kine) only
+  on a `*net.TCPConn`, and the wrapper hides that type. So on Linux the
+  wrapper sets the same value itself; elsewhere gRPC sets nothing either.
+- A negative value, or either limit with `Config.GRPCServer` set (a
+  server that the caller built), makes `Listen` fail.
+
+**Invariant.** With both at 0, kine builds the same gRPC server and serves
+the same listener as upstream. Each accepted connection frees its slot
+once. gRPC closes the accepted connection on every path (a failed
+handshake, a failed transport setup, the end of the transport), so no
+slot leaks. The limit counts all client connections, not the connections
+of one source: one source can still take every slot. A limit per source
+belongs in front of kine (a firewall, or a gateway that can count).
+
+**Not an optimisation.** This is a safety bound, off by default. The test
+suite is the check.
+
+**If it conflicts.** The new files never conflict. If upstream adds its
+own handshake timeout or connection limit, take upstream's and drop that
+half of P5; say in the changelog what happens to the flag names. If
+upstream wraps the listener itself (for example with `cmux`), keep the
+limit as the outer wrapper, so that it counts every connection. If gRPC
+stops setting `TCP_USER_TIMEOUT`, or finds the socket through an
+interface the wrapper can pass on, drop `setUserTimeout`. If gRPC removes
+`grpc.ConnectionTimeout` (it is experimental), set the deadline in the
+wrapper instead.
+
+**Re-verify** `go test -tags=test -race -run TestKubehzP5 ./pkg/endpoint/ ./pkg/app/`.
 
 ## Patches considered and deliberately NOT taken
 
