@@ -106,6 +106,19 @@ state starts.
 
 **Re-check** as for the P2 revision below.
 
+The relief compacts while the size is unknown, so maybe while the
+database is not full. That is no new risk: it is the compaction kine's own
+compactor does, of history at least `QuotaReliefLag` old and never past
+this process's poller. The comment on `quotaSampleFailLimit` says so.
+
+### CI — the PostgreSQL steps run on 17 and 18
+
+`unit.yml` ran its PostgreSQL service on `postgres:16`. It now runs the
+whole job once per image of a matrix, `postgres:17.11` and
+`postgres:18.4`, pinned by tag as before, with `fail-fast: false`. The
+job name carries the image (`Unit Tests (postgres:18.4)`). No branch rule
+requires the old name.
+
 ### P2 revision — a full cluster keeps running and frees space by itself (B481)
 
 Adds `pkg/logstructured/sqllog/kubehz_relief.go`. Touches

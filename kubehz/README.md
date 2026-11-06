@@ -51,8 +51,8 @@ carries one marker-wrapped line in `grpcServer` in
 
 Beside those source files, the fork carries its own tests (every
 `kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
-provides), two workflow files (`unit.yml` gains a step per patch and that
-service, `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the
+provides, on 17 and 18), two workflow files (`unit.yml` gains a step per
+patch, that service and its matrix, `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the
 `kubehz/` and `benchmarks/` directories. Nothing else differs from
 upstream. The check, from the repository root, is
 

@@ -16,14 +16,20 @@ permissions:
 
 jobs:
   unit-tests:
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # kubehz fork: a real PostgreSQL for the P2/P3 integration test
-    # (pkg/drivers/pgsql/kubehz_pgsql_test.go, gated on KINE_TEST_PGSQL_DSN).
+    # (pkg/drivers/pgsql/kubehz_pgsql_test.go, gated on KINE_TEST_PGSQL_DSN),
+    # once per supported major. Every step runs on both, so the whole
+    # suite does too.
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['postgres:17.11', 'postgres:18.4']
     services:
       postgres:
-        image: postgres:16
+        image: ${{ matrix.postgres }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:

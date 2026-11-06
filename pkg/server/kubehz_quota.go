@@ -152,7 +152,10 @@ const (
 	// succeeds. Every live read of a sample counts, also the read again
 	// after a pass; a read that failed because the sampler stops does not.
 	// At QuotaSampleInterval that is about 90 s after the last good sample
-	// at the earliest.
+	// at the earliest. The relief then compacts while the database may not
+	// be full. That is no new risk: it is the compaction kine's own
+	// compactor (--compact-interval) does, of history at least
+	// QuotaReliefLag old and never past this process's poller.
 	quotaSampleFailLimit = 3
 	// quotaReliefBudget bounds one compaction pass, so it ends before the
 	// next sample is due.

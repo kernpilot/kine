@@ -143,8 +143,8 @@ real kine on sqlite through `Listen`, the B481 relief end to end),
 `pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain) and
 `pkg/logstructured/sqllog/kubehz_relief_test.go` (the relief bounds),
 and `pkg/drivers/pgsql/kubehz_pgsql_test.go` against the PostgreSQL
-service `unit.yml` runs (skipped without `KINE_TEST_PGSQL_DSN`; it needs a
-role that may call `pg_stat_reset()`). `unit.yml` fails when they are missing.
+service `unit.yml` runs on 17 and 18 (skipped without
+`KINE_TEST_PGSQL_DSN`; it needs a role that may call `pg_stat_reset()`). `unit.yml` fails when they are missing.
 
 **Problem.** Upstream kine has no size limit: `Alarm` is unsupported, there
 is no quota flag, and PostgreSQL has no per-database quota. One kine per
