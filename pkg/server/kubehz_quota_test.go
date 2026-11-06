@@ -158,6 +158,25 @@ func TestKubehzP2LiveSizeOf(t *testing.T) {
 	}
 }
 
+// TestKubehzP2SetTTLDeleteTimeout: the helper Listen calls hands the timeout
+// to a backend that takes one, and reports false for a backend that does not.
+func TestKubehzP2SetTTLDeleteTimeout(t *testing.T) {
+	if SetTTLDeleteTimeout(&quotaFake{}, QuotaTTLDeleteTimeout) {
+		t.Fatal("a backend without TTLDeleteDeadline took a TTL delete timeout")
+	}
+	f := &ttlDeadlineFake{}
+	if !SetTTLDeleteTimeout(f, QuotaTTLDeleteTimeout) || f.timeout != QuotaTTLDeleteTimeout {
+		t.Fatalf("the backend got the timeout %s, want %s", f.timeout, QuotaTTLDeleteTimeout)
+	}
+}
+
+type ttlDeadlineFake struct {
+	quotaFake
+	timeout time.Duration
+}
+
+func (f *ttlDeadlineFake) SetTTLDeleteTimeout(d time.Duration) { f.timeout = d }
+
 func putTxn(key string, modRev int64) *etcdserverpb.TxnRequest {
 	// the apiserver's create (modRev 0) and update (modRev > 0) transactions
 	return &etcdserverpb.TxnRequest{

@@ -232,7 +232,8 @@ the key. `TestKubehzP2TTLDeleteTimeout` stalls an insert after its read,
 then writes two newer values and compacts. With no timeout, the stalled
 insert deletes the newest value. `TestKubehzP2TTLStart` and
 `TestKubehzP2ListenTTLDeleteTimeout` pin the wiring, also its order before
-`Start`. Nine mutations: each one makes a test fail. The second limit is
+`Start`, and `TestKubehzP2SetTTLDeleteTimeout` pins the helper. Ten
+mutations: each one makes a test fail. The second limit is
 now a condition for `--quota-bytes`: one active kine process per database,
 also during the handoff.
 
