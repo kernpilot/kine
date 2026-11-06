@@ -3,11 +3,11 @@ package logstructured
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/k3s-io/kine/pkg/server"
-	"github.com/k3s-io/kine/pkg/ttl"
 )
 
 type Log interface {
@@ -26,6 +26,9 @@ type Log interface {
 
 type LogStructured struct {
 	log Log
+	// KUBEHZ-PATCH P2 — see kubehz/MERGE-GUIDE.md#p2. The TTL delete
+	// timeout (kubehz_ttl.go); 0 means none, as upstream.
+	ttlDeleteTimeout time.Duration
 }
 
 func New(log Log) *LogStructured {
@@ -42,7 +45,10 @@ func (l *LogStructured) Start(ctx context.Context) error {
 	if _, err := l.Create(ctx, server.HealthKey, []byte(server.HealthVal), 0); err != nil && err != server.ErrKeyExists {
 		logrus.Errorf("Failed to create health check key: %v", err)
 	}
-	go ttl.Run(ctx, l)
+	// KUBEHZ-PATCH P2 — see kubehz/MERGE-GUIDE.md#p2. Upstream: go
+	// ttl.Run(ctx, l). ttlRun is ttl.Run, and ttlBackend returns l when no
+	// TTL delete timeout is set (kubehz_ttl.go).
+	go ttlRun(ctx, l.ttlBackend())
 	return nil
 }
 
@@ -296,6 +302,23 @@ func (l *LogStructured) LiveSize() server.SizeSource {
 		return s.LiveSize()
 	}
 	return nil
+}
+
+// RelieveQuota forwards the quota's compaction while full (B481) to the log
+// underneath. A log without one compacts nothing: the result is empty and
+// the quota then relies on the regular compactor.
+// CONFLICT: an added method next to LiveSize; keep it with that one.
+func (l *LogStructured) RelieveQuota(ctx context.Context, target int64, refresh bool) (server.ReliefResult, error) {
+	if r, ok := l.log.(server.QuotaRelief); ok {
+		return r.RelieveQuota(ctx, target, refresh)
+	}
+	return server.ReliefResult{}, nil
+}
+
+// StatsOwed forwards the log's statistics debt (server.QuotaRelief).
+func (l *LogStructured) StatsOwed() bool {
+	r, ok := l.log.(server.QuotaRelief)
+	return ok && r.StatsOwed()
 }
 
 // KUBEHZ-PATCH P2 END

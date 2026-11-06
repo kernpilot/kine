@@ -10,6 +10,7 @@ package endpoint
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -91,6 +92,163 @@ func TestKubehzP2ListenFailsOnFirstSample(t *testing.T) {
 		!strings.Contains(err.Error(), "relation kine does not exist") {
 		t.Fatalf("Listen with a failing live source: got %v, want the first-sample error", err)
 	}
+}
+
+// TestKubehzP2ListenTTLDeleteTimeout: with a quota, Listen gives the TTL
+// loop's deletes server.QuotaTTLDeleteTimeout, and does it before Start
+// (Start writes the health key and starts the TTL loop, so the key must not
+// exist yet). Without a quota it leaves the TTL loop as upstream.
+func TestKubehzP2ListenTTLDeleteTimeout(t *testing.T) {
+	seam := ttlDeleteTimeoutOf
+	t.Cleanup(func() { ttlDeleteTimeoutOf = seam })
+	for _, tc := range []struct {
+		name  string
+		quota int64
+		calls int
+	}{
+		{"a quota sets the timeout", 1, 1},
+		{"no quota sets nothing", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			ttlDeleteTimeoutOf = func(b server.Backend, d time.Duration) bool {
+				calls++
+				if d != server.QuotaTTLDeleteTimeout {
+					t.Errorf("TTL delete timeout %s, want %s", d, server.QuotaTTLDeleteTimeout)
+				}
+				// Before Start the log has no rows, and Get fails or finds
+				// nothing. Only a started backend has the health key.
+				if _, kv, err := b.Get(context.Background(), server.HealthKey, 0, false); err == nil && kv != nil {
+					t.Errorf("TTL delete timeout set after Start (the health key exists at revision %d)", kv.ModRevision)
+				}
+				ok := seam(b, d)
+				if !ok {
+					t.Errorf("the sqlite backend %T takes no TTL delete timeout", b)
+				}
+				return ok
+			}
+			if _, err := listenSQLite(t, tc.quota); err != nil {
+				t.Fatal(err)
+			}
+			if calls != tc.calls {
+				t.Fatalf("QuotaBytes=%d: %d calls to set the TTL delete timeout, want %d", tc.quota, calls, tc.calls)
+			}
+		})
+	}
+}
+
+// TestKubehzP2ListenRelief: B481 end to end on a real kine (sqlite). Fill the
+// database to its limit. A new key is then refused, while an update of an
+// existing Lease and an update that does not grow a value still pass. Delete
+// the filled keys: the quota's relief compacts the history by itself and a
+// new key is accepted again, with no other step. Without the relief (upstream
+// compactor off, as in the KKP render) the deleted rows stay and new keys stay
+// refused, which is the lock B481 found.
+func TestKubehzP2ListenRelief(t *testing.T) {
+	interval, lag := quotaSampleInterval, quotaReliefLag
+	t.Cleanup(func() { quotaSampleInterval, quotaReliefLag = interval, lag })
+	quotaSampleInterval, quotaReliefLag = 100*time.Millisecond, time.Second
+
+	e, err := listenSQLite(t, 512<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := clientv3.New(clientv3.Config{Endpoints: e.Endpoints, DialTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const lease = "/registry/leases/kube-system/k3s"
+	if _, err := client.Put(ctx, lease, strings.Repeat("l", 200)); err != nil {
+		t.Fatal(err)
+	}
+	blob := strings.Repeat("0123456789abcdef", 1024) // 16 KiB
+	var filled []string
+	for i := 0; ; i++ {
+		key := fmt.Sprintf("/registry/configmaps/fill/%03d", i)
+		_, err := client.Put(ctx, key, blob)
+		if errors.Is(err, rpctypes.ErrNoSpace) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("fill %s: %v", key, err)
+		}
+		if i > 200 {
+			t.Fatal("200 puts of 16 KiB did not reach a 512 KiB limit")
+		}
+		filled = append(filled, key)
+	}
+	if len(filled) == 0 {
+		t.Fatal("the first put was refused")
+	}
+
+	// full: a Lease renewal and a no-growth update pass, a new key does not
+	if err := updateTxn(ctx, client, lease, strings.Repeat("r", 200)); err != nil {
+		t.Fatalf("Lease update while full: %v", err)
+	}
+	if err := updateTxn(ctx, client, filled[0], blob[:len(blob)-100]); err != nil {
+		t.Fatalf("no-growth update while full: %v", err)
+	}
+	if _, err := client.Put(ctx, "/registry/configmaps/default/new", "v"); !errors.Is(err, rpctypes.ErrNoSpace) {
+		t.Fatalf("new key while full: got %v, want %v", err, rpctypes.ErrNoSpace)
+	}
+
+	for _, key := range filled {
+		resp, err := client.Get(ctx, key)
+		if err != nil || len(resp.Kvs) != 1 {
+			t.Fatalf("get %s before the delete: %v", key, err)
+		}
+		del, err := client.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(key), "=", resp.Kvs[0].ModRevision)).
+			Then(clientv3.OpDelete(key)).
+			Else(clientv3.OpGet(key)).
+			Commit()
+		if err != nil || !del.Succeeded {
+			t.Fatalf("delete %s while full: %v", key, err)
+		}
+	}
+
+	// the relief compacts only to a revision at least quotaReliefLag old
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		_, err := client.Put(ctx, "/registry/configmaps/default/after", "v")
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, rpctypes.ErrNoSpace) {
+			t.Fatalf("put after the delete: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("new keys still refused 15 s after deleting every filled key: the relief did not free the space")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// updateTxn is the apiserver's update: compare the current mod revision, put.
+func updateTxn(ctx context.Context, client *clientv3.Client, key, value string) error {
+	resp, err := client.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	if len(resp.Kvs) != 1 {
+		return fmt.Errorf("%s not found", key)
+	}
+	txn, err := client.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", resp.Kvs[0].ModRevision)).
+		Then(clientv3.OpPut(key, value)).
+		Else(clientv3.OpGet(key)).
+		Commit()
+	if err != nil {
+		return err
+	}
+	if !txn.Succeeded {
+		return fmt.Errorf("update of %s lost its compare", key)
+	}
+	return nil
 }
 
 // listenSQLite starts kine on a fresh sqlite database behind a unix socket.

@@ -72,7 +72,7 @@ jobs:
     - name: kubehz P2 tests exist and pass
       run: |
         set -euo pipefail
-        pkgs="./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/"
+        pkgs="./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/ ./pkg/logstructured/sqllog/"
         for pkg in $pkgs; do
           names=$(go test -tags=test -list 'TestKubehzP2' "$pkg")
           grep -q '^TestKubehzP2' <<<"$names" \
