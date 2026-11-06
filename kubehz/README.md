@@ -18,7 +18,7 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. It carries three patches.
+The fork is deliberately narrow. It carries four patches.
 
 P1 touches three files. `pkg/drivers/pgsql/notify.go` is new and cannot
 conflict. `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`
@@ -29,11 +29,13 @@ a candidate for upstreaming rather than indefinite carrying.
 P2 (the `--quota-bytes` limit on live data, and the B481 lanes and relief
 that keep a full cluster running and cleaning up) adds
 `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
-`pkg/drivers/pgsql/kubehz_quota.go` and `pkg/logstructured/sqllog/kubehz_relief.go`,
-and carries marker-wrapped edits in `pkg/app/app.go` (the flag),
-`pkg/endpoint/endpoint.go` (the config field, the wiring and two test seams),
-`pkg/server/kv.go` (two log conditions), `pkg/logstructured/logstructured.go`
-(two forwarding methods) and `pkg/logstructured/sqllog/sql.go` (one).
+`pkg/drivers/pgsql/kubehz_quota.go`, `pkg/logstructured/sqllog/kubehz_relief.go`
+and `pkg/logstructured/kubehz_ttl.go`, and carries marker-wrapped edits in
+`pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go` (the config field,
+the wiring, the TTL delete timeout and the test seams), `pkg/server/kv.go`
+(two log conditions), `pkg/logstructured/logstructured.go` (three
+forwarding methods, the TTL delete timeout and the TTL loop start) and
+`pkg/logstructured/sqllog/sql.go` (one).
 `go.mod` and `go.sum` differ from upstream too: the dependency bumps for
 advisories, and `golang.org/x/time` as a direct dependency (P2's rate limits).
 
@@ -41,6 +43,11 @@ P3 (storage parameters on the kine table) adds
 `pkg/drivers/pgsql/kubehz_reloptions.go` and touches `setup()` (one flag from
 its CockroachDB probe) and `New()` in `pkg/drivers/pgsql/pgsql.go`. The
 `CREATE TABLE` statement stays upstream's.
+
+P4 (a counter of failed TLS handshakes on the client listener, by reason)
+adds `pkg/endpoint/kubehz_tls.go` and `pkg/metrics/kubehz_tls.go`, and
+carries one marker-wrapped line in `grpcServer` in
+`pkg/endpoint/endpoint.go`.
 
 Beside those source files, the fork carries its own tests (every
 `kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
@@ -64,10 +71,13 @@ pkg/drivers/pgsql/kubehz_reloptions.go
 pkg/drivers/pgsql/notify.go
 pkg/drivers/pgsql/pgsql.go
 pkg/endpoint/endpoint.go
+pkg/endpoint/kubehz_tls.go
+pkg/logstructured/kubehz_ttl.go
 pkg/logstructured/logstructured.go
 pkg/logstructured/sqllog/kubehz_relief.go
 pkg/logstructured/sqllog/sql.go
 pkg/metrics/kubehz_quota.go
+pkg/metrics/kubehz_tls.go
 pkg/server/kubehz_quota.go
 pkg/server/kv.go
 ```

@@ -25,7 +25,7 @@ var (
 
 	QuotaFull = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "kine_quota_full",
-		Help: "1 while the figure is at or above --quota-bytes: new keys are refused, the lanes still write.",
+		Help: "1 while the figure is at or above --quota-bytes, or while the size is unknown after 3 failed samples in a row: new keys are refused, the lanes still write.",
 	})
 
 	QuotaPendingBytes = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -58,6 +58,11 @@ var (
 		Help: "Size samples that failed. The last good figure and the bytes written since stay in use.",
 	})
 
+	QuotaConsecutiveSampleErrors = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kine_quota_consecutive_sample_errors",
+		Help: "Live size samples that failed in a row; 0 after a good one. From 3, the quota counts as full until a sample succeeds.",
+	})
+
 	QuotaLastSample = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "kine_quota_last_sample_timestamp_seconds",
 		Help: "Unix time of the last good live sample.",
@@ -74,6 +79,6 @@ func QuotaMetrics() []prometheus.Collector {
 	return []prometheus.Collector{
 		QuotaBytes, LiveBytes, DBSizeBytes, QuotaFull, QuotaPendingBytes, QuotaRefused,
 		QuotaLaneWrites, QuotaReliefPasses, QuotaReliefRows, QuotaSampleErrors,
-		QuotaLastSample, QuotaLastRelief,
+		QuotaConsecutiveSampleErrors, QuotaLastSample, QuotaLastRelief,
 	}
 }

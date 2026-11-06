@@ -12,6 +12,100 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+### P4 — a counter of failed TLS handshakes on the client listener
+
+Adds `pkg/endpoint/kubehz_tls.go` and `pkg/metrics/kubehz_tls.go`. Touches
+`pkg/endpoint/endpoint.go` (one marker-wrapped line in `grpcServer`).
+
+**Why.** kine shows nothing for a TLS handshake that fails on its client
+listener: gRPC closes the connection and logs the error only at its own
+info level, which kine does not show. With `--trusted-ca-file`, nobody can
+see that kine refused a client with no certificate, a certificate from
+another CA, or an expired certificate.
+
+**What.** `kine_tls_handshake_failures_total{reason}`, with the reasons
+`no_client_cert`, `unknown_authority`, `expired`, `bad_certificate`,
+`client_alert`, `not_tls`, `closed`, `timeout` and `other`. A wrapper
+around gRPC's server transport credentials reads the handshake error and
+returns the wrapped results unchanged, so what is accepted or refused stays
+upstream's. The counter is registered only when the listener serves TLS,
+with every reason at 0. With `--debug`, one DEBUG line per failure.
+The rules are in [MERGE-GUIDE.md](MERGE-GUIDE.md#p4).
+
+**Tests** (`pkg/endpoint/kubehz_tls_test.go`):
+- `TestKubehzP4Reasons`: real handshakes against the server config that
+  `Listen` builds, on TLS 1.2 and 1.3. A valid client connects and counts
+  nothing. No client certificate, a certificate from another CA, an expired
+  certificate, a certificate for server auth only, a client that does not
+  trust the server, a client with no ALPN, plain HTTP/2, a connection
+  closed at once and a client that sends nothing until the deadline each
+  count once under their reason, and the client sees a refusal.
+- `TestKubehzP4ReasonTable`: the errors no real handshake makes here
+  (reset, broken pipe, the text-only certificate errors).
+- `TestKubehzP4Unchanged`: the wrapper returns the same values, counts
+  only a failure, not `ErrConnDispatched`, and `Clone` keeps the wrapper.
+- `TestKubehzP4Listen`: a real kine on sqlite with `--trusted-ca-file`.
+  An etcd client writes and reads. A client with no certificate and one
+  with a certificate from another CA are refused and count once each. The
+  counter is registered with every reason at 0, and not at all without
+  server TLS.
+
+Each of these 14 mutations makes a test fail: no wrap in `grpcServer`, no
+registration, no reason at 0, `ErrConnDispatched` counted, the error
+hidden, `Clone` without the wrapper, and each reason's check removed
+(client alert, unknown authority, expired, no certificate, the text
+certificate errors, not TLS, closed, timeout).
+
+**Re-check** `go test -tags=test -race -run TestKubehzP4 ./pkg/endpoint/`.
+
+### P2 follow-up — three failed samples in a row count as full
+
+Touches `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go` and
+`pkg/app/app.go` (the flag text).
+
+**Why.** A failed sample keeps the last figure. The bytes the figure does
+not count (another process's writes, the undercharge of a shrinking
+update, a lost acknowledgement, the old value in a delete row) show only
+in a good sample. While the samples fail, nothing shows them, with no time
+bound.
+
+**What.** Three failed samples in a row (`quotaSampleFailLimit`) make the
+quota full, whatever the figure, until a sample succeeds. It is the full
+behaviour of B481: new keys are refused, the two lanes write, and the
+relief compacts. Every live read counts, also the read again after a pass;
+a read that failed because kine stops does not. At the 30 s interval the
+quota is full about 90 s after the last good sample at the earliest. A
+WARN line starts the state and an INFO line ends it. The new gauge
+`kine_quota_consecutive_sample_errors` shows the failed samples in a row,
+and `kine_quota_full` is 1 from the third. No schema and no stored data
+change. The rules are in [MERGE-GUIDE.md](MERGE-GUIDE.md#p2), item 1 and
+"Bounds".
+
+**Tests** (`pkg/server/kubehz_quota_test.go`):
+- `TestKubehzP2FailedSamplesFull`: two failed samples and one stopped
+  sample leave the quota open; the third failed sample makes it full (a
+  new key refused, a no-growth update and a small Lease create pass);
+  one good sample clears it and the row starts at 0 again. The gauges, the
+  WARN line and the INFO line follow, and no line says the figure reached
+  the limit.
+- `TestKubehzP2FailedSamplesTick`: through the sampler's tick, three
+  failed samples set `kine_quota_full` and start the relief; a good sample
+  below the limit ends both.
+- `TestKubehzP2PendingWindow` made ten failed samples in a row, which now
+  make the quota full. It now makes two, and then a good sample, which
+  must keep the bytes written since the mark of the good sample two good
+  samples back. So the mutation "a failed sample moves the base" still
+  fails it.
+
+Each of these 10 mutations makes a test fail: the write check ignores the
+unknown size, two failed samples are enough, a good sample does not clear
+the state, a stopped sample counts, `Full` ignores the unknown size,
+`publish` ignores it, the row is not reset, no gauge on a failure, the
+line about the figure while the size is unknown, and no `publish` when the
+state starts.
+
+**Re-check** as for the P2 revision below.
+
 ### P2 revision — a full cluster keeps running and frees space by itself (B481)
 
 Adds `pkg/logstructured/sqllog/kubehz_relief.go`. Touches

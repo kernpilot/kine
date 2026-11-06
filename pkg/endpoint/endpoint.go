@@ -320,6 +320,13 @@ func grpcServer(config Config) (*grpc.Server, error) {
 			return nil, err
 		}
 		creds := credentials.NewTLS(tlsConfig)
+		// KUBEHZ-PATCH P4 BEGIN — see kubehz/MERGE-GUIDE.md#p4
+		// INTENT: count the failed TLS handshakes of this listener by reason
+		//   (kine_tls_handshake_failures_total). What is accepted or refused
+		//   stays upstream's.
+		// CONFLICT: keep the wrap between credentials.NewTLS and grpc.Creds.
+		creds = countHandshakeFailures(creds, config.MetricsRegisterer)
+		// KUBEHZ-PATCH P4 END
 		gopts = append(gopts, grpc.Creds(creds))
 	}
 

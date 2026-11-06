@@ -21,6 +21,8 @@ package server
 //     compaction pass, a quiet tick, and a refresh pass at least
 //     quotaRefreshSettle after the compaction ended. That is no bound: a
 //     refresh that fails or does not fit its budget delays it.
+//   quotaSampleFailLimit failed samples in a row also count as full, whatever
+//   the figure, until a sample succeeds.
 //
 // INVARIANT: the size is sampled, never queried on the write path. A write
 //   below the limit costs atomic loads and two atomic adds. The
@@ -36,7 +38,11 @@ package server
 //   live figure: a mixed read is an old base with a new sample, which reads
 //   high. A failed sample changes neither term, so the written bytes keep
 //   adding up: a sampler that keeps failing refuses writes after (L - live)
-//   bytes, it fails closed.
+//   bytes, it fails closed. Only a good sample shows the bytes the figure
+//   does not count (the gaps below, another process's writes), so after
+//   quotaSampleFailLimit failed samples in a row the quota counts as full
+//   until a sample succeeds. Without that, those bytes could add up with
+//   no time bound while the samples fail.
 //
 // INVARIANT: every put reserves its bytes BEFORE the check, so concurrent
 //   writes see each other: the limit is passed by one write at most. A
@@ -141,6 +147,13 @@ const (
 	// quotaQueryTimeout bounds one size query, so a hung query cannot stop
 	// the sampler; a timed-out sample counts as a failed one.
 	quotaQueryTimeout = 10 * time.Second
+	// quotaSampleFailLimit failed samples in a row make the quota count as
+	// full, with the lanes and the relief of a full quota, until a sample
+	// succeeds. Every live read of a sample counts, also the read again
+	// after a pass; a read that failed because the sampler stops does not.
+	// At QuotaSampleInterval that is about 90 s after the last good sample
+	// at the earliest.
+	quotaSampleFailLimit = 3
 	// quotaReliefBudget bounds one compaction pass, so it ends before the
 	// next sample is due.
 	quotaReliefBudget = 20 * time.Second
@@ -316,9 +329,14 @@ type Quota struct {
 	committed atomic.Int64
 	base      atomic.Int64
 	full      atomic.Bool
+	// sizeUnknown is set after quotaSampleFailLimit failed samples in a row,
+	// and a good sample clears it. While it is set the quota counts as full.
+	sizeUnknown atomic.Bool
 	// marks are committed at the start of the previous two good samples, the
-	// older first. Sampler goroutine only.
-	marks [2]int64
+	// older first. sampleFails is the number of failed samples in a row.
+	// Sampler goroutine only.
+	marks       [2]int64
+	sampleFails int
 
 	control      *rate.Limiter
 	cleanupOps   *rate.Limiter
@@ -404,15 +422,23 @@ func (q *Quota) figure(add int64) int64 {
 	return live + q.written.Add(add) - base
 }
 
-// Full reports whether the figure is at or above the limit. etcd refuses a
+// Full reports whether the figure is at or above the limit, or the size is
+// unknown (quotaSampleFailLimit failed samples in a row). etcd refuses a
 // write when size + cost would pass the quota, and every put has a cost, so
 // "at the limit" already refuses.
-func (q *Quota) Full() bool { return q.limit > 0 && q.Figure() >= q.limit }
+func (q *Quota) Full() bool {
+	return q.limit > 0 && (q.sizeUnknown.Load() || q.Figure() >= q.limit)
+}
+
+// SizeUnknown reports whether the last quotaSampleFailLimit or more samples
+// failed in a row, so the quota counts as full whatever the figure.
+func (q *Quota) SizeUnknown() bool { return q.sizeUnknown.Load() }
 
 // reserveBelow reserves cost and keeps it when the figure without this write
-// (other writes' reservations included) is below the limit.
+// (other writes' reservations included) is below the limit and the size is
+// known.
 func (q *Quota) reserveBelow(cost int64) bool {
-	if q.figure(cost)-cost < q.limit {
+	if q.figure(cost)-cost < q.limit && !q.sizeUnknown.Load() {
 		return true
 	}
 	q.written.Add(-cost)
@@ -453,18 +479,23 @@ func (q *Quota) Observe(live int64) {
 	q.publish()
 }
 
-// publish sets the full and pending gauges from the figure and logs the two
-// transitions. The sampler also calls it after a failed sample, because the
-// written bytes alone can fill the quota.
+// publish sets the full and pending gauges from the figure and the unknown
+// size, and logs the two transitions. The sampler also calls it after a
+// failed sample, because the written bytes alone can fill the quota, and
+// that sample can make the size unknown.
 func (q *Quota) publish() {
 	figure := q.Figure()
-	full := figure >= q.limit
+	full := q.sizeUnknown.Load() || figure >= q.limit
 	metrics.QuotaFull.Set(boolGauge(full))
 	metrics.QuotaPendingBytes.Set(float64(q.Pending()))
 	if q.full.Swap(full) == full {
 		return
 	}
 	if full {
+		if figure < q.limit {
+			// full because the size is unknown; sampleFailed logged why
+			return
+		}
 		logrus.Infof("quota: live data is %d bytes, the limit is %d bytes. New keys are refused until live data is smaller than the limit; reads, deletes and updates that do not grow a value continue.", figure, q.limit)
 	} else {
 		logrus.Infof("quota: live data is %d bytes, below the limit of %d bytes. Puts are accepted again.", figure, q.limit)
@@ -486,9 +517,11 @@ func (q *Quota) ObservePhysical(size int64) {
 
 // Sample reads both figures once and records them. physical may be nil. A
 // failed read keeps the last value and is logged; it never clears the limit
-// and it does not move the written-bytes base. The returned error is the
-// live read's. A read that failed because ctx ended (shutdown) is returned
-// without a warning.
+// and it does not move the written-bytes base. quotaSampleFailLimit failed
+// live reads in a row make the quota count as full until a live read
+// succeeds. The returned error is the live read's. A read that failed
+// because ctx ended (shutdown) is returned without a warning, and it does
+// not count as a failed sample.
 func (q *Quota) Sample(ctx context.Context, live, physical SizeSource) error {
 	return q.sample(ctx, live, physical, true)
 }
@@ -514,6 +547,7 @@ func (q *Quota) sample(ctx context.Context, live, physical SizeSource, advance b
 		if ctx.Err() == nil {
 			metrics.QuotaSampleErrors.Inc()
 			logrus.Warnf("quota: cannot read the live data size: %v. The last value, %d bytes, and the bytes written since stay in use.", err, q.Live())
+			q.sampleFailed()
 		}
 		return err
 	}
@@ -527,8 +561,38 @@ func (q *Quota) sample(ctx context.Context, live, physical SizeSource, advance b
 		q.marks[0], q.marks[1] = q.marks[1], mark
 		metrics.QuotaLastSample.SetToCurrentTime()
 	}
+	// The size becomes known only after the new figure is stored, so a
+	// write that sees it known also sees this sample.
+	q.sampleSucceeded()
 	q.Observe(size)
 	return nil
+}
+
+// sampleFailed counts a failed live read. The one that makes
+// quotaSampleFailLimit in a row makes the size unknown, and the quota then
+// counts as full.
+func (q *Quota) sampleFailed() {
+	q.sampleFails++
+	metrics.QuotaConsecutiveSampleErrors.Set(float64(q.sampleFails))
+	if q.sampleFails != quotaSampleFailLimit {
+		return
+	}
+	q.sizeUnknown.Store(true)
+	logrus.Warnf("quota: %d size samples in a row failed. Until a sample succeeds, the database counts as full: new keys are refused; reads, deletes, watches and the rate-limited updates of a full quota continue.", q.sampleFails)
+	if q.limit > 0 {
+		q.publish()
+	}
+}
+
+// sampleSucceeded ends a row of failed live reads and makes the size known
+// again.
+func (q *Quota) sampleSucceeded() {
+	fails := q.sampleFails
+	q.sampleFails = 0
+	metrics.QuotaConsecutiveSampleErrors.Set(0)
+	if q.sizeUnknown.Swap(false) {
+		logrus.Infof("quota: a size sample succeeded after %d failed ones. The figure decides again: live data is %d bytes, the limit is %d bytes.", fails, q.Figure(), q.limit)
+	}
 }
 
 // quotaSampleHook runs between the two stores of a sample. A test seam for
