@@ -246,10 +246,11 @@ func (d *notifyingDialect) RefreshStats(ctx context.Context) error {
 			// reset before the next sample still shows as a decrease. They
 			// are at most the counts the watch reads, so a later sample
 			// sees no false decrease.
-			if w, ok := statsWatches.Load(d); ok {
-				w := w.(*statsWatch)
-				w.heapVac, w.toastVac = heap, toast
-				w.owed.Store(false)
+			if v, ok := statsWatches.Load(d); ok {
+				if w, ok := v.(*statsWatch); ok {
+					w.heapVac, w.toastVac = heap, toast
+					w.owed.Store(false)
+				}
 			}
 			return nil
 		}
