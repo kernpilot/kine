@@ -83,3 +83,16 @@ jobs:
         grep -q '^TestKubehzP3' <<<"$names" \
           || { echo "::error::no TestKubehzP3* test in ./pkg/drivers/pgsql/ (see kubehz/MERGE-GUIDE.md)"; exit 1; }
         go test -tags=test -count=1 -race -run 'TestKubehzP3' ./pkg/drivers/pgsql/
+
+    # kubehz fork: same guard for the P4 tests (kubehz/CHANGELOG.md, P4). The
+    # PostgreSQL one must pass, not skip.
+    - name: kubehz P4 tests exist and pass
+      run: |
+        set -euo pipefail
+        names=$(go test -tags=test -list 'TestKubehzP4' ./pkg/drivers/generic/)
+        grep -q '^TestKubehzP4' <<<"$names" \
+          || { echo "::error::no TestKubehzP4* test in ./pkg/drivers/generic/ (see kubehz/CHANGELOG.md)"; exit 1; }
+        go test -tags=test -count=1 -race -run 'TestKubehzP4' ./pkg/drivers/generic/
+        out=$(go test -tags=test -count=1 -v -run 'TestKubehzP4Postgres' ./pkg/drivers/pgsql/)
+        grep -q -- '--- PASS: TestKubehzP4Postgres' <<<"$out" \
+          || { echo "::error::TestKubehzP4Postgres did not pass (skipped or failed)"; echo "$out" | tail -20; exit 1; }
