@@ -12,6 +12,38 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+Nothing yet.
+
+---
+
+## Released `v0.17.0-kubehz.4` on upstream `v0.17.0` (`6fb95f5`); release commit `fdd57ca`
+
+Image `ghcr.io/kernpilot/kine:v0.17.0-kubehz.4`, index digest
+
+```
+sha256:d234d8d46d64bbd24ad7985b05edd6365d61b4bdce34ab3af6885ba7fd61e93f
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-11-08). The moving
+`kubehz` tag points at the same digest. `publish-kubehz.yml` built and
+signed it: keyless cosign signature, buildkit provenance and SBOM in the
+index, and an attested SPDX SBOM. The run's own verify gate passed (run
+`42503234800`). Consumers pin the digest above (`KUBEHZ_EXTCP_KINE_IMAGE`).
+
+This release adds the P2 revision for B481 (PR #8, below): a full cluster
+keeps running and frees space by itself. It also carries:
+- PR #6: `golang.org/x/text` v0.41.0 (GO-2026-6629).
+- PR #7: `golang.org/x/net` v0.60.0, otel v1.45.0 and `google.golang.org/grpc`
+  v1.83.2, in the main module and in the three `benchmarks/*` modules.
+- PR #11: the first CI run since Actions came back on the fork. It fixes
+  three revive findings in the P2 code and its test, and it takes upstream
+  `afd69e2`, which pins the Python `kubernetes` package of the test image.
+  Without it every integration driver failed. The upstream rebase drops
+  that part again.
+
+PR #8 merged on local gates only, because Actions was off on the fork. PR
+#11's CI (34 checks, every driver) is the first CI proof of the P2 revision.
+
 ### P2 revision — a full cluster keeps running and frees space by itself (B481)
 
 Adds `pkg/logstructured/sqllog/kubehz_relief.go`. Touches
