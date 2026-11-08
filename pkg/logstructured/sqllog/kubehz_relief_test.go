@@ -347,8 +347,11 @@ func TestKubehzP2ReliefNotStaleWithoutRefresher(t *testing.T) {
 // fields of those names hide the promoted methods.
 type plainReliefDialect struct {
 	*reliefDialect
-	RefreshStats, StatsOwed struct{}
+	RefreshStats, StatsOwed hiddenMethod
 }
+
+// hiddenMethod is the type of a field that hides a promoted method.
+type hiddenMethod struct{}
 
 // TestKubehzP2ReliefCancelledInBatch: a cancel that comes after the batch's
 // transaction began ends the pass before the delete: the transaction rolls

@@ -130,7 +130,7 @@ func (s *SQLLog) startPolling() {
 			return
 		}
 		logrus.Infof("quota: started the poller for the relief, which needs it")
-		for range values {
+		for range values { //nolint:revive // drain: the relief needs the poller running, not its events
 		}
 	}()
 }
