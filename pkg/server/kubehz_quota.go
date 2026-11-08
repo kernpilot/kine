@@ -50,7 +50,11 @@ package server
 //   exactly when full, because the check reads the key anyway. When full, an
 //   update that finds no live key counts key + value and takes the create
 //   rules: at the revision of the key's delete row it writes the key again
-//   (upstream issue k3s-io/kine#825), so it is a create. An update
+//   (upstream issue k3s-io/kine#825), so it is a create. When full, an update
+//   at a compare revision newer than the key's is charged as an update of
+//   the value read: a write at that revision can land before the insert, and
+//   after a delete the update writes the key again. Only an update at an
+//   older revision passes with no charge: it can never match. An update
 //   below the limit that shrinks a value is charged less than it writes, by
 //   at most the old value: for that gap alone, the stored data can pass the
 //   figure by up to L while no good sample shows it, with no time bound
@@ -809,14 +813,19 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 // row the backend writes the key again (since upstream ca3c2d5; upstream
 // issue k3s-io/kine#825). So it takes the create rules (admitControlCreate)
 // at a create's cost, key + value, and the reservation settles like any
-// update's. An update whose compare revision is not the current one passes
-// with no reservation: the backend answers it without a new row, and the
-// compare-and-swap means no other write can slip in between. One that would
-// write passes when the value does not grow by more than quotaGrowthSlack,
-// the figure with its exact cost (key + new + old) stays within its lane's
-// cap (control: the ceiling; cleanup: the ceiling less quotaControlReserve),
-// and its lane's bucket has room. It returns the reserved cost and "" when
-// it passes, else the refusal reason.
+// update's. An update whose compare revision is older than the key's passes
+// with no reservation: the newest row of a key only gets a higher id (or, when
+// compaction removes all rows of a deleted key, 0, which no update compares
+// with), so the backend writes no row. An update at the key's revision or a
+// newer one takes the update rules against the value read. A newer revision
+// matches when another write lands at that revision before the insert; when
+// that write is a delete, the update writes the key again (the same upstream
+// issue), and that row (key + new) costs less than the charge. Such an update
+// passes when the value does not grow by more than quotaGrowthSlack, the
+// figure with its exact cost (key + new + old) stays within its lane's cap
+// (control: the ceiling; cleanup: the ceiling less quotaControlReserve), and
+// its lane's bucket has room. It returns the reserved cost and "" when it
+// passes, else the refusal reason.
 func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string) {
 	_, cur, err := b.Backend.Get(ctx, key, 0, false)
 	if err != nil {
@@ -826,7 +835,7 @@ func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte
 		cost := int64(len(key) + len(value))
 		return cost, b.admitControlCreate(key, value, cost)
 	}
-	if cur.ModRevision != revision {
+	if revision < cur.ModRevision {
 		return 0, ""
 	}
 	if len(value)-len(cur.Value) > quotaGrowthSlack {

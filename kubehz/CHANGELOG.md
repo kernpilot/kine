@@ -277,6 +277,54 @@ both `TestKubehzP2UpdateAtDeleteRevision` cases fail.
 no such key passes without a charge. A separate change edits that guide; it
 must take this rule over.
 
+### P2 fix — an update at a newer compare revision is charged while full (upstream issue k3s-io/kine#825)
+
+Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
+comments, and `pkg/server/kubehz_quota_test.go`. This goes past the fix
+above, and it can be dropped on its own (it is a separate commit).
+
+**Why.** `admitUpdate` passed with no charge every update whose compare
+revision is not the key's current one. Its comment said that "the
+compare-and-swap means no other write can slip in between". That holds for
+an older revision, not for a newer one. The quota reads the key, then the
+backend runs the insert. If another write lands at exactly the compare
+revision in between, the compare matches. When that write is the client's
+own delete, the update writes the key again with any value (the same
+upstream issue), with no charge, no lane cap and no rate bucket. A lost
+attempt cost nothing, so a client could send updates at the next revisions
+while it deletes. A correct client does not send a newer revision: it
+compares with a revision it read.
+
+**What.** While full, an update at the key's revision or at a newer one
+takes the update rules against the value it read: growth of at most
+`quotaGrowthSlack` (64 bytes), the cost key + new + old, the lane caps and
+the buckets. If it writes the key again after a delete, the row holds key +
+new, which is less than the charge. An update at an older revision still
+passes with no reservation, because it can never match: the newest row of a
+key only gets a higher id. It goes back only to 0, when compaction removes
+all rows of a deleted key, and an update never compares with 0 (the server
+sends a compare with 0 to `Create`).
+
+**Effect on clients.** None for a client that compares with a revision it
+read. While full, an update at a newer revision that grows the value past
+the slack, or that its lane refuses, gets the no-space error, where before
+its compare failed.
+
+**Tests.** `TestKubehzP2UpdateAtNewerRevision`: a hook in the fake makes the
+delete land between the quota's read and the compare. A 1 MiB update at the
+next revision is refused before the backend; a small one is written at key
++ new + old; an update at an older revision reaches the backend, loses its
+compare and reserves nothing. The `TestKubehzP2Lanes` case "stale compare
+revision" is now "newer compare revision, grows" (refused). Mutation: with
+the old test (`cur.ModRevision != revision` passes free), that case and the
+"grows" and "no growth" cases of `TestKubehzP2UpdateAtNewerRevision` fail.
+
+**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAtNewerRevision' ./pkg/server/`.
+
+[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2, also says that an update at a
+stale compare revision passes without a charge. That is now true only for an
+older revision. The change that edits the guide must take this over too.
+
 ---
 
 ## Released `v0.17.0-kubehz.4` on upstream `v0.17.0` (`6fb95f5`); release commit `fdd57ca`

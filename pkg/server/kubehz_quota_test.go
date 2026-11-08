@@ -35,13 +35,17 @@ type quotaFake struct {
 	size      atomic.Int64
 	sizeErr   atomic.Pointer[error]
 	sizeReads atomic.Int64
-	// current is the value Get returns at revision 1; missing makes Get find
-	// no key; tombstone is then the revision of the key's delete row (0: the
-	// key never existed); createErr fails every Create, updateErr every
-	// Update.
+	// current is the value Get returns at revision modRev (0: revision 1);
+	// missing makes Get find no key; tombstone is then the revision of the
+	// key's delete row (0: the key never existed); onUpdate, when set, runs
+	// at the start of Update, before the compare (a write that lands between
+	// the quota's read and the insert); createErr fails every Create,
+	// updateErr every Update.
 	current   []byte
+	modRev    int64
 	missing   bool
 	tombstone int64
+	onUpdate  func(*quotaFake)
 	createErr error
 	updateErr error
 	// hold, when set, keeps the first Create inside the backend until it is
@@ -59,7 +63,15 @@ func (f *quotaFake) Get(context.Context, string, int64, bool) (int64, *KeyValue,
 	if f.missing {
 		return 1, nil, nil
 	}
-	return 1, &KeyValue{ModRevision: 1, Value: f.current}, nil
+	return 1, &KeyValue{ModRevision: f.live(), Value: f.current}, nil
+}
+
+// live is the revision of the key's live row.
+func (f *quotaFake) live() int64 {
+	if f.modRev == 0 {
+		return 1
+	}
+	return f.modRev
 }
 
 func (f *quotaFake) Create(_ context.Context, key string, _ []byte, _ int64) (int64, error) {
@@ -96,6 +108,9 @@ func (f *quotaFake) Update(_ context.Context, key string, _ []byte, revision, _ 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates = append(f.updates, key)
+	if f.onUpdate != nil {
+		f.onUpdate(f)
+	}
 	if f.updateErr != nil {
 		return 0, nil, false, f.updateErr
 	}
@@ -103,7 +118,7 @@ func (f *quotaFake) Update(_ context.Context, key string, _ []byte, revision, _ 
 	// since ca3c2d5): a row only when revision is the key's newest row. For a
 	// deleted key that is its delete row, so an update at that revision
 	// writes the key again (upstream issue k3s-io/kine#825).
-	newest := int64(1)
+	newest := f.live()
 	if f.missing {
 		newest = f.tombstone
 	}
@@ -467,8 +482,8 @@ func bytesOf(n int) []byte { return []byte(strings.Repeat("x", n)) }
 // value and a large control create are refused. An update that finds no live
 // key is a create (it can write the key again, upstream issue
 // k3s-io/kine#825): refused unless it is a small control key, which reserves
-// key + value. An update at a stale compare revision reaches the backend and
-// reserves nothing.
+// key + value. An update at a newer compare revision than the key's takes
+// the update rules (see TestKubehzP2UpdateAtNewerRevision).
 func TestKubehzP2Lanes(t *testing.T) {
 	ctx := context.Background()
 	const lease = "/registry/leases/kube-system/kube-controller-manager"
@@ -490,7 +505,7 @@ func TestKubehzP2Lanes(t *testing.T) {
 		{"other create", true, "/registry/configmaps/default/a", 0, 10, 0, false, false, false},
 		{"finalizer removal", false, "/registry/pods/default/a", 2000, 1990, 1, false, true, true},
 		{"other update grows", false, "/registry/pods/default/a", 10, 100, 1, false, false, false},
-		{"stale compare revision", false, "/registry/pods/default/a", 10, 1000, 2, false, true, false},
+		{"newer compare revision, grows", false, "/registry/pods/default/a", 10, 1000, 2, false, false, false},
 		{"no live key, at its delete revision", false, "/registry/pods/default/b", 0, 1000, 1, true, false, false},
 		{"small lease, no live key", false, "/registry/leases/default/gone", 0, 200, 1, true, true, true},
 		{"large lease, no live key", false, "/registry/leases/default/gone", 0, quotaControlMaxValue + 1, 1, true, false, false},
@@ -583,6 +598,58 @@ func TestKubehzP2UpdateAtDeleteRevision(t *testing.T) {
 		}
 		if len(fake.updates) != 2 {
 			t.Fatalf("updates that reached the backend: %v, want two", fake.updates)
+		}
+	})
+}
+
+// TestKubehzP2UpdateAtNewerRevision: an update whose compare revision is
+// newer than the key's writes when another write lands at that revision
+// between the quota's read and the insert. If that write is the client's own
+// delete, the update writes the key again with any value (upstream issue
+// k3s-io/kine#825). So while full it takes the rules of an update of the
+// value it read: a value that grows past the slack is refused before the
+// backend, a small one passes at key + new + old. An update at an older
+// revision can never write: it reaches the backend and reserves nothing.
+func TestKubehzP2UpdateAtNewerRevision(t *testing.T) {
+	ctx := context.Background()
+	const pod = "/registry/pods/default/a"
+	// the key is live at revision 1 when the quota reads it; the client's
+	// own delete lands at revision 2 before the insert
+	deleteFirst := func(f *quotaFake) { f.missing, f.tombstone = true, 2 }
+
+	t.Run("grows", func(t *testing.T) {
+		fake := &quotaFake{current: bytesOf(10), onUpdate: deleteFirst}
+		quota := fullQuota(t)
+		before := quota.Pending()
+		if _, _, _, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(1<<20), 2, 0); !isNoSpace(err) {
+			t.Fatalf("a 1 MiB update at the next revision: got %v, want %v", err, ErrNoSpace)
+		}
+		if len(fake.updates) != 0 || quota.Pending() != before {
+			t.Fatalf("updates that reached the backend %v, pending grew by %d; want none and 0", fake.updates, quota.Pending()-before)
+		}
+	})
+
+	t.Run("no growth", func(t *testing.T) {
+		fake := &quotaFake{current: bytesOf(10), onUpdate: deleteFirst}
+		quota := fullQuota(t)
+		before := quota.Pending()
+		if _, _, ok, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(10), 2, 0); err != nil || !ok {
+			t.Fatalf("a small update at the next revision: ok %v, %v; want it written", ok, err)
+		}
+		if want := int64(len(pod) + 10 + 10); quota.Pending()-before != want {
+			t.Fatalf("pending grew by %d, want %d (key + new + old)", quota.Pending()-before, want)
+		}
+	})
+
+	t.Run("older revision", func(t *testing.T) {
+		fake := &quotaFake{current: bytesOf(10), modRev: 5}
+		quota := fullQuota(t)
+		before := quota.Pending()
+		if _, _, ok, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(1<<20), 2, 0); err != nil || ok {
+			t.Fatalf("an update at an older revision: ok %v, %v; want a lost compare-and-swap", ok, err)
+		}
+		if len(fake.updates) != 1 || quota.Pending() != before {
+			t.Fatalf("updates that reached the backend %v, pending grew by %d; want one and 0", fake.updates, quota.Pending()-before)
 		}
 	})
 }
