@@ -188,12 +188,12 @@ func TestBackend_Get(t *testing.T) {
 	// Get at prior version.
 	rev, ent, err = b.Get(ctx, prefix("/a"), rev, false)
 	noErr(t, err)
-	expEqual(t, baseRev+4, rev) // Should be the requested older revision
+	expEqual(t, baseRev+5, rev) // Should be the latest revision
 	expEqual(t, prefix("/a"), ent.Key)
 	expEqual(t, "c", string(ent.Value))
 	expEqual(t, 0, ent.Lease)
-	expEqual(t, rev, ent.ModRevision)
-	expEqual(t, rev, ent.CreateRevision)
+	expEqual(t, rev, ent.ModRevision+1)
+	expEqual(t, rev, ent.CreateRevision+1)
 
 	rev, ent, err = b.Get(ctx, prefix("/a"), 0, false)
 	noErr(t, err)
@@ -373,7 +373,7 @@ func TestBackend_List(t *testing.T) {
 	// List the keys up to a revision.
 	rev, ents, err = b.List(ctx, prefix("/"), prefix("0"), 0, baseRev+3, false)
 	noErr(t, err)
-	expEqual(t, baseRev+3, rev)
+	expEqual(t, baseRev+7, rev)
 	expEqual(t, 3, len(ents))
 	expSortedKeys(t, ents)
 	expEqualKeys(t, []string{prefix("/a"), prefix("/a/b/c"), prefix("/b")}, ents)
@@ -401,61 +401,4 @@ func TestBackend_List(t *testing.T) {
 	expEqual(t, 3, len(ents))
 	expSortedKeys(t, ents)
 	expEqualKeys(t, []string{prefix("/c"), prefix("/d/a"), prefix("/d/b")}, ents)
-}
-
-func TestBackend_Watch(t *testing.T) {
-	logrus.SetLevel(logrus.TraceLevel)
-	logrus.SetOutput(t.Output())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	wg := &sync.WaitGroup{}
-
-	defer func() {
-		cancel()
-		wg.Wait()
-	}()
-
-	ns, nc, b := setupBackend(ctx, wg, t)
-	defer ns.Shutdown()
-	defer nc.Drain()
-	defer os.RemoveAll(ns.StoreDir())
-
-	prefix := func(key string) string {
-		return "/test" + key
-	}
-
-	baseRev, err := b.CurrentRevision(ctx)
-	noErr(t, err)
-
-	cctx, cancel := context.WithCancel(ctx)
-
-	rev1, _ := b.Create(ctx, prefix("/a"), nil, 0)
-	rev2, _ := b.Create(ctx, prefix("/a/1"), nil, 0)
-	rev1, _, _, _ = b.Update(ctx, prefix("/a"), nil, rev1, 0)
-	_, _, _, _ = b.Delete(ctx, prefix("/a"), rev1)
-	_, _, _, _ = b.Update(ctx, prefix("/a/1"), nil, rev2, 0)
-
-	wr := b.Watch(cctx, "/", "0", baseRev+1)
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-
-	var events []*kserver.Event
-	for es := range wr.Events {
-		events = append(events, es...)
-	}
-
-	expEqual(t, 5, len(events))
-
-	cctx, cancel = context.WithCancel(ctx)
-	wr = b.Watch(cctx, prefix("/a/"), prefix("/a0"), baseRev)
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-
-	events = make([]*kserver.Event, 0)
-
-	for es := range wr.Events {
-		events = append(events, es...)
-	}
-
-	expEqual(t, 2, len(events))
 }

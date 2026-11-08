@@ -1,4 +1,4 @@
-# Merge guide — how to rebase this fork onto new upstream kine
+# Merge guide — how to sync this fork with new upstream kine
 
 **Read this before resolving any conflict in this repository.** It is written for
 whoever (or whatever) does the merge, and it assumes no memory of why these
@@ -8,8 +8,36 @@ patches exist.
 
 | branch | what it is |
 |---|---|
-| `upstream-master` | a pristine mirror of `k3s-io/kine` master, kept on `origin`. Never edit it. |
-| `main` | `upstream-master` plus the patches below, plus `kubehz/` and `benchmarks/`. |
+| `upstream-master` | a pristine mirror of upstream `k3s-io/kine`, kept on `origin`: the commit of the last upstream release that was merged into `main`. Never edit it. |
+| `main` | upstream plus the patches below, plus `kubehz/` and `benchmarks/`. It only moves forward. |
+
+**An upstream sync is a merge.** The ruleset on `main` refuses a force
+push, so `main` is never rebased. To sync:
+
+1. Make a branch from `main`.
+2. Merge the newest upstream release tag into it. Use a release tag, not
+   upstream master.
+3. Resolve each conflict with the rules below.
+4. Run the gates and `benchmarks/verify-patches.sh`.
+5. Open a PR. It lands as a merge commit
+   (`gh pr merge <n> --merge --match-head-commit <sha>`), never as a squash:
+   a squash loses the upstream ancestry, and the next sync then meets every
+   upstream change again as a conflict. The ruleset on `main` allows both
+   methods (since 2026-11-08). Every other PR lands as a squash.
+6. After the PR lands, move `upstream-master` to the commit of the tag.
+   Not before: `benchmarks/build.sh` builds the stock binary from it.
+7. Bring each open fork PR up to date: merge the new `main` into its
+   branch, then re-run its gates.
+8. A sync is not a release. To ship it, tag `v<upstream>-kubehz.1`
+   (see "Image releases" below).
+
+The patches are tracked by their `KUBEHZ-PATCH` markers and by
+`CHANGELOG.md`, not by commit order. The history of `main` mixes upstream
+and fork commits. Grep `KUBEHZ-PATCH` to find every patch.
+
+**Current base.** Upstream `v0.17.5` (`f82bd25`), the newest release tag
+on 2026-11-08. PR 14 (branch `sync/v0.17.5`) merged it into `main`; P1
+was dropped in that sync (see `CHANGELOG.md`).
 
 A clone has only `origin` (this fork). The recipe below works from a fresh
 clone; skip the lines you already have.
@@ -18,18 +46,20 @@ clone; skip the lines you already have.
 git clone https://github.com/kernpilot/kine.git && cd kine
 git remote add upstream https://github.com/k3s-io/kine.git
 git fetch upstream --tags                       # k3s-io/kine
-git fetch origin upstream-master:upstream-master # the mirror branch, from origin
-git checkout upstream-master && git merge --ff-only upstream/master
-git push origin upstream-master
-git checkout main && git rebase upstream-master   # replays every fork commit (P1, docs, benchmarks)
+git checkout -b sync/<tag> origin/main
+git merge --no-ff <tag>                         # the newest upstream release tag
 # resolve using the rules below, then:
-go test ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/   # P1 unit tests, hermetic
-cd benchmarks && ./verify-patches.sh     # re-measures every claim in CHANGELOG.md
+go test -tags=test ./...                        # with CGO_ENABLED=1 and with 0
+cd benchmarks && ./setup.sh && ./verify-patches.sh   # re-measures every claim in CHANGELOG.md
+# open the PR; it lands as a merge commit. After it landed:
+git push origin '<tag>^{commit}:refs/heads/upstream-master'
 ```
 
 Dependabot branches on `origin` (`dependabot/...`) come from upstream's
 `.github/dependabot.yml` and track upstream's dependencies. Close them
-unmerged: upstream owns those bumps and they arrive with the next rebase.
+unmerged: upstream owns those bumps and they arrive with the next sync.
+
+To report a bug upstream or send a patch there, read `UPSTREAM.md` first.
 
 ## Rules for resolving a conflict here
 
@@ -68,80 +98,54 @@ nothing on another. Re-run, do not assume.
 
 ## The patches
 
-### P1 — cross-instance watch wake-up
+### P1 — cross-instance watch wake-up (dropped 2026-11-08)
 
-**Files** `pkg/drivers/pgsql/notify.go` (new, conflict-free),
-`pkg/drivers/pgsql/pgsql.go` (the `notifyingDialect` wrapper at the end of
-`New`), `pkg/logstructured/sqllog/sql.go` (the `external` channel and its
-`select` arm in `SQLLog.poll`).
+P1 woke the poll loop of a second kine instance on the same database
+through PostgreSQL `LISTEN`/`NOTIFY`. It was dropped on 2026-11-08 under
+rules 4 and 5:
+- No product runs more than one kine on one database. The KKP-lite kine
+  has one replica, the extCP HA tier is shelved, and managed state is one
+  kine per tenant.
+- On v0.17.5 its p99 claim did not reproduce: p50 about 20 ms against
+  709 ms stock, but p99 720 ms against 709 ms.
+- Upstream `ca3c2d5` moved every write to a path that P1 did not see. P1
+  needed a port, and without it P1 stopped with no error.
 
-**Tests** `pkg/drivers/pgsql/kubehz_notify_test.go` (`record`, payload
-parsing, the non-blocking forward, the reconnect backoff) and
-`pkg/logstructured/sqllog/kubehz_notify_test.go` (a fake dialect proving the
-`case <-external:` arm wakes `poll`). Both are hermetic; `unit.yml` fails
-when a `TestKubehzP1*` test is missing from either package, so dropping the
-patch means deleting the tests in the same commit.
-
-**Problem.** kine signals its own poll loop in-process on every insert, so a
-single instance wakes its watchers in milliseconds. That signal does not cross a
-process boundary. With two kine instances on one database, a watcher on the
-instance that did not receive the write waits for its 1 second fallback ticker.
-Measured: p50 **715 ms**, p99 **716 ms**, against 18/21 ms on the writing
-instance. Multi-replica kine is what Kamaji and k0smotron deploy.
-
-**Approach.** A notification carries no data — it only means "poll now", and
-that poll drains everything waiting. So one notification per interval is worth
-as much as one per row. This emits at most one `pg_notify` per 10 ms from a
-dedicated connection on a background goroutine; the write path pays a single
-atomic compare-and-swap.
-
-**Rejected alternative, do not reintroduce.** An `AFTER INSERT` trigger calling
-`pg_notify` per row is the obvious implementation and it is unusable: measured,
-it cut write throughput **96.8 %** (5076 → 163 writes/s) and pushed put p99 from
-39.5 ms to 876 ms, because every backend serialises on PostgreSQL's shared
-async-notification queue.
-
-**Measured** cross-instance watch p50 715.7 → 20.0 ms, p99 716.6 → 21.3 ms, with
-saturated write throughput unchanged (5076 → 5124/s, inside a 0.7 % noise
-floor). Confirmed through real apiservers in an HA topology: p50 499.6 → 15.2 ms,
-p99 1000.9 → 25.3 ms.
-
-**Invariant.** The 1 second poll ticker stays. `NOTIFY` fires on COMMIT and is
-not durable — a listener that reconnects cannot replay what it missed, so the
-channel may only make a poll happen sooner. Verified by terminating the LISTEN
-backend mid-run: **0 events lost**, p99 degraded to 712.9 ms for the reconnect
-window, then recovered. Without the ticker that same failure drops watch events
-silently, which is far worse than being late.
-
-**If it conflicts.** Keep upstream's `select{}` shape and re-add the
-`case <-external:` arm. `RevisionNotify()` is deliberately an *optional
-interface* asserted at the call site, not a method on `server.Dialect`, so the
-sqlite, mysql and nats drivers never see it — preserve that. If the dialect
-plumbing changes beyond easy repair, drop P1: it is a latency optimisation, not
-a correctness fix.
-
-**Re-verify** `benchmarks/run-cross.sh` (two kine instances, one database).
+The last version, ported to v0.17.5 with its tests, is on branch
+`archive/p1-port-v0.17.5` (`0f83a48`). `CHANGELOG.md` has the
+measurements, and the rejected per-row trigger (write throughput −96.8 %;
+do not use it again). If a product starts to run more than one kine on one
+database, start from that branch, and first fix its known limit: the
+notifier sends only the highest revision, so a lower revision that
+commits last in a burst waits for the ticker. Since v0.17.5,
+`--datastore-poll-interval` is a configuration alternative, at the cost of
+one poll query per interval while idle.
 
 ### P2 — per-database size limit (`--quota-bytes`)
 
 **Files** `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
 `pkg/drivers/pgsql/kubehz_quota.go`, `pkg/logstructured/sqllog/kubehz_relief.go`
 and `pkg/logstructured/kubehz_ttl.go` (new, conflict-free). Edits:
-`pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go` (the config field,
+`pkg/drivers/pgsql/pgsql.go` (the one-time `ANALYZE` in `New`, and the
+`quotaDialect` wrapper that `New` hands to `sqllog.New`; the type is in
+`kubehz_quota.go`), `pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go` (the config field,
 the wiring, the TTL delete timeout before `backend.Start`, and the test
 seams), `pkg/server/kv.go` (two log conditions),
 `pkg/logstructured/logstructured.go` (three forwarding methods, the TTL
 delete timeout field, and the TTL loop start: upstream's
 `go ttl.Run(ctx, l)` is `go ttlRun(ctx, l.ttlBackend())`, so the `ttl`
 import moved to `kubehz_ttl.go`) and `pkg/logstructured/sqllog/sql.go` (one
-forwarding method), and `go.mod` (`golang.org/x/time` is a direct
+forwarding method, and the `polledRev` field with its one store at the top
+of the poll loop: upstream removed the field in v0.17.1 and the relief
+needs it), and `go.mod` (`golang.org/x/time` is a direct
 dependency now). Tests `pkg/server/kubehz_quota_test.go`,
 `pkg/app/kubehz_quota_test.go`, `pkg/endpoint/kubehz_quota_test.go` (a
 real kine on sqlite through `Listen`, the B481 relief end to end),
 `pkg/drivers/pgsql/kubehz_quota_test.go`,
 `pkg/logstructured/kubehz_ttl_test.go` (the TTL delete timeout),
-`pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain) and
-`pkg/logstructured/sqllog/kubehz_relief_test.go` (the relief bounds),
+`pkg/logstructured/sqllog/kubehz_quota_test.go` (the forwarding chain),
+`pkg/logstructured/sqllog/kubehz_relief_test.go` (the relief bounds) with
+its fake dialect in `pkg/logstructured/sqllog/kubehz_dialect_test.go`,
 and `pkg/drivers/pgsql/kubehz_pgsql_test.go` against the PostgreSQL
 service `unit.yml` runs (skipped without `KINE_TEST_PGSQL_DSN`; it needs a
 role that may call `pg_stat_reset()`). `unit.yml` fails when they are missing.
@@ -185,8 +189,23 @@ which only feeds a gauge. The rules:
    token buckets: the control lane (`/registry/leases/`,
    `/registry/masterleases/` and kine's stand-in for the apiserver's
    compaction key, values up to 4 KiB, 100/s) and the cleanup lane (every
-   other key, 20/s and 4 MiB/s). An update that cannot write (no such key,
-   a stale compare revision) passes without a charge.
+   other key, 20/s and 4 MiB/s). An update passes only when its compare
+   revision is the revision that the check read (0 when the key has no live
+   row). The insert copies the old value from the row at the compare
+   revision, and rows do not change after the insert. So that row holds the
+   value that the check read, and the charge is exact. With no live row,
+   such an update is a create: key + value, under the create rules. The
+   check answers an update at any other revision itself, as a lost
+   compare-and-swap with the revision and the key as read (no key when it
+   has no live row). That is the answer `LogStructured.Update` gives, with
+   no error. The backend does not see the update. The apiserver then
+   retries as after any conflict, or reports a key with no live row as not
+   found. At an older revision, a compaction can make an older row of a key
+   the newest again, so the backend could write such an update with no
+   charge. At a newer revision, another write can land there before the
+   insert, and after a delete the update writes the key again (upstream
+   issue k3s-io/kine#825). That includes an update at the revision of a
+   deleted key's delete row.
 3. The ceiling is `2 × limit + 64 MiB`: a lane write passes only while
    figure + its cost stays at or below its lane's cap. Control creates stop
    at `limit + 16 MiB` (new Leases while full are few, so many are a fault
@@ -326,8 +345,8 @@ on-disk size of live rows, so it reads smaller than etcd's uncompressed
 in-use figure for the same objects. Catalog lookups only, no scan, no
 indexes or page overhead. `pgstattuple_approx` would be closer but needs an
 extension the tenant role cannot create. The source travels as the
-optional interface `server.LiveSizer`, asserted at the call site like
-`RevisionNotify` in P1: the pgsql `notifyingDialect` offers it, `SQLLog`
+optional interface `server.LiveSizer`, asserted at the call site: the
+pgsql `quotaDialect` offers it, `SQLLog`
 and `LogStructured` forward it, `endpoint.Listen` asks for it and falls
 back to `DbSize` when it gets nil (sqlite, the others). The relief travels
 the same way as `server.QuotaRelief` (`SQLLog` implements it,
@@ -408,7 +427,7 @@ operator's (CNPG volume and WAL limits).
 while below the limit: a write costs atomic operations. Only a write while
 full reads its key. A failed sample keeps the last value and never clears
 the limit. The first sample must succeed or kine does not start. On
-PostgreSQL the compared figure is live data: if a rebase loses a
+PostgreSQL the compared figure is live data: if a sync loses a
 forwarding method the limit silently becomes a file-size limit, which is
 why `TestKubehzP2LiveSizeChain` exists; if it loses the relief forward or
 the wiring, B481 comes back, which is why `TestKubehzP2ListenRelief`
@@ -442,15 +461,20 @@ re-measure. The test suite is the check.
 the flag table, re-add the one `Int64Flag`. If `endpoint.Listen` is
 restructured, keep upstream's order (backend `Start`, then `server.New`) and
 re-express the block: sample and relieve from the unwrapped backend, hand
-the wrapped one to `server.New`. The forwarding methods are additions next
+the wrapped one to `server.New`. If upstream changes what `pgsql.New`
+returns, keep upstream's return value and wrap the dialect in
+`quotaDialect` there: `TestKubehzP2P3Postgres` fails when the backend
+`New` returns offers no live figure. The forwarding methods are additions next
 to `DbSize`. Re-add them wherever `DbSize` lands. If upstream changes
 `Backend` so that puts no longer go through `Create`/`Update`, move the
 checks to whatever the new write methods are. The tests on a fake backend
 show which calls must be refused and which must pass. If upstream changes
-the poll loop's `polledRev`, the broadcaster's `Subscribe` (the relief
-starts the poller with it) or the transaction methods the relief uses
-(`CurrentRevision`, `GetCompactRevision`, `Compact`, `SetCompactRevision`),
-re-check `kubehz_relief.go` against the new contract. If upstream changes
+the poll loop, keep the `polledRev` store at the top of each iteration: it
+must only ever hold a revision whose events were sent. If upstream changes
+`SQLLog.Watch` (the relief starts the poller with it) or the transaction
+methods the relief uses (`CurrentRevision`, `GetCompactRevision`,
+`Compact(from, to)`, `SetCompactRevision`), re-check `kubehz_relief.go`
+against the new contract. If upstream changes
 `ErrKeyExists` or how an update reports a lost compare-and-swap, re-check
 which errors `quotaBackend` settles as written. If the PostgreSQL
 statistics flush intervals change (`PGSTAT_IDLE_INTERVAL`, 10 s), re-check
@@ -550,10 +574,10 @@ tenant extCP control planes pull it from THEIR machines with no credentials.
 
 Version scheme: `v<upstream>-kubehz.<n>`
 
-- `<upstream>` — the k3s-io/kine tag `main` is currently rebased onto
-  (`git describe --tags upstream-master`).
+- `<upstream>` — the k3s-io/kine release tag last merged into `main`
+  (`git describe --tags upstream-master`, after the sync landed).
 - `<n>` — the patchset release counter on that base. Bump it for any release
-  from the same base; a rebase onto a newer upstream resets it to 1.
+  from the same base; a sync with a newer upstream resets it to 1.
 
 Release = push the tag; `.github/workflows/publish-kubehz.yml` builds
 linux/amd64 + linux/arm64 (CGO_ENABLED=0 — drops only sqlite/dqlite; the

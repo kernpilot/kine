@@ -45,4 +45,4 @@ start kine-bench-walmem 55452 -v kine-walmem-data:/var/lib/postgresql \
   --tmpfs /pgwal:rw,size=8g,mode=0700 \
   -e PGDATA=/var/lib/postgresql/data -e POSTGRES_INITDB_WALDIR=/pgwal
 
-say "done. build the binaries with ./build.sh, then ./verify-patches.sh"
+say "done. run ./verify-patches.sh; ./build.sh builds the binaries the run-*.sh benchmarks compare"

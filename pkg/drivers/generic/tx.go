@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/k3s-io/kine/pkg/metrics"
 	"github.com/k3s-io/kine/pkg/query"
 	"github.com/k3s-io/kine/pkg/server"
@@ -15,24 +16,30 @@ import (
 var _ server.Transaction = (*Tx)(nil)
 
 type Tx struct {
+	i uuid.UUID
 	x *sql.Tx
 	d *Generic
 }
 
 func (d *Generic) BeginTx(ctx context.Context, opts *sql.TxOptions) (server.Transaction, error) {
-	logrus.Tracef("TX BEGIN")
+	if opts == nil {
+		opts = &sql.TxOptions{Isolation: sql.LevelRepeatableRead}
+	}
+	id := uuid.New()
+	logrus.Tracef("TX BEGIN id=%s, isolation='%s'", id, opts.Isolation)
 	x, err := d.DB.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 	return &Tx{
+		i: id,
 		x: x,
 		d: d,
 	}, nil
 }
 
 func (t *Tx) Commit() error {
-	logrus.Tracef("TX COMMIT")
+	logrus.Tracef("TX COMMIT id=%s", t.i)
 	return t.x.Commit()
 }
 
@@ -43,7 +50,7 @@ func (t *Tx) MustCommit() {
 }
 
 func (t *Tx) Rollback() error {
-	logrus.Tracef("TX ROLLBACK")
+	logrus.Tracef("TX ROLLBACK id=%s", t.i)
 	return t.x.Rollback()
 }
 
@@ -71,9 +78,9 @@ func (t *Tx) SetCompactRevision(ctx context.Context, revision int64) error {
 	return err
 }
 
-func (t *Tx) Compact(ctx context.Context, revision int64) (int64, error) {
-	logrus.Tracef("TX COMPACT %v", revision)
-	res, err := t.execute(ctx, t.d.CompactSQL, revision, revision)
+func (t *Tx) Compact(ctx context.Context, from, to int64) (int64, error) {
+	logrus.Tracef("TX COMPACT %v => %v", from, to)
+	res, err := t.execute(ctx, t.d.CompactSQL, from, to, from, to)
 	if err != nil {
 		return 0, err
 	}
@@ -94,6 +101,47 @@ func (t *Tx) CurrentRevision(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	return id, err
+}
+
+func (t *Tx) Insert(ctx context.Context, key string, created, deleted bool, previousRevision, ttl int64, value []byte) (id int64, err error) {
+	if t.d.TranslateErr != nil {
+		defer func() {
+			if err != nil {
+				err = t.d.TranslateErr(err)
+			}
+		}()
+	}
+
+	cols := []any{previousRevision, key, boolToInt(created), boolToInt(deleted), previousRevision, ttl, value, key, previousRevision}
+
+	if t.d.LastInsertID {
+		res, err := t.execute(ctx, t.d.InsertSQL, cols...)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if rows == 0 {
+			return 0, nil
+		}
+		return res.LastInsertId()
+	}
+
+	// KUBEHZ-PATCH P6 BEGIN — see kubehz/CHANGELOG.md, P6; upstream issue k3s-io/kine#824
+	// INTENT: the RETURNING insert (PostgreSQL) runs in this transaction, on
+	//   its connection. Upstream passes t.d.queryRow, the pool: then a write
+	//   holds two connections, and max-open concurrent writes wait for each
+	//   other until their contexts end.
+	// INVARIANT: a write holds one pool connection.
+	// INVARIANT: the kine_pkey retry still works. PostgreSQL aborts a
+	//   transaction on any error (25P02), so insertAtSavepoint rolls back to a
+	//   savepoint before each retry.
+	// CONFLICT: if upstream runs this insert in the transaction and keeps the
+	//   retry working, take upstream's side and drop P6.
+	return t.insertAtSavepoint(ctx, cols...)
+	// KUBEHZ-PATCH P6 END
 }
 
 func (t *Tx) query(ctx context.Context, sql *query.Named, args ...any) (result *sql.Rows, err error) {

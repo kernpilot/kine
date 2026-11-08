@@ -8,8 +8,8 @@ worth carrying?" by running it.
 
 ```bash
 ./setup.sh          # three PostgreSQL backends (disk, tmpfs, split-WAL)
-./build.sh          # kine-upstream + kine-patched, both from this repo
-./verify-patches.sh # re-measure every claim in the changelog
+./verify-patches.sh # re-measure every claim in the changelog (P2, P3)
+./build.sh          # kine-upstream + kine-patched, for the run-*.sh benchmarks
 ```
 
 ## The three backends, and why
