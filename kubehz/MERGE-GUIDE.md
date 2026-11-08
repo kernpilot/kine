@@ -59,6 +59,8 @@ Dependabot branches on `origin` (`dependabot/...`) come from upstream's
 `.github/dependabot.yml` and track upstream's dependencies. Close them
 unmerged: upstream owns those bumps and they arrive with the next sync.
 
+To report a bug upstream or send a patch there, read `UPSTREAM.md` first.
+
 ## Rules for resolving a conflict here
 
 1. **Find the marker.** Every in-place edit is wrapped in
