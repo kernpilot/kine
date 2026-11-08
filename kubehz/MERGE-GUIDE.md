@@ -19,22 +19,25 @@ push, so `main` is never rebased. To sync:
    upstream master.
 3. Resolve each conflict with the rules below.
 4. Run the gates and `benchmarks/verify-patches.sh`.
-5. Open a PR. It lands as a merge commit, never as a squash: a squash
-   loses the upstream ancestry, and the next sync then meets every
-   upstream change again as a conflict. The ruleset must allow merge
-   commits. On 2026-11-08 it allows only squash merges, so the owner must
-   allow the merge method before the first sync lands.
+5. Open a PR. It lands as a merge commit
+   (`gh pr merge <n> --merge --match-head-commit <sha>`), never as a squash:
+   a squash loses the upstream ancestry, and the next sync then meets every
+   upstream change again as a conflict. The ruleset on `main` allows both
+   methods (since 2026-11-08). Every other PR lands as a squash.
 6. After the PR lands, move `upstream-master` to the commit of the tag.
    Not before: `benchmarks/build.sh` builds the stock binary from it.
+7. Bring each open fork PR up to date: merge the new `main` into its
+   branch, then re-run its gates.
+8. A sync is not a release. To ship it, tag `v<upstream>-kubehz.1`
+   (see "Image releases" below).
 
 The patches are tracked by their `KUBEHZ-PATCH` markers and by
 `CHANGELOG.md`, not by commit order. The history of `main` mixes upstream
 and fork commits. Grep `KUBEHZ-PATCH` to find every patch.
 
 **Current base.** Upstream `v0.17.5` (`f82bd25`), the newest release tag
-on 2026-11-08, merged on branch `sync/v0.17.5`. Until that branch lands,
-`main` and `upstream-master` are on `v0.17.0` (`6fb95f5`). Branch
-`rebase/v0.17.5` has the same tree as one commit per patch, for review.
+on 2026-11-08. PR 14 (branch `sync/v0.17.5`) merged it into `main`; P1
+was dropped in that sync (see `CHANGELOG.md`).
 
 A clone has only `origin` (this fork). The recipe below works from a fresh
 clone; skip the lines you already have.
@@ -55,6 +58,8 @@ git push origin '<tag>^{commit}:refs/heads/upstream-master'
 Dependabot branches on `origin` (`dependabot/...`) come from upstream's
 `.github/dependabot.yml` and track upstream's dependencies. Close them
 unmerged: upstream owns those bumps and they arrive with the next sync.
+
+To report a bug upstream or send a patch there, read `UPSTREAM.md` first.
 
 ## Rules for resolving a conflict here
 
