@@ -113,7 +113,8 @@ func joinRelief(first, then error) error {
 // stops (pkg/broadcaster), so this pass compacts nothing and a later one can.
 // The start runs in its own goroutine, one at a time per log: its revision
 // read runs under the log's context with no deadline and holds the
-// broadcaster's lock, and the sampler must not wait for it. The subscription
+// broadcaster's lock, and the sampler must not wait for it. It goes through
+// SQLLog.Watch, so the poller is the one every watch shares. The subscription
 // is drained and never read; a slow reader is dropped by the broadcaster,
 // which leaves the poller running.
 func (s *SQLLog) startPolling() {
@@ -122,15 +123,17 @@ func (s *SQLLog) startPolling() {
 	}
 	go func() {
 		defer pollerStarts.Delete(s)
-		values, err := s.broadcaster.Subscribe(s.ctx, s.startWatch)
-		if err != nil {
+		// Watch is upstream's start path; it logs the error and returns nil
+		// when the start failed.
+		values := s.Watch(s.ctx)
+		if values == nil {
 			if s.ctx.Err() == nil {
-				logrus.Warnf("quota: the relief needs the poller, and starting it failed: %v", err)
+				logrus.Warnf("quota: the relief needs the poller, and starting it failed")
 			}
 			return
 		}
 		logrus.Infof("quota: started the poller for the relief, which needs it")
-		for range values {
+		for range values { //nolint:revive // drain: the relief needs the poller running, not its events
 		}
 	}()
 }
@@ -161,7 +164,9 @@ func (s *SQLLog) reliefBatch(ctx context.Context, target int64) (done bool, rows
 	if s.compactBatchSize > 0 {
 		batch = min(batch, compactRev+s.compactBatchSize)
 	}
-	if rows, err = t.Compact(ctx, batch); err != nil {
+	// Compact deletes the rows in (compactRev, batch]; the rows up to
+	// compactRev went in earlier passes (upstream 80f2963).
+	if rows, err = t.Compact(ctx, compactRev, batch); err != nil {
 		return true, 0, 0, current, fmt.Errorf("compacting to revision %d: %w", batch, err)
 	}
 	if err := t.SetCompactRevision(ctx, batch); err != nil {

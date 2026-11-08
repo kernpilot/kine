@@ -233,6 +233,497 @@ whole job once per image of a matrix, `postgres:17.11` and
 job name carries the image (`Unit Tests (postgres:18.4)`). No branch rule
 requires the old name.
 
+---
+
+## Released `v0.17.5-kubehz.1` on upstream `v0.17.5` (`f82bd25`); release commit `4780507`
+
+Image `ghcr.io/kernpilot/kine:v0.17.5-kubehz.1`, index digest
+
+```
+sha256:b1867214ddfda096a1741fe277ac2878e2ec4145c8347f552fc3109acd9f3810
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-11-08). The moving
+`kubehz` tag points at the same digest. `publish-kubehz.yml` built and
+signed it: keyless cosign signature, buildkit provenance and SBOM in the
+index, and an attested SPDX SBOM. The run's own verify gate passed (run
+`42533521321`, identity `publish-kubehz.yml@refs/tags/v0.17.5-kubehz.1`).
+Consumers pin the digest above (`KUBEHZ_EXTCP_KINE_IMAGE`).
+
+This is the first release on upstream `v0.17.5`. It carries:
+- PR #14: the sync with upstream `v0.17.5` as a merge commit (below).
+- PR #15: the merge guide after the sync, and `UPSTREAM.md`.
+- PR #16: P6 (a write holds one pool connection) and the P2 fixes for an
+  update while full (below).
+
+### Sync with upstream `v0.17.5` (`f82bd25`)
+
+Upstream released `v0.17.5` on 2026-11-05. It is the newest release tag.
+On 2026-11-08 upstream master was at the same commit. The fork was on
+`v0.17.0` (`6fb95f5`), so 85 upstream commits are new.
+
+**How it lands.** The ruleset on `main` refuses a force push, so the sync
+is a merge (MERGE-GUIDE.md, "The model"). Branch `sync/v0.17.5` has one
+merge commit. Its parents are `main` (`f0dab20`) and `v0.17.5`. Branch
+`rebase/v0.17.5` has the same tree as a replay of the 27 fork commits onto
+`v0.17.5`, one commit per fork commit, for review. Its last commits carry
+the patches onto the new interfaces and drop P1 (below). The merge commit
+takes that tree, so `git diff rebase/v0.17.5 sync/v0.17.5` is empty. The
+sync must land as a merge commit. A squash loses the upstream ancestry.
+
+**Conflicts.** The merge of `v0.17.5` into `main` conflicts in `go.mod`,
+`go.sum`, `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`.
+The replay found them commit by commit (original commit, file,
+resolution):
+- `02bd318` (P1), `pkg/drivers/pgsql/pgsql.go`, the end of `New`: keep the
+  wrapper, remove the `dialect.Migrate` call (upstream `89a57ad` removed
+  migrations), and call `sqllog.New(backend, wg, cfg)`.
+- `02bd318` (P1), `pkg/logstructured/sqllog/sql.go`, the start of the poll
+  loop: keep upstream's `POLL START` trace line and the P1 block.
+- `5a0298b` and `a390482`, `pkg/drivers/pgsql/pgsql.go`: the marker blocks
+  next to the removed `Migrate` call. Keep the fork side without `Migrate`.
+- `0ccb433`, `7c8a4f7` and `37f39d3`, `go.mod` and `go.sum`: keep the
+  upstream side. Upstream is at or above every floor these commits set.
+  `37f39d3` keeps `golang.org/x/time` as a direct dependency.
+
+All other commits applied with no conflict. Upstream `afd69e2` (the
+`kubernetes` pin in `Dockerfile.test`) is in `v0.17.5`, so the copy that
+PR 11 took became empty and dropped. `Dockerfile.test` and `go.sum` are
+now equal to upstream. `go.mod` differs only in `golang.org/x/time`, which
+is direct. The main module has grpc v1.85.0, `golang.org/x/net` v0.61.0,
+`golang.org/x/text` v0.43.0 and otel v1.46.0, above every floor.
+
+**Upstream changes that touch the patches.**
+- `ca3c2d5` (Optimize create/update/delete txn): every write now goes
+  through `SQLLog.Append`, which runs `BeginTx`, `Transaction.Insert` and
+  `Commit`. The insert statement itself compares the newest revision of
+  the key. `Dialect.Insert` has no caller. P1 recorded each revision in
+  `Dialect.Insert`, so a plain replay builds and passes every hermetic P1
+  test, but never sends a NOTIFY (see "P1 dropped"). P2's TTL delete
+  timeout stays: a statement that stops after its snapshot can still
+  delete a newer value after a relief pass.
+- `22ab6ec` (Check max sent revision instead of using WaitForSyncTo): it
+  removed `SQLLog.polledRev`. The P2 relief needs that revision, so it is a
+  marked P2 field again, stored at the top of each poll iteration.
+- `6a267d5`: the broadcaster's `Subscribe` is not exported. The relief
+  starts the poller through `SQLLog.Watch`.
+- `80f2963`: `Transaction.Compact` takes both bounds. The relief compacts
+  `(compactRev, batch]`.
+- `3425d74`: `--datastore-poll-interval` (default 1 s). Test configurations
+  must set it, because zero is refused.
+- `pkg/server` imports package `query` now. The P2 size-query helper is
+  `querySize`.
+
+**Markers.** `main` has 49 in code, 9 of them P1. This tree has 46 in
+code, none P1. The six new ones are P2: the `polledRev` field (BEGIN, END)
+and its store, the `quotaDialect` return in `pgsql.New` (BEGIN, END), and
+the header of `kubehz_dialect_test.go`.
+
+**Gates** (Go 1.26.9, on this tree). `go build ./...`, `go vet ./...` and
+`go vet -tags=test ./...`, each with `CGO_ENABLED=1` and `0`.
+`go test -cover -tags=test -count=1 ./...` with `CGO_ENABLED=1` and `0`:
+11 packages ok, none failed. The P2 and P3 tests with `-race` (`-run
+'TestKubehzP2|TestKubehzP3'` over `pkg/drivers/pgsql`, `pkg/server`,
+`pkg/app`, `pkg/endpoint`, `pkg/logstructured` and its `sqllog`) against
+PostgreSQL 17.11 and 18.6: 92 passed and 0 skipped on each, live-size
+ratio 1.006. golangci-lint v2.10.1: 0 issues.
+`SKIP_LINT=1 ./scripts/validate` passes. `go mod tidy -diff` shows no
+change. The four `benchmarks/*` modules build and vet.
+`benchmarks/verify-patches.sh` on PostgreSQL 18.6 passes (ratio 1.006).
+Mutation: with the plain dialect in `pgsql.New`,
+`TestKubehzP2P3Postgres` fails.
+
+**`verify-patches.sh`.** It now runs `TestKubehzP2P3Postgres` against
+`kine-bench-pg` and prints the P2 live-size ratio next to the recorded
+one. The P1 measurement went with P1. While P1 was measured, a failed run
+passed on the figures of an earlier run, because the result files are
+tracked. `703beb2` on `rebase/v0.17.5` fixed that before the drop.
+
+### P1 dropped — cross-instance watch wake-up
+
+Owner decision on 2026-11-08, under MERGE-GUIDE rules 4 ("when in doubt,
+drop the patch") and 5 ("re-measure before believing").
+
+**Why.**
+- No product runs more than one kine on one database. The KKP-lite kine
+  has one replica, the extCP HA tier is shelved, and managed state is one
+  kine per tenant.
+- On v0.17.5 the p99 claim does not reproduce. `run-cross.sh`, PostgreSQL
+  18, 2 kine instances, 4 writers at 1/s, 16 watchers, 60 s. The stock
+  binary gave p50 707.0 / p99 708.6 ms. p50 / p95 / p99 in ms:
+
+  | run | `v0.17.0-kubehz.4` (`fdd57ca`) | P1 ported to v0.17.5 |
+  |---|---|---|
+  | 1 | 21.4 / 42.3 / 718.8 | 17.6 / 718.9 / 720.2 |
+  | 2 | 37.4 / 497.9 / 718.9 | 19.1 / 719.0 / 720.2 |
+  | 3 | 19.6 / 21.0 / 39.4 | 19.0 / 29.3 / 719.8 |
+  | traced, 30 s | 16.7 / 26.8 / 27.1 | 20.5 / 30.8 / 730.3 |
+
+  p50 stays near 20 ms against 709 ms, but p99 is 720 ms against 709 ms.
+  The notifier sends only the highest revision. With concurrent writers a
+  lower revision can commit after a higher one; the other instance then
+  finds a gap it cannot fill, and when that commit is the last of a burst
+  it waits for its ticker. The traced runs had 5 gaps (2 failed fills) on
+  `v0.17.0-kubehz.4` and 16 gaps (7 failed fills) on v0.17.5, where the
+  separate `COMMIT` round trip of `ca3c2d5` makes such commits more
+  frequent.
+- `ca3c2d5` moved every write to a path that P1 did not see. P1 needed a
+  port, and a replay without it stopped P1 with no error.
+
+**Removed.** `pkg/drivers/pgsql/notify.go`; the notifier wiring and the
+`notifyingDialect` and `notifyingTx` types in `pkg/drivers/pgsql/pgsql.go`;
+the `external` channel and its `select` arm in `SQLLog.poll`; the P1 tests
+(both `kubehz_notify_test.go` files and `TestKubehzP1PostgresNotify`); the
+P1 step in `unit.yml`; and the P1 measurement in `verify-patches.sh`.
+`pkg/logstructured/sqllog/sql.go` is upstream's again, except for the P2
+lines.
+
+**What P2 kept.** P2's dialect methods (`LiveSize`, `StatsOwed`,
+`RefreshStats`) were on `notifyingDialect`. They are on `quotaDialect` now
+(`pkg/drivers/pgsql/kubehz_quota.go`), which only embeds
+`*generic.Generic`. `pgsql.New` hands it to `sqllog.New` in a P2 marker
+block. `TestKubehzP2P3Postgres` fails when `New` hands over the plain
+dialect. The hermetic sqllog P2 tests embedded the P1 fake dialect. It is
+`fakeDialect` in `pkg/logstructured/sqllog/kubehz_dialect_test.go` now,
+with the same behaviour.
+
+**Effect.** With two kine instances on one database, a watcher on the
+instance that did not get the write waits for its poll ticker again: up
+to `--datastore-poll-interval` (default 1 s). That is upstream's
+behaviour.
+
+**Archive.** Branch `archive/p1-port-v0.17.5` (`0f83a48`) has P1 ported to
+v0.17.5 with its tests. There it passed build, vet, the tests with and
+without cgo, `-race` on PostgreSQL 17.11 and 18.6, and golangci-lint. The
+last release with P1 is `v0.17.0-kubehz.4` (`fdd57ca`). The per-row
+trigger that the P1 sections below reject (write throughput −96.8 %) stays
+rejected.
+
+### P6 — a write holds one pool connection (upstream issue k3s-io/kine#824)
+
+Adds `pkg/drivers/generic/kubehz_tx.go`. Touches `Tx.Insert` in
+`pkg/drivers/generic/tx.go` (the `return` of the RETURNING branch, in a
+marker block). Tests `pkg/drivers/generic/kubehz_tx_test.go` (hermetic) and
+`pkg/drivers/pgsql/kubehz_tx_test.go` (a real PostgreSQL, gated on
+`KINE_TEST_PGSQL_DSN`, in its own database `kine_kubehz_p6_test`).
+`unit.yml` fails when the P6 tests are missing or when the PostgreSQL one
+skips. MERGE-GUIDE.md has no P6 section yet; this entry is the record until
+it has one. The id is P6 because the open fork PR kernpilot/kine#9
+(`feat/managed-state-kine`) takes P4 and P5.
+
+**Why.** Since upstream `ca3c2d5`, `SQLLog.Append` opens a READ COMMITTED
+transaction and calls `Transaction.Insert`. On the drivers without
+`LastInsertID` (PostgreSQL, and CockroachDB through the pgsql driver)
+`Tx.Insert` gave `retryInsert` the pool's `queryRow`, not the
+transaction's. The insert then ran autocommitted on a second connection
+while the empty transaction held the first. With
+`--datastore-max-open-connections` N, N concurrent writes each hold a
+transaction and wait for a second connection, so every write stalls until
+its context ends. With N = 1 no write completes. The extCP kine runs with
+8. The MySQL and SQLite branch (`t.execute`) was correct. Upstream master
+still had this on 2026-11-08.
+
+**What.** The RETURNING insert runs on the transaction's connection. A
+plain switch to the transaction's `queryRow` is not enough: `retryInsert`
+retries a unique violation of `kine_pkey` (a gap fill took the id that the
+sequence gave), and in a PostgreSQL transaction the first error aborts every
+later statement (SQLSTATE 25P02), so the retry always fails. Each attempt
+therefore starts at `SAVEPOINT kine_insert`, and a retry first runs
+`ROLLBACK TO SAVEPOINT kine_insert`. The retried insert takes a new
+snapshot and the next id, as on the pool. `retryInsert` and the
+LastInsertID branch stay upstream's. The options that were not taken (a
+restart of the transaction, a retry loop in `Append`, no transaction for
+PostgreSQL) changed more upstream code or held only while the insert is the
+first statement of its transaction.
+
+**Cost.** One more round trip per PostgreSQL write (the `SAVEPOINT`; pgx
+sends a statement with no arguments in one round trip) and one subtransaction
+per write. One subtransaction per transaction stays far below PostgreSQL's
+cache of 64 per backend, so there is no overflow. On a PostgreSQL 18.4 in
+docker on a loaded host, 3000 sequential creates took 7.5 and 14.5 ms per
+write with P6, and 10.4 and 14.6 ms with upstream's line (two runs each,
+taken in turn). The commit's flush to disk is most of that time, and the
+extra round trip did not show above the noise. Not measured: a database
+over a network link, where each write takes one more round-trip time.
+
+**Measured.** `TestKubehzP6Postgres` passes on PostgreSQL 18.4 and 17.11.
+With upstream's line its three phases fail on PostgreSQL 18.4, each with
+`context deadline exceeded` (after 5, 5 and 10 s).
+
+**Fake.** The fake driver checks the compare before the insert takes an id
+(an insert that does not match takes none), sees all rows of the statement
+(committed and its own), and enforces kine's unique index on (name,
+prev_revision) besides `kine_pkey`. Not tested: a retry that runs out of
+attempts. Upstream's linear backoff makes the 20 attempts take about 19 s.
+Its rollback is `Append`'s, and it is not changed by P6.
+
+**Re-check** `go test -tags=test -race -run TestKubehzP6 ./pkg/drivers/generic/`,
+and with `KINE_TEST_PGSQL_DSN` set,
+`go test -tags=test -v -run TestKubehzP6Postgres ./pkg/drivers/pgsql/`.
+Mutations: with upstream's line (the pool's `queryRow`),
+`TestKubehzP6OneConnection` (both pool sizes), `TestKubehzP6ConcurrentWrites`
+and `TestKubehzP6RetryInTransaction` fail, and so do the three phases of
+`TestKubehzP6Postgres`. With the plain switch (the transaction's
+`queryRow`, no savepoint), `TestKubehzP6RetryInTransaction` fails with
+25P02, and the `kine_pkey` phase of `TestKubehzP6Postgres` finds no key
+after the create (`LogStructured.Create` reports a failed insert as
+revision 0 with no error, so the test reads the key back).
+`TestKubehzP6LastInsertIDInTransaction` passes on all three: the MySQL and
+SQLite branch did not change.
+
+**If it conflicts.** If upstream runs this insert in the transaction and
+keeps the `kine_pkey` retry working (a savepoint, a restart of the
+transaction, or a retry in `Append`), take upstream's side and drop P6, with
+its tests. Then `TestKubehzP6Postgres` is the check that upstream's fix holds
+on a pool of one connection.
+
+### P2 fix — an update with no live key is a create while full (upstream issue k3s-io/kine#825)
+
+Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
+comments, and `pkg/server/kubehz_quota_test.go`.
+
+**Why.** Since upstream `ca3c2d5`, `LogStructured.Update` does not read the
+key before its insert. The insert statement writes when the newest row of
+the key (`MAX(id)`) has the compare revision, and for a deleted key that row
+is its delete row. So an update at the revision of the delete writes a live
+row again, with any value (upstream issue k3s-io/kine#825). P2 assumed that
+an update that finds no live key writes nothing. While full it passed such
+an update with no charge: no growth check, no lane cap and no rate bucket.
+A client could delete a key and update it at the delete's revision, again
+and again, while full.
+
+**Measured** on PostgreSQL 18.4 and 17.11 with a one-off test through
+`LogStructured`: a create (revision 1), a delete (revision 2), then an
+update at revision 2 returns ok at revision 3. The key is live again with
+the new value and `CreateRevision` 0. Its row has `created = 0`,
+`create_revision` NULL, `prev_revision` 2 (the delete row) and `old_value`
+NULL. In etcd the compare fails: a deleted key compares as mod revision 0.
+
+**What.** While full, an update that finds no live key passes only when it
+compares the revision 0. It is then a create: the create rules
+(`admitControlCreate`: a control key with a value of at most 4 KiB, the
+create cap, the control bucket) at a create's cost, key + value. The update
+at the delete revision is refused, for a small control key too. The
+reservation settles as any update's does: a write keeps it, a lost
+compare-and-swap gives it back. Below the limit nothing changes (key + 2 ×
+value). As first written (`40f4ca8`), the create rules applied at any
+compare revision, so a small Lease passed at its delete revision. The review
+round narrowed that to the revision read (the next entry), because another
+write can land at a compare revision that the quota did not read.
+
+**Effect on clients.** Only while full: an update of a deleted key now gets
+the no-space error, where before its compare failed. An apiserver update of
+an object that another client deleted meanwhile then fails with a server
+error, where before it got "not found". A retry gets "not found" when the
+apiserver has seen the delete. (Superseded by the last P2 fix entry below:
+such an update now gets a failed compare with no key, and the apiserver
+reports "not found".)
+
+**Tests.** The fake backend enforces the real contract: an update at the
+revision of a deleted key's delete row writes a row, at the next revision.
+`TestKubehzP2Lanes` has cases for an update at the delete revision of a key
+with no live row (refused, for a Pod and for a small Lease) and for a
+small Lease with no row at the compare revision 0 (passes at key + value).
+`TestKubehzP2UpdateAtDeleteRevision` sends the apiserver's update
+transaction at the delete revision three times, and a 200-byte and a 1 MiB
+update, for a Pod and for a Lease: each is refused before the backend, with
+no reservation. Below the limit the update at the delete revision 7 writes
+revision 8, and an update at 8 writes revision 9. Mutation (against
+`40f4ca8`'s first tests): with the old `cur == nil` branch (no charge, no
+refusal), 3 `TestKubehzP2Lanes` cases and both
+`TestKubehzP2UpdateAtDeleteRevision` cases failed.
+
+**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAtDeleteRevision' ./pkg/server/`.
+
+### P2 fix — while full, an update passes only at the revision the quota read (upstream issue k3s-io/kine#825)
+
+Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
+comments, the help text of `kine_quota_refused_total` (a new reason,
+`revision`), `pkg/server/kubehz_quota_test.go`, and
+[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2. It replaces the rule of
+`d31cd11`, which charged an update at a newer compare revision from the
+value the quota read.
+
+**Why.** The quota reads the key, then the backend runs the insert. An
+update whose compare revision is newer than the one read matches when
+another write lands at exactly that revision in between. The insert then
+copies its old value from that write's row, not from the value the quota
+read. So a charge from the read value misses bytes, and the growth check
+misses growth. The review (Astra) gave three schedules. A 74-byte update
+lands at the compare revision of a 10-byte update: 64 bytes are not
+charged. A 4 KiB Lease create lands at the compare revision of an update of
+a missing Lease: 4096 bytes are not charged. A shrink to 10 bytes lands at
+the compare revision of a 1000-byte update: the value grows by 990 bytes,
+past the 64-byte slack. When the write that lands is the client's own
+delete, the update writes the key again with any value.
+
+**What.** While full, an update passes only when its compare revision is the
+revision the quota read: the key's mod revision, or 0 when it has no live
+row. Upstream's insert statement copies the old value from the row with the
+compare revision (`ikv` in `insertSQL`), and kine never changes the value of
+a row after the insert (its only `UPDATE` sets `prev_revision` of
+`compact_rev_key`). So at the revision read, the row written holds exactly
+the value read, or the compare fails, and the charge key + new + old is
+exact. With no live row, the update at 0 is a create (key + value, the
+create rules). The quota answers an update at an older revision itself, as
+a lost compare-and-swap, and the backend never sees it (see "Older
+revisions" below). Every other update is refused, with the reason
+`revision`. Below the limit nothing changes. (Superseded by the next entry:
+the quota answers those updates as a lost compare-and-swap too, and the
+reason `revision` is removed.)
+
+**Older revisions.** As first written (`3ffdb3c`), an update at an older
+revision went to the backend with no reservation, on the claim that it can
+never match. The second review (Astra) showed that the newest row of a key
+can fall back after compaction. An insert that started before a compaction
+can add a row whose `prev_revision` the compaction removed (the unique
+index entry for (name, 1) belonged to a deleted row): rows 3 (live) and 4
+(prev_revision 1). The quota reads row 4 and passes an update at 3 free. A
+delete writes row 5, a compaction removes rows 4 and 5, and row 3 is the
+newest again: the update writes any size, with no charge. Now, while full,
+the quota answers such an update as `LogStructured.Update` answers a lost
+compare-and-swap (`pkg/logstructured/logstructured.go:200`: the current
+revision, the live key, not updated). `LimitedServer.update`
+(`pkg/server/update.go:54`) then answers the transaction with
+`Succeeded: false` and a range response that holds the key, as for any
+failed compare. Below the limit the update still goes to the backend.
+
+**Effect on clients.** None for an update that compares with the revision it
+read, which is what the apiserver sends. An update at an older revision
+gets the same failed compare as before, so the apiserver's retry after a
+conflict works while full. The key in that answer is the one the quota
+read. While full, an update at a newer revision gets the no-space error,
+where before its compare failed (or, with `d31cd11`, it took the update
+rules). (Superseded by the next entry: it gets a failed compare.)
+
+**Tests.** The fake backend keeps rows like the kine table: each write adds
+a row at the next revision, an update copies the old value from the row at
+its compare revision, and no row changes. (The review found that the fake
+returned fixed revisions and kept no old value, so a refund test passed for
+the wrong reason.) `TestKubehzP2UpdateAtNewerRevision` lands each of the
+three schedules, and the client's own delete, between the quota's read and
+the insert. Each case fails when the update writes a row that its
+reservation does not cover, grows the value past the slack, or reaches the
+backend. A write that lands before an update at the revision read makes its
+compare fail, with nothing reserved. `TestKubehzP2UpdateAtOlderRevision`
+holds the forked history above. Its update transaction at the older
+revision gets `Succeeded: false` with the key at revision 4, and the backend
+sees no update. With the compaction landed before the insert, the update
+writes nothing. On the production code of `bde9682`, and with the
+lost-compare answer removed by hand, both subtests fail: "updates that
+reached the backend [/registry/pods/default/a]" and "the update wrote a row
+of 1048610 bytes and reserved 0". `TestKubehzP2Lanes` checks that each update
+that writes is charged exactly its row, and has the new case "newer compare
+revision, no growth" (refused). `TestKubehzP2Ceiling` and
+`TestKubehzP2LaneRate` update at the revision of the write before. With the
+production code of `8e9d2fa`, and with the refusal removed by hand, these
+fail: the Lanes cases "newer compare revision, no growth" and "small lease,
+no live key, at its delete revision", the Lease case of
+`TestKubehzP2UpdateAtDeleteRevision`, and the four landing cases of
+`TestKubehzP2UpdateAtNewerRevision` ("64 bytes not charged", "4096 bytes not
+charged", "grew the live value by 990 bytes", and the delete).
+
+**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAt|TestKubehzP2Ceiling|TestKubehzP2LaneRate' ./pkg/server/`
+(`TestKubehzP2UpdateAt` matches the delete, newer and older revision
+tests).
+
+### P2 fix — while full, an update at a revision the quota did not read gets a lost compare (upstream issue k3s-io/kine#825)
+
+Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
+comments, the help text of `kine_quota_refused_total` (the reason
+`revision` is removed), `pkg/server/kubehz_quota_test.go`, and
+[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2.
+
+**Why.** The two entries above refuse two updates while full with the
+no-space error: an update at a newer compare revision, and an update of a
+key with no live row at a revision above 0 (this includes upstream issue
+825, the update at a delete revision). The apiserver does not retry an
+error, so an update from a stale object fails with a server error while
+full. A lost compare-and-swap from the quota is as safe as a refusal: the
+backend sees nothing and writes nothing. It is also the answer that the
+client gets without the quota, when no other write lands first.
+
+**What.** While full, the quota answers every update whose compare revision
+is not the one it read as `LogStructured.Update` answers a lost
+compare-and-swap (`pkg/logstructured/logstructured.go:199-206`). That code
+reads the key with `l.get(ctx, key, 0, false, false)`. It returns
+`(rev, nil, false, err)` when it finds no live key, else
+`(rev, event.KV, false, nil)`. `get` returns a nil error when the key has
+no live row (`logstructured.go:73-74`), so with no live key the answer is
+`(rev, nil, false, nil)`, with no error. The quota's own read is
+`LogStructured.Get`: the same `get` call, and the same `adjustRevision`. Its
+revision and key (or no key) are the answer. This is also what
+`LogStructured.Update` did before upstream `ca3c2d5`, when it read the key
+before the insert (`(0, nil, false, nil)` with no live key, the revision
+then set to the current one, and `(rev, event.KV, false, nil)` at another
+revision). Nothing is reserved and no refusal is counted.
+`LimitedServer.update` (`pkg/server/update.go:54-81`) then answers the
+transaction with `Succeeded: false` and a range response with the key, or
+with no key. A failed read is still refused, with the reason `read`. No
+code uses the reason `revision` now, so it is removed from the code and
+from the help text of `kine_quota_refused_total`. It was added on this
+branch and was never released, so no alert or dashboard uses it.
+
+**Effect on clients.** Only while full. An update at a newer compare
+revision gets a failed compare with the key as read. An update of a key
+with no live row at a revision above 0 gets a failed compare with no key,
+and the apiserver reports "not found". The update at a deleted key's delete
+revision writes nothing while full. Below the limit it writes the key
+again, as upstream does. While full, the no-space error on an update now
+comes only from the update rules (growth, ceiling, rate) and from a failed
+read.
+
+**Tests.** `TestKubehzP2Lanes`: the five cases at a newer revision, or with
+no live key at a revision above 0, want a lost compare-and-swap: no error,
+not written, not at the backend, nothing reserved.
+`TestKubehzP2UpdateAtDeleteRevision` (the shape of upstream issue 825):
+while full, the update transaction at the delete revision gets
+`Succeeded: false`, the revision 7 and no key, three times. A 200-byte and a
+1 MiB update get `(7, nil, false, nil)`. The backend sees no update, nothing
+is reserved, and the newest row is still the delete row.
+`TestKubehzP2UpdateAtNewerRevision`: the four landing schedules want the
+revision and the key as read, and no update at the backend. A new
+subtest sends the update transaction and wants `Succeeded: false` with the
+key at revision 1. On the production code of `914880b`, 12 subtests fail
+with the no-space error. With the lost answer replaced by hand with a
+forward to the backend at no reservation, 14 subtests fail. The update
+transaction at the delete revision succeeds at revision 8 (the key is
+written again). The landing schedules write rows of 108, 4322, 1034 and
+34 bytes with 0 reserved, and both `TestKubehzP2UpdateAtOlderRevision`
+subtests fail.
+
+**Re-check** as for the entry above.
+
+---
+
+## Released `v0.17.0-kubehz.4` on upstream `v0.17.0` (`6fb95f5`); release commit `fdd57ca`
+
+Image `ghcr.io/kernpilot/kine:v0.17.0-kubehz.4`, index digest
+
+```
+sha256:d234d8d46d64bbd24ad7985b05edd6365d61b4bdce34ab3af6885ba7fd61e93f
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-11-08). The moving
+`kubehz` tag points at the same digest. `publish-kubehz.yml` built and
+signed it: keyless cosign signature, buildkit provenance and SBOM in the
+index, and an attested SPDX SBOM. The run's own verify gate passed (run
+`42503234800`). Consumers pin the digest above (`KUBEHZ_EXTCP_KINE_IMAGE`).
+
+This release adds the P2 revision for B481 (PR #8, below): a full cluster
+keeps running and frees space by itself. It also carries:
+- PR #6: `golang.org/x/text` v0.41.0 (GO-2026-6629).
+- PR #7: `golang.org/x/net` v0.60.0, otel v1.45.0 and `google.golang.org/grpc`
+  v1.83.2, in the main module and in the three `benchmarks/*` modules.
+- PR #11: the first CI run since Actions came back on the fork. It fixes
+  three revive findings in the P2 code and its test, and it takes upstream
+  `afd69e2`, which pins the Python `kubernetes` package of the test image.
+  Without it every integration driver failed. The upstream rebase drops
+  that part again.
+
+PR #8 merged on local gates only, because Actions was off on the fork. PR
+#11's CI (34 checks, every driver) is the first CI proof of the P2 revision.
+
 ### P2 revision — a full cluster keeps running and frees space by itself (B481)
 
 Adds `pkg/logstructured/sqllog/kubehz_relief.go`. Touches
@@ -1010,11 +1501,15 @@ fixed.
   `wr.CompactRevision` and a reason into the final `Cancel` of `watcher.watch`
   instead of the literal zeros.
 
-Neither `P2` nor `P3` is being carried. P2 was written, measured, found to
-change nothing, and reverted; P3's trigger could not be demonstrated. Both
-hazards are real and both remain unexplained at the mechanism level. Neither has
-an upstream issue.
+No patch is carried for either hazard. In August 2026 this section gave the
+two candidate patches the ids `P2` (a byte bound on the watch buffers:
+written, measured, found to change nothing, and reverted) and `P3` (the
+cancel with the compact revision: not written, because its trigger could not
+be demonstrated). Those ids now belong to other patches: P2 is the size limit
+and P3 the storage parameters, above. Neither hazard has an upstream issue.
 
-**The fork currently carries exactly one patch, P1.** That is the honest state:
-the watch-path hazards that motivated forking turned out to need diagnosis
-before they need code.
+**What the fork carries** (2026-11-08): P2 (the size limit,
+`--quota-bytes`), P3 (the storage parameters on the kine table) and P6 (one
+pool connection per write). P1 was dropped in the `v0.17.5` sync (see "P1
+dropped" above). The `KUBEHZ-PATCH` markers in the code are the record: grep
+them to find every patch.

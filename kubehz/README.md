@@ -7,9 +7,9 @@ benchmark suite that justifies them.
 
 | file | what |
 |---|---|
-| [MERGE-GUIDE.md](MERGE-GUIDE.md) | **read before resolving any conflict.** How to rebase onto new upstream, what each patch must preserve, and when to drop one. |
+| [MERGE-GUIDE.md](MERGE-GUIDE.md) | **read before resolving any conflict.** How to sync with a new upstream release, what each patch must preserve, and when to drop one. |
 | [CHANGELOG.md](CHANGELOG.md) | every patch, the measurement behind it, and the command that re-checks it. Also what was measured and deliberately *not* patched. |
-| [../benchmarks/](../benchmarks/) | the suite. `./setup.sh && ./build.sh && ./verify-patches.sh` |
+| [../benchmarks/](../benchmarks/) | the suite. `./setup.sh && ./verify-patches.sh` re-checks the patches; `./build.sh` builds the binaries the `run-*.sh` benchmarks compare. |
 
 ## Why this fork exists
 
@@ -18,26 +18,25 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. It carries five patches.
-
-P1 touches three files. `pkg/drivers/pgsql/notify.go` is new and cannot
-conflict. `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`
-carry small marker-wrapped edits. `sqllog/sql.go` is a file upstream churns
-(~21 commits a year), so that edit is written to be dropped cheaply, and is
-a candidate for upstreaming rather than indefinite carrying.
+The fork is deliberately narrow. It carries five patches, P2 to P6. P1
+(the cross-instance watch wake-up) was dropped on 2026-11-08: see
+CHANGELOG.md. Its last version is on branch `archive/p1-port-v0.17.5`.
 
 P2 (the `--quota-bytes` limit on live data, and the B481 lanes and relief
 that keep a full cluster running and cleaning up) adds
 `pkg/server/kubehz_quota.go`, `pkg/metrics/kubehz_quota.go`,
-`pkg/drivers/pgsql/kubehz_quota.go`, `pkg/logstructured/sqllog/kubehz_relief.go`
-and `pkg/logstructured/kubehz_ttl.go`, and carries marker-wrapped edits in
+`pkg/drivers/pgsql/kubehz_quota.go` and `pkg/logstructured/sqllog/kubehz_relief.go`,
+and `pkg/logstructured/kubehz_ttl.go`. It carries marker-wrapped edits in
 `pkg/app/app.go` (the flag), `pkg/endpoint/endpoint.go` (the config field,
 the wiring, the TTL delete timeout and the test seams), `pkg/server/kv.go`
 (two log conditions), `pkg/logstructured/logstructured.go` (three
-forwarding methods, the TTL delete timeout and the TTL loop start) and
-`pkg/logstructured/sqllog/sql.go` (one).
-`go.mod` and `go.sum` differ from upstream too: the dependency bumps for
-advisories, and `golang.org/x/time` as a direct dependency (P2's rate limits).
+forwarding methods, the TTL delete timeout field and the TTL loop start),
+`pkg/logstructured/sqllog/sql.go` (one forwarding method, and the
+`polledRev` field with its store) and `pkg/drivers/pgsql/pgsql.go` (the
+one-time `ANALYZE`, and the `quotaDialect` wrapper that `New` hands to
+`sqllog.New`). `go.mod` differs from upstream too: `golang.org/x/time` is a
+direct dependency (P2's rate limits). On `v0.17.5` upstream is above every
+dependency floor the fork set, so `go.sum` is upstream's.
 
 P3 (storage parameters on the kine table) adds
 `pkg/drivers/pgsql/kubehz_reloptions.go` and touches `setup()` (one flag from
@@ -58,6 +57,10 @@ fields, the check, the listener wrap, the gRPC option and the credentials
 wrap of the pending budget). It makes
 `golang.org/x/sys` a direct dependency in `go.mod`.
 
+P6 (a write holds one pool connection, upstream issue k3s-io/kine#824)
+adds `pkg/drivers/generic/kubehz_tx.go` and carries one marker-wrapped edit
+in `Tx.Insert` in `pkg/drivers/generic/tx.go`.
+
 Beside those source files, the fork carries its own tests (every
 `kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
 provides, on 17 and 18), two workflow files (`unit.yml` gains a step per
@@ -74,11 +77,11 @@ which must list exactly these files:
 
 ```
 go.mod
-go.sum
 pkg/app/app.go
+pkg/drivers/generic/kubehz_tx.go
+pkg/drivers/generic/tx.go
 pkg/drivers/pgsql/kubehz_quota.go
 pkg/drivers/pgsql/kubehz_reloptions.go
-pkg/drivers/pgsql/notify.go
 pkg/drivers/pgsql/pgsql.go
 pkg/endpoint/endpoint.go
 pkg/endpoint/kubehz_listen.go

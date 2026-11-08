@@ -53,6 +53,7 @@ type Config struct {
 	CompactMinRetain      int64
 	CompactBatchSize      int64
 	PollBatchSize         int64
+	PollInterval          time.Duration
 	LogFormat             string
 	PeerConfig            drivers.PeerConfig
 	S3Config              drivers.S3Config
@@ -105,6 +106,7 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 		CompactMinRetain:      config.CompactMinRetain,
 		CompactBatchSize:      config.CompactBatchSize,
 		PollBatchSize:         config.PollBatchSize,
+		PollInterval:          config.PollInterval,
 		PeerConfig:            config.PeerConfig,
 		S3Config:              config.S3Config,
 	})
@@ -403,6 +405,11 @@ func (l *loggingServerStream) SendMsg(m any) error {
 		if wr, ok := m.(*etcdserverpb.WatchResponse); ok {
 			logrus.Tracef("STREAM STATS WATCH SEND DONE client=%s, id=%d, revision=%d, events=%d, size=%d, created=%v, canceled=%v, reason=%q, time=%s",
 				l.clientAddr, wr.WatchId, wr.Header.Revision, len(wr.Events), proto.Size(wr), wr.Created, wr.Canceled, wr.CancelReason, time.Since(start).Truncate(time.Microsecond))
+			return
+		}
+		if rsr, ok := m.(*etcdserverpb.RangeStreamResponse); ok {
+			logrus.Tracef("STREAM STATS SENDMSG client=%s, name=%s, size=%d, time=%s, kvs=%d, count=%d, more=%t, header=%s",
+				l.clientAddr, proto.MessageName(rsr), proto.Size(rsr), time.Since(start).Truncate(time.Microsecond), len(rsr.RangeResponse.Kvs), rsr.RangeResponse.Count, rsr.RangeResponse.More, rsr.RangeResponse.Header)
 			return
 		}
 		if p, ok := m.(proto.Message); ok {

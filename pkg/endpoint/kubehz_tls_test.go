@@ -533,6 +533,7 @@ func listenP4(t *testing.T, serverTLS kinetls.Config, reg prometheus.Registerer,
 		CompactMinRetain: 1000,
 		CompactBatchSize: 1000,
 		PollBatchSize:    500,
+		PollInterval:     time.Second, // since v0.17.5 (upstream 3425d74)
 	}
 	for _, option := range options {
 		option(&config)

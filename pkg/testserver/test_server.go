@@ -30,11 +30,9 @@ import (
 func NewTestConfig(t testing.TB) *embed.Config {
 	cfg := embed.NewConfig()
 
-	clientURL := url.URL{Scheme: "unix", Path: "/tmp/kine.sock"}
-
-	cfg.ListenClientUrls = []url.URL{clientURL}
-	cfg.WatchProgressNotifyInterval = 5 * time.Second
 	cfg.Dir = t.TempDir()
+	cfg.ListenClientUrls = []url.URL{{Scheme: "unix", Path: cfg.Dir + "/kine.sock"}}
+	cfg.WatchProgressNotifyInterval = 5 * time.Second
 	os.Chmod(cfg.Dir, 0700)
 	return cfg
 }
@@ -123,8 +121,17 @@ func setObjectStorePath(config *endpoint.Config, dir string) {
 func setDatabasePath(endpoint, dir string) (string, error) {
 	// append a hash of the temp dir to the db name for remote engines where we cannot set the db path directly
 	hash := databaseHash(dir)
-	scheme, _, _ := strings.Cut(endpoint, "://")
+	scheme, dsn, _ := strings.Cut(endpoint, "://")
 	switch scheme {
+	case "split":
+		// use the logic for whatever the actual driver is to inject the dir
+		dsn, driverName, _ := strings.Cut(dsn, "&driver=")
+		dsn, err := setDatabasePath(driverName+"://"+dsn, dir)
+		if err != nil {
+			return "", err
+		}
+		_, dsn, _ = strings.Cut(dsn, "://")
+		return "split://" + dsn + "&driver=" + driverName, nil
 	case "memory":
 		return endpoint, nil
 	case "", "sqlite", "litestream":
@@ -150,6 +157,9 @@ func setDatabasePath(endpoint, dir string) (string, error) {
 		//  mysql DSNs are not valid URLs, so just insert the hash before the query string, if any
 		path, query, _ := strings.Cut(endpoint, "?")
 		return path + hash + "?" + query, nil
+	case "t4":
+		hash = dir
+		fallthrough
 	default:
 		ep, err := url.Parse(endpoint)
 		if err != nil {

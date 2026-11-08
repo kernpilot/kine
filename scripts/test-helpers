@@ -18,7 +18,7 @@ dump-logs() {
         for log in $node/logs/*.log; do
             echo
             echo "#- Tail: $log"
-            tail -5 $log
+            tail -15 $log
             echo "#- Done: $log"
             echo
         done
@@ -171,6 +171,7 @@ wait-for-kine() {(
     local name=$(cat $TEST_DIR/kine/$num/metadata/name)
     while ! docker logs $name 2>&1 | grep -qF " available at "; do
         echo "Waiting for kine to become available..." >&2
+        docker logs $name >&2
         sleep 5
     done
 )}
@@ -240,7 +241,7 @@ build-apiserver-tests() {
   sed -i 's|waitTimeout = 100 \* waitDelay|waitTimeout = 500 \* waitDelay|' pkg/storage/etcd3/compact_test.go
   go mod edit --replace github.com/k3s-io/kine=$KINEPATH
   go mod tidy
-  go test -c -o $KINEPATH/bin/ -tags nats ./pkg/storage/etcd3/...
+  go test -c -o $KINEPATH/bin/ -tags nats,kine_split_driver ./pkg/storage/etcd3/...
   cd $KINEPATH
 }
 export -f build-apiserver-tests
@@ -251,7 +252,7 @@ run-apiserver-tests() {
   test -e ./bin/etcd3.test || build-apiserver-tests
   for TEST in ./bin/*.test; do
     # TODO: add RangeStream support - ref https://github.com/k3s-io/kine/issues/740
-    (set -x; $TEST -test.failfast -test.count 1 -test.parallel 1 -test.timeout 15m -test.skip 'ListStream|StreamMetrics|TestWatchChanSync')
+    (set -x; $TEST -test.failfast -test.count 1 -test.parallel 1 -test.timeout 15m)
   done
 }
 export -f run-apiserver-tests
@@ -315,13 +316,17 @@ provision-kine() {
 
     run-function kine-pre-hook $count
 
-    docker container run \
-        -d --name $name \
-        $KINE_ENV \
-        $KINE_IMAGE \
-        --compact-interval=0 \
-        --watch-progress-notify-interval=5s \
-        --endpoint=$KINE_ENDPOINT
+    (
+      set -x
+      docker container run \
+          -d --name $name \
+          $KINE_ENV \
+          $KINE_IMAGE \
+          --debug \
+          --compact-interval=0 \
+          --watch-progress-notify-interval=5s \
+          --endpoint=$KINE_ENDPOINT
+    )
 
     local ip=$(docker container inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{printf "%s" $v.IPAddress}}{{end}}' $name | tee $TEST_DIR/kine/$count/metadata/ip)
     local port=$(docker container inspect --format '{{range $k, $v := .NetworkSettings.Ports}}{{printf "%s\n" $k}}{{end}}' $name | head -n 1 | cut -d/ -f1 | tee $TEST_DIR/kine/$count/metadata/port)

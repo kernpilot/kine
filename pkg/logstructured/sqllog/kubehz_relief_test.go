@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"runtime"
 	"slices"
 	"sync/atomic"
@@ -24,6 +25,7 @@ var (
 	errCompact = errors.New("compact failed")
 	errCommit  = errors.New("commit failed")
 	errRefresh = errors.New("refresh failed")
+	errFrom    = errors.New("compact from a revision that is not the compact revision")
 )
 
 // reliefCtxKey marks the caller's context, so the fake can tell that every
@@ -32,7 +34,7 @@ type reliefCtxKey struct{}
 
 // reliefDialect hands out reliefTx transactions over one shared state.
 type reliefDialect struct {
-	wakeDialect
+	fakeDialect
 	current      int64 // MAX(id)
 	compactRev   int64 // the committed compact revision
 	failAt       int64 // Compact to this revision fails; 0 = never
@@ -62,7 +64,7 @@ func (d *reliefDialect) BeginTx(ctx context.Context, _ *sql.TxOptions) (server.T
 	if d.onBegin != nil {
 		d.onBegin()
 	}
-	return &reliefTx{d: d, compactRev: d.compactRev}, nil
+	return &reliefTx{d: d, compactRev: d.compactRev, began: d.compactRev}, nil
 }
 func (d *reliefDialect) checkCtx(ctx context.Context) {
 	if ctx.Value(reliefCtxKey{}) == nil {
@@ -93,9 +95,13 @@ func (d *reliefDialect) StatsOwed() bool { return d.owed }
 
 // reliefTx stages SetCompactRevision until Commit, like a real transaction.
 // The Must* methods fail the test: the relief must never end the process.
+// Compact deletes the rows in (from, to] (upstream 80f2963), so from must be
+// the compact revision the transaction began on; another from would skip or
+// repeat rows, and the fake refuses it.
 type reliefTx struct {
 	d          *reliefDialect
 	compactRev int64
+	began      int64
 	done       bool
 }
 
@@ -132,17 +138,23 @@ func (t *reliefTx) SetCompactRevision(_ context.Context, rev int64) error {
 	t.compactRev = rev
 	return nil
 }
-func (t *reliefTx) Compact(ctx context.Context, rev int64) (int64, error) {
+func (t *reliefTx) Compact(ctx context.Context, from, rev int64) (int64, error) {
 	t.d.checkCtx(ctx)
 	if err := ctx.Err(); err != nil {
 		return 0, err
+	}
+	if from != t.began {
+		return 0, fmt.Errorf("%w: from %d, compact revision %d", errFrom, from, t.began)
 	}
 	if t.d.failAt != 0 && rev == t.d.failAt {
 		return 0, errCompact
 	}
 	t.d.batches = append(t.d.batches, rev)
 	t.d.calls = append(t.d.calls, "compact")
-	return rev - t.compactRev, nil
+	return rev - from, nil
+}
+func (t *reliefTx) Insert(context.Context, string, bool, bool, int64, int64, []byte) (int64, error) {
+	return 0, errNotUsed
 }
 func (t *reliefTx) DeleteRevision(context.Context, int64) error { return errNotUsed }
 func (t *reliefTx) CurrentRevision(context.Context) (int64, error) {
@@ -189,7 +201,7 @@ func TestKubehzP2ReliefBounds(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &reliefDialect{current: tc.current, failAt: tc.failAt, commitAt: tc.commitAt, refreshFails: tc.refFails}
-			s := New(d, 0, 0, 0, 0, tc.batch, 0)
+			s := newTestLog(d, tc.batch)
 			s.polledRev.Store(tc.polled)
 
 			ctx := context.WithValue(context.Background(), reliefCtxKey{}, true)
@@ -257,7 +269,7 @@ func TestKubehzP2ReliefStartsPoller(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	d := &reliefDialect{current: 50, revBlock: make(chan struct{})}
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.ctx = ctx
 
 	pass := func() (server.ReliefResult, error) {
@@ -316,7 +328,7 @@ func TestKubehzP2ReliefRefreshOnly(t *testing.T) {
 	t.Cleanup(cancel)
 	d := &reliefDialect{current: 100, revBlock: make(chan struct{})}
 	t.Cleanup(func() { close(d.revBlock) })
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.ctx = ctx
 	res, err := s.RelieveQuota(context.WithValue(ctx, reliefCtxKey{}, true), 20, true)
 	if err != nil || !res.Refreshed || d.refreshes != 1 {
@@ -332,7 +344,7 @@ func TestKubehzP2ReliefRefreshOnly(t *testing.T) {
 // cannot refresh its statistics owe no refresh (SQLite, MySQL).
 func TestKubehzP2ReliefNotStaleWithoutRefresher(t *testing.T) {
 	d := &plainReliefDialect{reliefDialect: &reliefDialect{current: 100}}
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.polledRev.Store(100)
 	res, err := s.RelieveQuota(context.WithValue(context.Background(), reliefCtxKey{}, true), 20, false)
 	if err != nil || res.Rows != 20 || res.Stale {
@@ -347,8 +359,11 @@ func TestKubehzP2ReliefNotStaleWithoutRefresher(t *testing.T) {
 // fields of those names hide the promoted methods.
 type plainReliefDialect struct {
 	*reliefDialect
-	RefreshStats, StatsOwed struct{}
+	RefreshStats, StatsOwed hiddenMethod
 }
+
+// hiddenMethod is the type of a field that hides a promoted method.
+type hiddenMethod struct{}
 
 // TestKubehzP2ReliefCancelledInBatch: a cancel that comes after the batch's
 // transaction began ends the pass before the delete: the transaction rolls
@@ -357,7 +372,7 @@ func TestKubehzP2ReliefCancelledInBatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), reliefCtxKey{}, true))
 	defer cancel()
 	d := &reliefDialect{current: 100, onBegin: cancel}
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.polledRev.Store(100)
 	res, err := s.RelieveQuota(ctx, 20, false)
 	if !errors.Is(err, context.Canceled) || res.Rows != 0 || len(d.batches) != 0 || d.compactRev != 0 {
@@ -375,7 +390,7 @@ func TestKubehzP2ReliefPollerRetry(t *testing.T) {
 	t.Cleanup(cancel)
 	d := &reliefDialect{current: 50}
 	d.revFails.Store(1)
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.ctx = ctx
 	rctx := context.WithValue(ctx, reliefCtxKey{}, true)
 	if _, err := s.RelieveQuota(rctx, 40, false); err != nil {
@@ -393,7 +408,7 @@ func TestKubehzP2ReliefPollerRetry(t *testing.T) {
 // quota's refresh waits for those deletes to settle.
 func TestKubehzP2ReliefLostCommitAck(t *testing.T) {
 	d := &reliefDialect{current: 100, commitLostAt: 10}
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.polledRev.Store(100)
 	res, err := s.RelieveQuota(context.WithValue(context.Background(), reliefCtxKey{}, true), 30, false)
 	if !errors.Is(err, errCommit) || res.Rows != 0 || !res.Stale || d.compactRev != 10 {
@@ -405,7 +420,7 @@ func TestKubehzP2ReliefLostCommitAck(t *testing.T) {
 // no transaction: the pass's context bounds the transaction too.
 func TestKubehzP2ReliefCancelled(t *testing.T) {
 	d := &reliefDialect{current: 100}
-	s := New(d, 0, 0, 0, 0, 10, 0)
+	s := newTestLog(d, 10)
 	s.polledRev.Store(100)
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), reliefCtxKey{}, true))
 	cancel()

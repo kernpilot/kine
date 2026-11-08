@@ -151,7 +151,7 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Logf("the delete's counters landed after %s", time.Since(start).Truncate(time.Millisecond))
-	refresher := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	refresher := &quotaDialect{Generic: &generic.Generic{DB: db}}
 	if err := refresher.RefreshStats(ctx); err != nil {
 		t.Fatalf("RefreshStats: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestKubehzP2RefreshKeepsTrailingPages(t *testing.T) {
 		return size
 	}
 	before := heapBytes()
-	refresher := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	refresher := &quotaDialect{Generic: &generic.Generic{DB: db}}
 	if err := refresher.RefreshStats(ctx); err != nil {
 		t.Fatalf("RefreshStats: %v", err)
 	}
@@ -423,6 +423,7 @@ func kubehzPostgres(t *testing.T) (context.Context, server.Backend, *sql.DB) {
 		CompactMinRetain:     1000,
 		CompactBatchSize:     1000,
 		PollBatchSize:        500,
+		PollInterval:         time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

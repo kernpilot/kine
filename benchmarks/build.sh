@@ -54,4 +54,4 @@ if cmp -s kine-patched kine-upstream; then
   die "kine-patched and kine-upstream are byte-identical — the anchor is wrong.
   A comparison against this pair would report every patch as having no effect."
 fi
-say "binaries differ, as they must — ready for ./verify-patches.sh"
+say "binaries differ, as they must — ready for the run-*.sh benchmarks"
