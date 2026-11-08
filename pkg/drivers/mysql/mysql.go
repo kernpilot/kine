@@ -5,6 +5,7 @@ import (
 	cryptotls "crypto/tls"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -101,12 +102,14 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 			WHERE
 				kp.name != 'compact_rev_key' AND
 				kp.prev_revision != 0 AND
+				kp.id > ? AND
 				kp.id <= ?
-			UNION
+			UNION ALL
 			SELECT kd.id AS id
 			FROM kine AS kd
 			WHERE
 				kd.deleted != 0 AND
+				kd.id > ? AND
 				kd.id <= ?
 		) AS ks
 		ON kv.id = ks.id`,
@@ -116,6 +119,12 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 			return server.ErrKeyExists
 		}
 		return err
+	}
+	dialect.TxRetry = func(err error) bool {
+		// Error 1020: with innodb_snapshot_isolation=ON, the default as of MariaDB 11.6.2, a locking read fails if a row
+		// was committed after the transaction's read view was created. Only a new transaction can get past it.
+		var merr *mysql.MySQLError
+		return errors.As(err, &merr) && merr.Number == 1020
 	}
 	dialect.ErrCode = func(err error) string {
 		if err == nil {
@@ -137,8 +146,7 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		return false, nil, err
 	}
 
-	dialect.Migrate(context.Background())
-	return true, logstructured.New(sqllog.New(dialect, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+	return true, logstructured.New(sqllog.New(dialect, wg, cfg)), nil
 }
 
 func setup(db *sql.DB) error {

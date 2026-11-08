@@ -279,6 +279,7 @@ func listenSQLite(t *testing.T, quota int64) (ETCDConfig, error) {
 		CompactMinRetain: 1000,
 		CompactBatchSize: 1000,
 		PollBatchSize:    500,
+		PollInterval:     time.Second, // since v0.17.5 (upstream 3425d74)
 		QuotaBytes:       quota,
 	})
 }

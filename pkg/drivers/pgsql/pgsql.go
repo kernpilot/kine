@@ -54,6 +54,27 @@ var (
 		`CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)`,
 		`CREATE INDEX IF NOT EXISTS kine_list_query_index on kine(name, id DESC, deleted)`,
 	}
+
+	listFmt = `
+		WITH
+		ikv AS (%s),
+		ckv AS (SELECT * FROM (%s) AS current_rev, (%s) AS compact_rev),
+		mkv AS (SELECT %s FROM kine INNER JOIN ikv USING (id) WHERE (ikv_deleted = 0 OR ?) ORDER BY ikv_name ASC %s),
+		fkv AS (SELECT * FROM mkv UNION ALL SELECT %s WHERE NOT EXISTS (SELECT * FROM mkv))
+		SELECT * from ckv, fkv ORDER BY name ASC
+		`
+	// use a subquery to extract `name, id DESC, deleted` so that the postgres
+	// query planner will make use of kine_list_query_index; by default the `MAX(id)`
+	// plans as a separate group aggregate which will not use the index.
+	distinctNameSQL = `
+		SELECT DISTINCT ON (name) name AS ikv_name, id, deleted AS ikv_deleted
+		FROM kine
+		WHERE name >= ? AND name < ? %s
+		ORDER BY ikv_name ASC, id DESC`
+
+	listSQL    = fmt.Sprintf(listFmt, distinctNameSQL, generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns, query.LimitToken, generic.Nulls(generic.Columns))
+	listValSQL = fmt.Sprintf(listFmt, distinctNameSQL, generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal, query.LimitToken, generic.Nulls(generic.WithVal))
+
 	schemaMigrations = []string{
 		`ALTER TABLE kine ALTER COLUMN id SET DATA TYPE BIGINT, ALTER COLUMN create_revision SET DATA TYPE BIGINT, ALTER COLUMN prev_revision SET DATA TYPE BIGINT; ALTER SEQUENCE kine_id_seq AS BIGINT`,
 		// It is important to set the collation to "C" to ensure that LIKE and COMPARISON
@@ -88,15 +109,22 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 			WHERE
 				kp.name != 'compact_rev_key' AND
 				kp.prev_revision != 0 AND
-				kp.id <= $1
-			UNION
+				kp.id > $1 AND
+				kp.id <= $2
+			UNION ALL
 			SELECT kd.id AS id
 			FROM kine AS kd
 			WHERE
 				kd.deleted != 0 AND
-				kd.id <= $2
+				kd.id > $3 AND
+				kd.id <= $4
 		) AS ks
 		WHERE kv.id = ks.id`, "$", true, "Compact")
+	// Push the row limit into the key selection; see listFmt.
+	dialect.ListCurrentSQL = query.New(fmt.Sprintf(listSQL, ""), "$", true, "ListCurrent")
+	dialect.ListCurrentValSQL = query.New(fmt.Sprintf(listValSQL, ""), "$", true, "ListCurrentVal")
+	dialect.GetRevisionAfterSQL = query.New(fmt.Sprintf(listSQL, "AND id <= ?"), "$", true, "GetRevisionAfter")
+	dialect.GetRevisionAfterValSQL = query.New(fmt.Sprintf(listValSQL, "AND id <= ?"), "$", true, "GetRevisionAfterVal")
 	dialect.FillRetryDuration = time.Millisecond + 5
 	dialect.InsertRetry = func(err error) bool {
 		if err, ok := err.(*pgconn.PgError); ok && err.Code == pgerrcode.UniqueViolation && err.ConstraintName == "kine_pkey" {
@@ -150,55 +178,14 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	}
 	// KUBEHZ-PATCH P2 END
 
-	dialect.Migrate(context.Background())
-
-	// KUBEHZ-PATCH P1 BEGIN — wire the cross-instance notifier
-	//   see kubehz/MERGE-GUIDE.md#p1
-	// CONFLICT if upstream changes what New() returns, keep upstream's return
-	//          value and wrap it here; the only requirement is that the object
-	//          handed to sqllog.New() also satisfies RevisionNotify().
-	//
-	// Wrap the dialect so the poll loop can be woken by another kine instance's
-	// writes. Only PostgreSQL offers this; every other driver keeps the plain
-	// dialect and its ticker, which is why this is an optional interface rather
-	// than a method on server.Dialect.
-	backend := &notifyingDialect{
-		Generic: dialect,
-		revs:    startRevisionListener(ctx, wg, config),
-	}
-	backend.notifier.run(ctx, wg, config)
-	return true, logstructured.New(sqllog.New(backend, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: sqllog.New gets the quotaDialect wrapper (kubehz_quota.go), which
+	//   adds the live-data figure and the statistics refresh to upstream's
+	//   dialect. With the plain dialect the quota measures the physical size.
+	// CONFLICT: keep upstream's return value and wrap the dialect here.
+	return true, logstructured.New(sqllog.New(&quotaDialect{Generic: dialect}, wg, cfg)), nil
+	// KUBEHZ-PATCH P2 END
 }
-
-// KUBEHZ-PATCH P1 (types) BEGIN — the notifyingDialect type and its methods,
-// down to the END marker after RevisionNotify. setup, createDBIfNotExist,
-// prepareConfig and init below that marker are upstream's; take upstream's
-// side there.
-// notifyingDialect adds cross-instance revision wake-ups to the generic
-// dialect. It changes nothing about how data is read or written — the channel
-// is a hint that a poll is worth doing now rather than at the next tick.
-type notifyingDialect struct {
-	*generic.Generic
-	revs     <-chan int64
-	notifier revisionNotifier
-}
-
-// Insert records the new revision for the coalescing notifier, then returns
-// unchanged. The recording is a single atomic compare-and-swap; the NOTIFY
-// itself happens on another goroutine and another connection, so the write
-// path never pays for it.
-func (n *notifyingDialect) Insert(ctx context.Context, key string, create, del bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
-	rev, err := n.Generic.Insert(ctx, key, create, del, createRevision, previousRevision, ttl, value)
-	if err == nil && rev > 0 {
-		n.notifier.record(rev)
-	}
-	return rev, err
-}
-
-// RevisionNotify satisfies the optional interface the poll loop looks for.
-func (n *notifyingDialect) RevisionNotify() <-chan int64 { return n.revs }
-
-// KUBEHZ-PATCH P1 END
 
 func setup(db *sql.DB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")

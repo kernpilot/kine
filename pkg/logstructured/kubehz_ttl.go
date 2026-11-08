@@ -3,12 +3,17 @@ package logstructured
 // KUBEHZ-PATCH P2 (TTL deadline) — this whole file is ours; see kubehz/MERGE-GUIDE.md#p2.
 //
 // With --quota-bytes > 0 the relief compacts with no --compact-min-retain
-// floor (B481). A TTL delete reads the key, then inserts a delete row whose
-// compare-and-swap is the unique (name, prev_revision) pair. If the delete
-// pauses between the read and the insert while newer values are written and
-// compacted away, the insert finds no conflicting row and removes the newest
-// value. A timeout below server.QuotaReliefLag on the whole delete closes
-// that gap: endpoint.Listen sets server.QuotaTTLDeleteTimeout before Start.
+// floor (B481). A TTL delete inserts a delete row in one statement. The
+// statement compares the key's newest row with the revision the TTL loop
+// holds, and the unique (name, prev_revision) pair refuses a second writer
+// (upstream ca3c2d5, v0.17.5). If the statement stalls after its snapshot
+// while newer values are written and compacted away, the unique check finds
+// no conflicting row and the insert removes the newest value. A timeout below
+// server.QuotaReliefLag on the whole delete ends such a statement through its
+// cancel: endpoint.Listen sets server.QuotaTTLDeleteTimeout before Start. Up
+// to v0.17.0 the read and the insert were two statements, so a pause of the
+// kine process between them was enough; since v0.17.5 only a stall inside
+// the one statement is.
 
 import (
 	"context"
@@ -44,9 +49,10 @@ type ttlDeadlineBackend struct {
 	timeout time.Duration
 }
 
-// Delete runs the backend's Delete under the timeout. LogStructured.Delete
-// reports a failed insert as "not deleted" with no error. When the timeout
-// ends the call, that result would make the TTL loop drop the key, so the
+// Delete runs the backend's Delete under the timeout. When the timeout ends
+// the insert, LogStructured.Delete returns the context error, because its
+// re-read runs on the same context. Should it ever report "not deleted" with
+// no error after the deadline, the TTL loop would drop the key, so the
 // context error is returned instead, and the loop tries again.
 func (b ttlDeadlineBackend) Delete(ctx context.Context, key string, revision int64) (int64, *server.KeyValue, bool, error) {
 	dctx, cancel := context.WithTimeout(ctx, b.timeout)

@@ -14,7 +14,7 @@ import (
 )
 
 func TestKubehzP2LiveSizer(t *testing.T) {
-	var d server.Dialect = &notifyingDialect{Generic: &generic.Generic{}}
+	var d server.Dialect = &quotaDialect{Generic: &generic.Generic{}}
 	l, ok := d.(server.LiveSizer)
 	if !ok {
 		t.Fatal("the pgsql dialect does not offer server.LiveSizer")
