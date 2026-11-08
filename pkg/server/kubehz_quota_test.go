@@ -36,9 +36,12 @@ type quotaFake struct {
 	sizeErr   atomic.Pointer[error]
 	sizeReads atomic.Int64
 	// current is the value Get returns at revision 1; missing makes Get find
-	// no key; createErr fails every Create, updateErr every Update.
+	// no key; tombstone is then the revision of the key's delete row (0: the
+	// key never existed); createErr fails every Create, updateErr every
+	// Update.
 	current   []byte
 	missing   bool
+	tombstone int64
 	createErr error
 	updateErr error
 	// hold, when set, keeps the first Create inside the backend until it is
@@ -96,8 +99,15 @@ func (f *quotaFake) Update(_ context.Context, key string, _ []byte, revision, _ 
 	if f.updateErr != nil {
 		return 0, nil, false, f.updateErr
 	}
-	// the compare-and-swap of the real backend: no row unless revision is current
-	if f.missing || revision != 1 {
+	// the compare-and-swap of the real backend (upstream's insert statement
+	// since ca3c2d5): a row only when revision is the key's newest row. For a
+	// deleted key that is its delete row, so an update at that revision
+	// writes the key again (upstream issue k3s-io/kine#825).
+	newest := int64(1)
+	if f.missing {
+		newest = f.tombstone
+	}
+	if revision != newest {
 		return 1, nil, false, nil
 	}
 	return 4, &KeyValue{Key: key}, true, nil
@@ -454,9 +464,11 @@ func bytesOf(n int) []byte { return []byte(strings.Repeat("x", n)) }
 // TestKubehzP2Lanes: what passes while full (B481). A control key (a Lease,
 // the compaction key) may be created small or updated without growth; any
 // other existing key may be updated without growth; a new key, a growing
-// value and a large control create are refused. An update that cannot write
-// (missing key, stale compare revision) reaches the backend and reserves
-// nothing.
+// value and a large control create are refused. An update that finds no live
+// key is a create (it can write the key again, upstream issue
+// k3s-io/kine#825): refused unless it is a small control key, which reserves
+// key + value. An update at a stale compare revision reaches the backend and
+// reserves nothing.
 func TestKubehzP2Lanes(t *testing.T) {
 	ctx := context.Background()
 	const lease = "/registry/leases/kube-system/kube-controller-manager"
@@ -479,10 +491,14 @@ func TestKubehzP2Lanes(t *testing.T) {
 		{"finalizer removal", false, "/registry/pods/default/a", 2000, 1990, 1, false, true, true},
 		{"other update grows", false, "/registry/pods/default/a", 10, 100, 1, false, false, false},
 		{"stale compare revision", false, "/registry/pods/default/a", 10, 1000, 2, false, true, false},
-		{"missing key", false, "/registry/pods/default/b", 0, 1000, 1, true, true, false},
+		{"no live key, at its delete revision", false, "/registry/pods/default/b", 0, 1000, 1, true, false, false},
+		{"small lease, no live key", false, "/registry/leases/default/gone", 0, 200, 1, true, true, true},
+		{"large lease, no live key", false, "/registry/leases/default/gone", 0, quotaControlMaxValue + 1, 1, true, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := &quotaFake{current: bytesOf(tc.current), missing: tc.missing}
+			// a missing key was deleted at the compare revision: the update
+			// writes it again
+			fake := &quotaFake{current: bytesOf(tc.current), missing: tc.missing, tombstone: tc.revision}
 			quota := fullQuota(t)
 			b := WithQuota(fake, quota)
 			before := quota.Pending()
@@ -506,13 +522,69 @@ func TestKubehzP2Lanes(t *testing.T) {
 				t.Fatalf("pending grew by %d, want a reservation: %v", got, tc.reserved)
 			}
 			if !tc.create && tc.reserved {
-				// while full an update counts key + new + old exactly
+				// while full an update counts key + new + old exactly, and one
+				// with no live key (current 0 here) key + new, as a create
 				if want := int64(len(tc.key) + tc.value + tc.current); quota.Pending()-before != want {
 					t.Fatalf("pending grew by %d, want %d", quota.Pending()-before, want)
 				}
 			}
 		})
 	}
+}
+
+// TestKubehzP2UpdateAtDeleteRevision: since upstream ca3c2d5 an update at the
+// revision of a deleted key's delete row writes the key again with any value
+// (upstream issue k3s-io/kine#825). While full that is a create. A key that
+// is not a small control key is refused before it reaches the backend, as
+// often as the client deletes and updates, and reserves nothing. A small
+// control key passes in the control lane at a create's cost, key + value;
+// when its compare fails, it gives that cost back.
+func TestKubehzP2UpdateAtDeleteRevision(t *testing.T) {
+	ctx := context.Background()
+	const pod, lease, deleted = "/registry/pods/default/a", "/registry/leases/default/a", 7
+
+	t.Run("other key", func(t *testing.T) {
+		fake := &quotaFake{missing: true, tombstone: deleted}
+		quota := fullQuota(t)
+		backend := WithQuota(fake, quota)
+		l := &LimitedServer{backend: backend}
+		before := quota.Pending()
+		for i := range 3 {
+			// the apiserver's update transaction at the delete revision
+			if _, err := l.Txn(ctx, putTxn(pod, deleted)); !isNoSpace(err) {
+				t.Fatalf("update transaction %d at the delete revision: got %v, want %v", i, err, ErrNoSpace)
+			}
+		}
+		if _, _, _, err := backend.Update(ctx, pod, bytesOf(1<<20), deleted, 0); !isNoSpace(err) {
+			t.Fatalf("a 1 MiB update at the delete revision: got %v, want %v", err, ErrNoSpace)
+		}
+		if len(fake.updates) != 0 || quota.Pending() != before {
+			t.Fatalf("updates that reached the backend %v, pending grew by %d; want none and 0", fake.updates, quota.Pending()-before)
+		}
+	})
+
+	t.Run("small control key", func(t *testing.T) {
+		fake := &quotaFake{missing: true, tombstone: deleted}
+		quota := fullQuota(t)
+		backend := WithQuota(fake, quota)
+		before := quota.Pending()
+		if _, _, ok, err := backend.Update(ctx, lease, bytesOf(200), deleted, 0); err != nil || !ok {
+			t.Fatalf("a small Lease update at the delete revision: ok %v, %v; want it written", ok, err)
+		}
+		if want := int64(len(lease) + 200); quota.Pending()-before != want {
+			t.Fatalf("pending grew by %d, want %d (key + value, a create)", quota.Pending()-before, want)
+		}
+		before = quota.Pending()
+		if _, _, ok, err := backend.Update(ctx, lease, bytesOf(200), deleted+1, 0); err != nil || ok {
+			t.Fatalf("a Lease update at another revision: ok %v, %v; want a lost compare-and-swap", ok, err)
+		}
+		if quota.Pending() != before {
+			t.Fatalf("pending grew by %d after a lost compare-and-swap, want 0", quota.Pending()-before)
+		}
+		if len(fake.updates) != 2 {
+			t.Fatalf("updates that reached the backend: %v, want two", fake.updates)
+		}
+	})
 }
 
 // TestKubehzP2Ceiling: at the ceiling the lanes close too; only deletes go on.

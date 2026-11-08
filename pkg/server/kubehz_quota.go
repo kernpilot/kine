@@ -47,7 +47,10 @@ package server
 //   value; an update counts key + 2 x value below the limit (the new row
 //   also carries the old value; over a key's life the charge is at least the
 //   bytes written, less the key's first value) and key + new + old value
-//   exactly when full, because the check reads the key anyway. An update
+//   exactly when full, because the check reads the key anyway. When full, an
+//   update that finds no live key counts key + value and takes the create
+//   rules: at the revision of the key's delete row it writes the key again
+//   (upstream issue k3s-io/kine#825), so it is a create. An update
 //   below the limit that shrinks a value is charged less than it writes, by
 //   at most the old value: for that gap alone, the stored data can pass the
 //   figure by up to L while no good sample shows it, with no time bound
@@ -802,20 +805,28 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 }
 
 // admitUpdate decides an update while full. It reads the key once. An update
-// that cannot write (no such key, or the compare revision is not the current
-// one) passes with no reservation: the backend answers it without a new row,
-// and the compare-and-swap means no other write can slip in between. One
-// that would write passes when the value does not grow by more than
-// quotaGrowthSlack, the figure with its exact cost (key + new + old) stays
-// within its lane's cap (control: the ceiling; cleanup: the ceiling less
-// quotaControlReserve), and its lane's bucket has room. It returns the
-// reserved cost and "" when it passes, else the refusal reason.
+// that finds no live key is a create: at the revision of the key's delete
+// row the backend writes the key again (since upstream ca3c2d5; upstream
+// issue k3s-io/kine#825). So it takes the create rules (admitControlCreate)
+// at a create's cost, key + value, and the reservation settles like any
+// update's. An update whose compare revision is not the current one passes
+// with no reservation: the backend answers it without a new row, and the
+// compare-and-swap means no other write can slip in between. One that would
+// write passes when the value does not grow by more than quotaGrowthSlack,
+// the figure with its exact cost (key + new + old) stays within its lane's
+// cap (control: the ceiling; cleanup: the ceiling less quotaControlReserve),
+// and its lane's bucket has room. It returns the reserved cost and "" when
+// it passes, else the refusal reason.
 func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string) {
 	_, cur, err := b.Backend.Get(ctx, key, 0, false)
 	if err != nil {
 		return 0, "read"
 	}
-	if cur == nil || cur.ModRevision != revision {
+	if cur == nil {
+		cost := int64(len(key) + len(value))
+		return cost, b.admitControlCreate(key, value, cost)
+	}
+	if cur.ModRevision != revision {
 		return 0, ""
 	}
 	if len(value)-len(cur.Value) > quotaGrowthSlack {

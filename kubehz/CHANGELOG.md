@@ -225,6 +225,58 @@ transaction, or a retry in `Append`), take upstream's side and drop P4, with
 its tests. Then `TestKubehzP4Postgres` is the check that upstream's fix holds
 on a pool of one connection.
 
+### P2 fix — an update with no live key is a create while full (upstream issue k3s-io/kine#825)
+
+Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
+comments, and `pkg/server/kubehz_quota_test.go`.
+
+**Why.** Since upstream `ca3c2d5`, `LogStructured.Update` does not read the
+key before its insert. The insert statement writes when the newest row of
+the key (`MAX(id)`) has the compare revision, and for a deleted key that row
+is its delete row. So an update at the revision of the delete writes a live
+row again, with any value (upstream issue k3s-io/kine#825). P2 assumed that
+an update that finds no live key writes nothing. While full it passed such
+an update with no charge: no growth check, no lane cap and no rate bucket.
+A client could delete a key and update it at the delete's revision, again
+and again, while full.
+
+**Measured** on PostgreSQL 18.4 and 17.11 with a one-off test through
+`LogStructured`: a create (revision 1), a delete (revision 2), then an
+update at revision 2 returns ok at revision 3. The key is live again with
+the new value and `CreateRevision` 0. Its row has `created = 0`,
+`create_revision` NULL, `prev_revision` 2 (the delete row) and `old_value`
+NULL. In etcd the compare fails: a deleted key compares as mod revision 0.
+
+**What.** While full, an update that finds no live key is a create. It takes
+the create rules (`admitControlCreate`: a control key with a value of at most
+4 KiB, the create cap, the control bucket) at a create's cost, key + value.
+The reservation settles as any update's does: a write keeps it, a lost
+compare-and-swap gives it back. Below the limit nothing changes (key + 2 ×
+value).
+
+**Effect on clients.** Only while full: an update of a deleted key that is
+not a small control key now gets the no-space error, where before its
+compare failed. An apiserver update of an object that another client deleted
+meanwhile then fails with a server error, where before it got "not found".
+A retry gets "not found" when the apiserver has seen the delete.
+
+**Tests.** The fake backend now enforces the real contract: an update at the
+revision of a deleted key's delete row writes a row. `TestKubehzP2Lanes` has
+three new cases (an update at the delete revision of a key with no live
+row is refused, a small Lease passes at key + value, a large one is
+refused). `TestKubehzP2UpdateAtDeleteRevision` sends the apiserver's update
+transaction at the delete revision three times and a 1 MiB update: each is
+refused before the backend, with no reservation. A small Lease passes at key
++ value, and gives it back when its compare fails. Mutation: with the old
+`cur == nil` branch (no charge, no refusal), 3 `TestKubehzP2Lanes` cases and
+both `TestKubehzP2UpdateAtDeleteRevision` cases fail.
+
+**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAtDeleteRevision' ./pkg/server/`.
+
+[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2, still says that an update with
+no such key passes without a charge. A separate change edits that guide; it
+must take this rule over.
+
 ---
 
 ## Released `v0.17.0-kubehz.4` on upstream `v0.17.0` (`6fb95f5`); release commit `fdd57ca`
