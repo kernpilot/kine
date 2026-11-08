@@ -319,19 +319,34 @@ a row after the insert (its only `UPDATE` sets `prev_revision` of
 `compact_rev_key`). So at the revision read, the row written holds exactly
 the value read, or the compare fails, and the charge key + new + old is
 exact. With no live row, the update at 0 is a create (key + value, the
-create rules). An update at an older revision still passes with no
-reservation, because it can never match: the newest row of a key only gets
-a higher id. It goes back only to 0, when compaction removes all rows of a
-deleted key, and the server sends a compare with 0 to `Create`, not to
-`Update`. Every other update is refused, with the reason `revision`. Below
-the limit nothing changes.
+create rules). The quota answers an update at an older revision itself, as
+a lost compare-and-swap, and the backend never sees it (see "Older
+revisions" below). Every other update is refused, with the reason
+`revision`. Below the limit nothing changes.
+
+**Older revisions.** As first written (`3ffdb3c`), an update at an older
+revision went to the backend with no reservation, on the claim that it can
+never match. The second review (Astra) showed that the newest row of a key
+can fall back after compaction. An insert that started before a compaction
+can add a row whose `prev_revision` the compaction removed (the unique
+index entry for (name, 1) belonged to a deleted row): rows 3 (live) and 4
+(prev_revision 1). The quota reads row 4 and passes an update at 3 free. A
+delete writes row 5, a compaction removes rows 4 and 5, and row 3 is the
+newest again: the update writes any size, with no charge. Now, while full,
+the quota answers such an update as `LogStructured.Update` answers a lost
+compare-and-swap (`pkg/logstructured/logstructured.go:200`: the current
+revision, the live key, not updated). `LimitedServer.update`
+(`pkg/server/update.go:54`) then answers the transaction with
+`Succeeded: false` and a range response that holds the key, as for any
+failed compare. Below the limit the update still goes to the backend.
 
 **Effect on clients.** None for an update that compares with the revision it
 read, which is what the apiserver sends. An update at an older revision
-still loses its compare and is not refused, so the apiserver's retry after a
-conflict works while full. While full, an update at a newer revision gets
-the no-space error, where before its compare failed (or, with `d31cd11`, it
-took the update rules).
+gets the same failed compare as before, so the apiserver's retry after a
+conflict works while full. The key in that answer is the one the quota
+read. While full, an update at a newer revision gets the no-space error,
+where before its compare failed (or, with `d31cd11`, it took the update
+rules).
 
 **Tests.** The fake backend keeps rows like the kine table: each write adds
 a row at the next revision, an update copies the old value from the row at
@@ -342,8 +357,14 @@ three schedules, and the client's own delete, between the quota's read and
 the insert. Each case fails when the update writes a row that its
 reservation does not cover, grows the value past the slack, or reaches the
 backend. A write that lands before an update at the revision read makes its
-compare fail, with nothing reserved. An update at an older revision reaches
-the backend and reserves nothing. `TestKubehzP2Lanes` checks that each update
+compare fail, with nothing reserved. `TestKubehzP2UpdateAtOlderRevision`
+holds the forked history above. Its update transaction at the older
+revision gets `Succeeded: false` with the key at revision 4, and the backend
+sees no update. With the compaction landed before the insert, the update
+writes nothing. On the production code of `bde9682`, and with the
+lost-compare answer removed by hand, both subtests fail: "updates that
+reached the backend [/registry/pods/default/a]" and "the update wrote a row
+of 1048610 bytes and reserved 0". `TestKubehzP2Lanes` checks that each update
 that writes is charged exactly its row, and has the new case "newer compare
 revision, no growth" (refused). `TestKubehzP2Ceiling` and
 `TestKubehzP2LaneRate` update at the revision of the write before. With the
@@ -354,7 +375,9 @@ no live key, at its delete revision", the Lease case of
 `TestKubehzP2UpdateAtNewerRevision` ("64 bytes not charged", "4096 bytes not
 charged", "grew the live value by 990 bytes", and the delete).
 
-**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAt|TestKubehzP2Ceiling|TestKubehzP2LaneRate' ./pkg/server/`.
+**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAt|TestKubehzP2Ceiling|TestKubehzP2LaneRate' ./pkg/server/`
+(`TestKubehzP2UpdateAt` matches the delete, newer and older revision
+tests).
 
 ---
 

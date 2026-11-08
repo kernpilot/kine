@@ -189,11 +189,15 @@ which only feeds a gauge. The rules:
    row). The insert copies the old value from the row at the compare
    revision, and rows do not change after the insert. So that row holds the
    value that the check read, and the charge is exact. With no live row,
-   such an update is a create: key + value, under the create rules. An
-   update at an older revision passes without a charge, because it cannot
-   match. The check refuses all other updates. Another write can land at
-   their compare revision before the insert, and after a delete the update
-   writes the key again (upstream issue k3s-io/kine#825).
+   such an update is a create: key + value, under the create rules. The
+   check answers an update at an older revision itself, as a lost
+   compare-and-swap with the key as read (the answer `LogStructured.Update`
+   gives), and the backend does not see it. The apiserver then retries as
+   after any conflict. A compaction can make an older row of a key the
+   newest again, so the backend could write such an update with no charge.
+   The check refuses all other updates. Another write can land at their
+   compare revision before the insert, and after a delete the update writes
+   the key again (upstream issue k3s-io/kine#825).
 3. The ceiling is `2 × limit + 64 MiB`: a lane write passes only while
    figure + its cost stays at or below its lane's cap. Control creates stop
    at `limit + 16 MiB` (new Leases while full are few, so many are a fault

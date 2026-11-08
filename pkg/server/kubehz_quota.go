@@ -52,12 +52,14 @@ package server
 //   (0 when it found no live key). The insert copies the old value from the
 //   row at the compare revision, and rows never change, so that row is the
 //   one the check read and the charge is exact. With no live key the update
-//   is a create (key + value, the create rules). An update at an older
-//   revision passes with no charge: it can never match. Every other update
-//   is refused. Another write can land at its compare revision before the
-//   insert (after a delete the update writes the key again, upstream issue
-//   k3s-io/kine#825), and its charge would come from a value the check did
-//   not read. An update
+//   is a create (key + value, the create rules). The quota answers an update
+//   at an older revision itself, as a lost compare-and-swap with the key as
+//   read, and the backend never sees it: compaction can make an older row
+//   of a key the newest again, so the backend could write it with no charge.
+//   Every other update is refused. Another write can land at its compare
+//   revision before the insert (after a delete the update writes the key
+//   again, upstream issue k3s-io/kine#825), and its charge would come from a
+//   value the check did not read. An update
 //   below the limit that shrinks a value is charged less than it writes, by
 //   at most the old value: for that gap alone, the stored data can pass the
 //   figure by up to L while no good sample shows it, with no time bound
@@ -797,9 +799,14 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 	cost := int64(len(key) + 2*len(value))
 	if !b.quota.reserveBelow(cost) {
 		var reason string
-		if cost, reason = b.admitUpdate(ctx, key, value, revision); reason != "" {
+		var lost *lostCompare
+		if cost, reason, lost = b.admitUpdate(ctx, key, value, revision); reason != "" {
 			metrics.QuotaRefused.WithLabelValues(reason).Inc()
 			return 0, nil, false, ErrNoSpace
+		}
+		if lost != nil {
+			// the answer LogStructured.Update gives a lost compare-and-swap
+			return lost.rev, lost.kv, false, nil
 		}
 	}
 	rev, kv, ok, err := b.Backend.Update(ctx, key, value, revision, lease)
@@ -817,11 +824,17 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 // compare revision, and it copies its old value from the row with that id.
 // Rows never change after the insert. So at the observed revision the row
 // written holds exactly the value read, or the compare fails. That is the
-// only update that passes with a charge. An update at an older revision
-// passes with no reservation: the newest row of a key only gets a higher id
-// (or 0 when compaction removes all rows of a deleted key, and the server
-// sends a compare with 0 to Create), so the backend writes no row. Every
-// other update is refused ("revision"). Another write can land at a newer
+// only update that passes with a charge. An update at an older revision gets
+// lost: the current revision and the key as read. Update returns them as
+// LogStructured.Update returns a lost compare-and-swap, and the server then
+// answers the transaction with succeeded = false and the key, so the
+// apiserver retries as after any conflict. The backend never sees that
+// update. Compaction can make an older row of a key the newest again: an
+// insert that started before a compaction can add a row whose
+// prev_revision the compaction removed, and when a later compaction removes
+// that row and its delete, the older row is the newest. At that revision the
+// backend would write with no charge. Every other update is refused
+// ("revision"). Another write can land at a newer
 // compare revision before the insert. The update then writes over a value
 // the check did not read, and after a delete it writes the key again (since
 // upstream ca3c2d5; upstream issue k3s-io/kine#825). With no live key, the
@@ -832,27 +845,27 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 // ceiling; cleanup: the ceiling less quotaControlReserve), and its lane's
 // bucket has room. The reservation settles like any update's. It returns the
 // reserved cost and "" when it passes, else the refusal reason.
-func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string) {
-	_, cur, err := b.Backend.Get(ctx, key, 0, false)
+func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string, *lostCompare) {
+	rev, cur, err := b.Backend.Get(ctx, key, 0, false)
 	if err != nil {
-		return 0, "read"
+		return 0, "read", nil
 	}
 	observed := int64(0)
 	if cur != nil {
 		observed = cur.ModRevision
 	}
 	if revision < observed {
-		return 0, ""
+		return 0, "", &lostCompare{rev: rev, kv: cur}
 	}
 	if revision != observed {
-		return 0, "revision"
+		return 0, "revision", nil
 	}
 	if cur == nil {
 		cost := int64(len(key) + len(value))
-		return cost, b.admitControlCreate(key, value, cost)
+		return cost, b.admitControlCreate(key, value, cost), nil
 	}
 	if len(value)-len(cur.Value) > quotaGrowthSlack {
-		return 0, "growth"
+		return 0, "growth", nil
 	}
 	cost := int64(len(key) + len(value) + len(cur.Value))
 	control := isControlKey(key) && len(value) <= quotaControlMaxValue
@@ -861,27 +874,35 @@ func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte
 		limit = b.quota.ceiling
 	}
 	if !b.quota.reserveWithin(cost, limit) {
-		return 0, "ceiling"
+		return 0, "ceiling", nil
 	}
 	now := time.Now()
 	if control {
 		if !b.quota.control.AllowN(now, 1) {
 			b.quota.release(cost)
-			return 0, "rate"
+			return 0, "rate", nil
 		}
 		metrics.QuotaLaneWrites.WithLabelValues("control").Inc()
-		return cost, ""
+		return cost, "", nil
 	}
 	if !b.quota.cleanupOps.AllowN(now, 1) {
 		b.quota.release(cost)
-		return 0, "rate"
+		return 0, "rate", nil
 	}
 	if !b.quota.cleanupBytes.AllowN(now, int(min(cost, int64(quotaCleanupBytesBurst)))) {
 		b.quota.release(cost)
-		return 0, "rate"
+		return 0, "rate", nil
 	}
 	metrics.QuotaLaneWrites.WithLabelValues("cleanup").Inc()
-	return cost, ""
+	return cost, "", nil
+}
+
+// lostCompare is admitUpdate's answer to an update at an older compare
+// revision: the revision and the key (nil: no live key) as the quota read
+// them.
+type lostCompare struct {
+	rev int64
+	kv  *KeyValue
 }
 
 func isControlKey(key string) bool {
