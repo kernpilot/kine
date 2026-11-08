@@ -48,13 +48,16 @@ package server
 //   also carries the old value; over a key's life the charge is at least the
 //   bytes written, less the key's first value) and key + new + old value
 //   exactly when full, because the check reads the key anyway. When full, an
-//   update that finds no live key counts key + value and takes the create
-//   rules: at the revision of the key's delete row it writes the key again
-//   (upstream issue k3s-io/kine#825), so it is a create. When full, an update
-//   at a compare revision newer than the key's is charged as an update of
-//   the value read: a write at that revision can land before the insert, and
-//   after a delete the update writes the key again. Only an update at an
-//   older revision passes with no charge: it can never match. An update
+//   update passes only when its compare revision is the one the check read
+//   (0 when it found no live key). The insert copies the old value from the
+//   row at the compare revision, and rows never change, so that row is the
+//   one the check read and the charge is exact. With no live key the update
+//   is a create (key + value, the create rules). An update at an older
+//   revision passes with no charge: it can never match. Every other update
+//   is refused. Another write can land at its compare revision before the
+//   insert (after a delete the update writes the key again, upstream issue
+//   k3s-io/kine#825), and its charge would come from a value the check did
+//   not read. An update
 //   below the limit that shrinks a value is charged less than it writes, by
 //   at most the old value: for that gap alone, the stored data can pass the
 //   figure by up to L while no good sample shows it, with no time bound
@@ -808,35 +811,45 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 	return rev, kv, ok, err
 }
 
-// admitUpdate decides an update while full. It reads the key once. An update
-// that finds no live key is a create: at the revision of the key's delete
-// row the backend writes the key again (since upstream ca3c2d5; upstream
-// issue k3s-io/kine#825). So it takes the create rules (admitControlCreate)
-// at a create's cost, key + value, and the reservation settles like any
-// update's. An update whose compare revision is older than the key's passes
-// with no reservation: the newest row of a key only gets a higher id (or, when
-// compaction removes all rows of a deleted key, 0, which no update compares
-// with), so the backend writes no row. An update at the key's revision or a
-// newer one takes the update rules against the value read. A newer revision
-// matches when another write lands at that revision before the insert; when
-// that write is a delete, the update writes the key again (the same upstream
-// issue), and that row (key + new) costs less than the charge. Such an update
-// passes when the value does not grow by more than quotaGrowthSlack, the
-// figure with its exact cost (key + new + old) stays within its lane's cap
-// (control: the ceiling; cleanup: the ceiling less quotaControlReserve), and
-// its lane's bucket has room. It returns the reserved cost and "" when it
-// passes, else the refusal reason.
+// admitUpdate decides an update while full. It reads the key once, and the
+// observed revision is the key's mod revision, or 0 when it has no live key.
+// The backend's insert writes only when the newest row of the key has the
+// compare revision, and it copies its old value from the row with that id.
+// Rows never change after the insert. So at the observed revision the row
+// written holds exactly the value read, or the compare fails. That is the
+// only update that passes with a charge. An update at an older revision
+// passes with no reservation: the newest row of a key only gets a higher id
+// (or 0 when compaction removes all rows of a deleted key, and the server
+// sends a compare with 0 to Create), so the backend writes no row. Every
+// other update is refused ("revision"). Another write can land at a newer
+// compare revision before the insert. The update then writes over a value
+// the check did not read, and after a delete it writes the key again (since
+// upstream ca3c2d5; upstream issue k3s-io/kine#825). With no live key, the
+// update at revision 0 is a create: the create rules (admitControlCreate) at
+// a create's cost, key + value. With a live key, the update passes when the
+// value does not grow by more than quotaGrowthSlack, the figure with its
+// exact cost (key + new + old) stays within its lane's cap (control: the
+// ceiling; cleanup: the ceiling less quotaControlReserve), and its lane's
+// bucket has room. The reservation settles like any update's. It returns the
+// reserved cost and "" when it passes, else the refusal reason.
 func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string) {
 	_, cur, err := b.Backend.Get(ctx, key, 0, false)
 	if err != nil {
 		return 0, "read"
 	}
+	observed := int64(0)
+	if cur != nil {
+		observed = cur.ModRevision
+	}
+	if revision < observed {
+		return 0, ""
+	}
+	if revision != observed {
+		return 0, "revision"
+	}
 	if cur == nil {
 		cost := int64(len(key) + len(value))
 		return cost, b.admitControlCreate(key, value, cost)
-	}
-	if revision < cur.ModRevision {
-		return 0, ""
 	}
 	if len(value)-len(cur.Value) > quotaGrowthSlack {
 		return 0, "growth"

@@ -248,83 +248,106 @@ the new value and `CreateRevision` 0. Its row has `created = 0`,
 `create_revision` NULL, `prev_revision` 2 (the delete row) and `old_value`
 NULL. In etcd the compare fails: a deleted key compares as mod revision 0.
 
-**What.** While full, an update that finds no live key is a create. It takes
-the create rules (`admitControlCreate`: a control key with a value of at most
-4 KiB, the create cap, the control bucket) at a create's cost, key + value.
-The reservation settles as any update's does: a write keeps it, a lost
+**What.** While full, an update that finds no live key passes only when it
+compares the revision 0. It is then a create: the create rules
+(`admitControlCreate`: a control key with a value of at most 4 KiB, the
+create cap, the control bucket) at a create's cost, key + value. The update
+at the delete revision is refused, for a small control key too. The
+reservation settles as any update's does: a write keeps it, a lost
 compare-and-swap gives it back. Below the limit nothing changes (key + 2 ×
-value).
+value). As first written (`40f4ca8`), the create rules applied at any
+compare revision, so a small Lease passed at its delete revision. The review
+round narrowed that to the revision read (the next entry), because another
+write can land at a compare revision that the quota did not read.
 
-**Effect on clients.** Only while full: an update of a deleted key that is
-not a small control key now gets the no-space error, where before its
-compare failed. An apiserver update of an object that another client deleted
-meanwhile then fails with a server error, where before it got "not found".
-A retry gets "not found" when the apiserver has seen the delete.
+**Effect on clients.** Only while full: an update of a deleted key now gets
+the no-space error, where before its compare failed. An apiserver update of
+an object that another client deleted meanwhile then fails with a server
+error, where before it got "not found". A retry gets "not found" when the
+apiserver has seen the delete.
 
-**Tests.** The fake backend now enforces the real contract: an update at the
-revision of a deleted key's delete row writes a row. `TestKubehzP2Lanes` has
-three new cases (an update at the delete revision of a key with no live
-row is refused, a small Lease passes at key + value, a large one is
-refused). `TestKubehzP2UpdateAtDeleteRevision` sends the apiserver's update
-transaction at the delete revision three times and a 1 MiB update: each is
-refused before the backend, with no reservation. A small Lease passes at key
-+ value, and gives it back when its compare fails. Mutation: with the old
-`cur == nil` branch (no charge, no refusal), 3 `TestKubehzP2Lanes` cases and
-both `TestKubehzP2UpdateAtDeleteRevision` cases fail.
+**Tests.** The fake backend enforces the real contract: an update at the
+revision of a deleted key's delete row writes a row, at the next revision.
+`TestKubehzP2Lanes` has cases for an update at the delete revision of a key
+with no live row (refused, for a Pod and for a small Lease) and for a
+small Lease with no row at the compare revision 0 (passes at key + value).
+`TestKubehzP2UpdateAtDeleteRevision` sends the apiserver's update
+transaction at the delete revision three times, and a 200-byte and a 1 MiB
+update, for a Pod and for a Lease: each is refused before the backend, with
+no reservation. Below the limit the update at the delete revision 7 writes
+revision 8, and an update at 8 writes revision 9. Mutation (against
+`40f4ca8`'s first tests): with the old `cur == nil` branch (no charge, no
+refusal), 3 `TestKubehzP2Lanes` cases and both
+`TestKubehzP2UpdateAtDeleteRevision` cases failed.
 
 **Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAtDeleteRevision' ./pkg/server/`.
 
-[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2, still says that an update with
-no such key passes without a charge. A separate change edits that guide; it
-must take this rule over.
-
-### P2 fix — an update at a newer compare revision is charged while full (upstream issue k3s-io/kine#825)
+### P2 fix — while full, an update passes only at the revision the quota read (upstream issue k3s-io/kine#825)
 
 Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
-comments, and `pkg/server/kubehz_quota_test.go`. This goes past the fix
-above, and it can be dropped on its own (it is a separate commit).
+comments, the help text of `kine_quota_refused_total` (a new reason,
+`revision`), `pkg/server/kubehz_quota_test.go`, and
+[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2. It replaces the rule of
+`d31cd11`, which charged an update at a newer compare revision from the
+value the quota read.
 
-**Why.** `admitUpdate` passed with no charge every update whose compare
-revision is not the key's current one. Its comment said that "the
-compare-and-swap means no other write can slip in between". That holds for
-an older revision, not for a newer one. The quota reads the key, then the
-backend runs the insert. If another write lands at exactly the compare
-revision in between, the compare matches. When that write is the client's
-own delete, the update writes the key again with any value (the same
-upstream issue), with no charge, no lane cap and no rate bucket. A lost
-attempt cost nothing, so a client could send updates at the next revisions
-while it deletes. A correct client does not send a newer revision: it
-compares with a revision it read.
+**Why.** The quota reads the key, then the backend runs the insert. An
+update whose compare revision is newer than the one read matches when
+another write lands at exactly that revision in between. The insert then
+copies its old value from that write's row, not from the value the quota
+read. So a charge from the read value misses bytes, and the growth check
+misses growth. The review (Astra) gave three schedules. A 74-byte update
+lands at the compare revision of a 10-byte update: 64 bytes are not
+charged. A 4 KiB Lease create lands at the compare revision of an update of
+a missing Lease: 4096 bytes are not charged. A shrink to 10 bytes lands at
+the compare revision of a 1000-byte update: the value grows by 990 bytes,
+past the 64-byte slack. When the write that lands is the client's own
+delete, the update writes the key again with any value.
 
-**What.** While full, an update at the key's revision or at a newer one
-takes the update rules against the value it read: growth of at most
-`quotaGrowthSlack` (64 bytes), the cost key + new + old, the lane caps and
-the buckets. If it writes the key again after a delete, the row holds key +
-new, which is less than the charge. An update at an older revision still
-passes with no reservation, because it can never match: the newest row of a
-key only gets a higher id. It goes back only to 0, when compaction removes
-all rows of a deleted key, and an update never compares with 0 (the server
-sends a compare with 0 to `Create`).
+**What.** While full, an update passes only when its compare revision is the
+revision the quota read: the key's mod revision, or 0 when it has no live
+row. Upstream's insert statement copies the old value from the row with the
+compare revision (`ikv` in `insertSQL`), and kine never changes the value of
+a row after the insert (its only `UPDATE` sets `prev_revision` of
+`compact_rev_key`). So at the revision read, the row written holds exactly
+the value read, or the compare fails, and the charge key + new + old is
+exact. With no live row, the update at 0 is a create (key + value, the
+create rules). An update at an older revision still passes with no
+reservation, because it can never match: the newest row of a key only gets
+a higher id. It goes back only to 0, when compaction removes all rows of a
+deleted key, and the server sends a compare with 0 to `Create`, not to
+`Update`. Every other update is refused, with the reason `revision`. Below
+the limit nothing changes.
 
-**Effect on clients.** None for a client that compares with a revision it
-read. While full, an update at a newer revision that grows the value past
-the slack, or that its lane refuses, gets the no-space error, where before
-its compare failed.
+**Effect on clients.** None for an update that compares with the revision it
+read, which is what the apiserver sends. An update at an older revision
+still loses its compare and is not refused, so the apiserver's retry after a
+conflict works while full. While full, an update at a newer revision gets
+the no-space error, where before its compare failed (or, with `d31cd11`, it
+took the update rules).
 
-**Tests.** `TestKubehzP2UpdateAtNewerRevision`: a hook in the fake makes the
-delete land between the quota's read and the compare. A 1 MiB update at the
-next revision is refused before the backend; a small one is written at key
-+ new + old; an update at an older revision reaches the backend, loses its
-compare and reserves nothing. The `TestKubehzP2Lanes` case "stale compare
-revision" is now "newer compare revision, grows" (refused). Mutation: with
-the old test (`cur.ModRevision != revision` passes free), that case and the
-"grows" and "no growth" cases of `TestKubehzP2UpdateAtNewerRevision` fail.
+**Tests.** The fake backend keeps rows like the kine table: each write adds
+a row at the next revision, an update copies the old value from the row at
+its compare revision, and no row changes. (The review found that the fake
+returned fixed revisions and kept no old value, so a refund test passed for
+the wrong reason.) `TestKubehzP2UpdateAtNewerRevision` lands each of the
+three schedules, and the client's own delete, between the quota's read and
+the insert. Each case fails when the update writes a row that its
+reservation does not cover, grows the value past the slack, or reaches the
+backend. A write that lands before an update at the revision read makes its
+compare fail, with nothing reserved. An update at an older revision reaches
+the backend and reserves nothing. `TestKubehzP2Lanes` checks that each update
+that writes is charged exactly its row, and has the new case "newer compare
+revision, no growth" (refused). `TestKubehzP2Ceiling` and
+`TestKubehzP2LaneRate` update at the revision of the write before. With the
+production code of `8e9d2fa`, and with the refusal removed by hand, these
+fail: the Lanes cases "newer compare revision, no growth" and "small lease,
+no live key, at its delete revision", the Lease case of
+`TestKubehzP2UpdateAtDeleteRevision`, and the four landing cases of
+`TestKubehzP2UpdateAtNewerRevision` ("64 bytes not charged", "4096 bytes not
+charged", "grew the live value by 990 bytes", and the delete).
 
-**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAtNewerRevision' ./pkg/server/`.
-
-[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2, also says that an update at a
-stale compare revision passes without a charge. That is now true only for an
-older revision. The change that edits the guide must take this over too.
+**Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAt|TestKubehzP2Ceiling|TestKubehzP2LaneRate' ./pkg/server/`.
 
 ---
 

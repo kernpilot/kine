@@ -25,8 +25,11 @@ import (
 
 var errNotUsed = errors.New("not used by this test")
 
-// quotaFake records which writes reached the backend. Every write succeeds,
-// so a refused write can only have been refused by the quota wrapper.
+// quotaFake records which writes reached the backend. It keeps the rows of
+// each key like the kine table does: a write adds a row at the next revision,
+// and a row never changes after it is written. Create and Delete always
+// write, so a refused one can only have been refused by the quota wrapper.
+// Update keeps the contract of upstream's insert statement (see Update).
 type quotaFake struct {
 	mu        sync.Mutex
 	creates   []string
@@ -35,19 +38,24 @@ type quotaFake struct {
 	size      atomic.Int64
 	sizeErr   atomic.Pointer[error]
 	sizeReads atomic.Int64
-	// current is the value Get returns at revision modRev (0: revision 1);
-	// missing makes Get find no key; tombstone is then the revision of the
-	// key's delete row (0: the key never existed); onUpdate, when set, runs
-	// at the start of Update, before the compare (a write that lands between
-	// the quota's read and the insert); createErr fails every Create,
-	// updateErr every Update.
+	// A key with no rows yet starts with a live row that holds current at
+	// revision modRev (0: revision 1). With missing it has no live row:
+	// only a delete row at tombstone (0: no row at all). seq is the newest
+	// revision; it starts at the highest of these. onUpdate, when set, runs
+	// in Update before the compare, with the lock held: a write that lands
+	// between the quota's read and the insert (it calls put). createErr
+	// fails every Create, updateErr every Update.
 	current   []byte
 	modRev    int64
 	missing   bool
 	tombstone int64
-	onUpdate  func(*quotaFake)
+	seq       int64
+	onUpdate  func(f *quotaFake, key string)
 	createErr error
 	updateErr error
+	rows      map[string][]quotaRow
+	// stored is the row the last Update wrote.
+	stored quotaRow
 	// hold, when set, keeps the first Create inside the backend until it is
 	// closed; held is signalled when that Create arrives. heldErr is what
 	// that Create then returns.
@@ -57,24 +65,97 @@ type quotaFake struct {
 	heldErr error
 }
 
+// quotaRow is one row of the fake kine table.
+type quotaRow struct {
+	id      int64
+	value   []byte
+	old     []byte // the old_value column
+	deleted bool
+}
+
+// cost is what the row adds to the table: key + value + old value.
+func (r quotaRow) cost(key string) int64 { return int64(len(key) + len(r.value) + len(r.old)) }
+
+// log returns the rows of key, oldest first, and makes the first ones from
+// the fields above. The caller holds f.mu.
+func (f *quotaFake) log(key string) []quotaRow {
+	if f.rows == nil {
+		f.rows = map[string][]quotaRow{}
+	}
+	rows, ok := f.rows[key]
+	if !ok {
+		switch {
+		case !f.missing:
+			id := max(f.modRev, 1)
+			rows = []quotaRow{{id: id, value: f.current}}
+		case f.tombstone > 0:
+			rows = []quotaRow{{id: f.tombstone, deleted: true}}
+		}
+		for _, r := range rows {
+			f.seq = max(f.seq, r.id)
+		}
+		f.rows[key] = rows
+	}
+	return rows
+}
+
+// newest is the newest row of key; ok is false when the key has no row.
+// The caller holds f.mu.
+func (f *quotaFake) newest(key string) (quotaRow, bool) {
+	rows := f.log(key)
+	if len(rows) == 0 {
+		return quotaRow{}, false
+	}
+	return rows[len(rows)-1], true
+}
+
+// put is upstream's insert statement (since ca3c2d5): it writes only when
+// the newest row of key has the compare revision (0: no row), and the old
+// value is the value of the row with that id, if it is not a delete row. The
+// new row takes the next revision. It returns that revision, or 0 when the
+// compare fails. The caller holds f.mu.
+func (f *quotaFake) put(key string, value []byte, compare int64, deleted bool) int64 {
+	var newest int64
+	var old []byte
+	if r, ok := f.newest(key); ok {
+		newest = r.id
+		if !r.deleted {
+			old = r.value
+		}
+	}
+	if newest != compare {
+		return 0
+	}
+	f.seq++
+	row := quotaRow{id: f.seq, value: value, old: old, deleted: deleted}
+	f.rows[key] = append(f.rows[key], row)
+	if !deleted {
+		f.stored = row
+	}
+	return f.seq
+}
+
+// revOf is the revision of the newest row of key.
+func (f *quotaFake) revOf(key string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, _ := f.newest(key)
+	return r.id
+}
+
 func (f *quotaFake) Start(context.Context) error { return nil }
 
-func (f *quotaFake) Get(context.Context, string, int64, bool) (int64, *KeyValue, error) {
-	if f.missing {
-		return 1, nil, nil
+func (f *quotaFake) Get(_ context.Context, key string, _ int64, _ bool) (int64, *KeyValue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.newest(key)
+	if !ok || r.deleted {
+		return f.seq, nil, nil
 	}
-	return 1, &KeyValue{ModRevision: f.live(), Value: f.current}, nil
+	return f.seq, &KeyValue{Key: key, ModRevision: r.id, Value: r.value}, nil
 }
 
-// live is the revision of the key's live row.
-func (f *quotaFake) live() int64 {
-	if f.modRev == 0 {
-		return 1
-	}
-	return f.modRev
-}
-
-func (f *quotaFake) Create(_ context.Context, key string, _ []byte, _ int64) (int64, error) {
+func (f *quotaFake) Create(_ context.Context, key string, value []byte, _ int64) (int64, error) {
 	if f.createErr != nil {
 		return 0, f.createErr
 	}
@@ -88,12 +169,16 @@ func (f *quotaFake) Create(_ context.Context, key string, _ []byte, _ int64) (in
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.creates = append(f.creates, key)
-	return 2, nil
+	r, _ := f.newest(key)
+	return f.put(key, value, r.id, false), nil
 }
 
 func (f *quotaFake) Delete(_ context.Context, key string, _ int64) (int64, *KeyValue, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, key)
-	return 3, &KeyValue{Key: key}, true, nil
+	r, _ := f.newest(key)
+	return f.put(key, nil, r.id, true), &KeyValue{Key: key}, true, nil
 }
 
 func (f *quotaFake) List(context.Context, string, string, int64, int64, bool) (int64, []*KeyValue, error) {
@@ -104,28 +189,26 @@ func (f *quotaFake) Count(context.Context, string, string, int64) (int64, int64,
 	return 1, 0, nil
 }
 
-func (f *quotaFake) Update(_ context.Context, key string, _ []byte, revision, _ int64) (int64, *KeyValue, bool, error) {
+// Update is LogStructured.Update over upstream's insert statement: a row
+// only when the newest row of the key has the compare revision. For a
+// deleted key that is its delete row, so an update at that revision writes
+// the key again (upstream issue k3s-io/kine#825).
+func (f *quotaFake) Update(_ context.Context, key string, value []byte, revision, _ int64) (int64, *KeyValue, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates = append(f.updates, key)
+	f.log(key)
 	if f.onUpdate != nil {
-		f.onUpdate(f)
+		f.onUpdate(f, key)
 	}
 	if f.updateErr != nil {
 		return 0, nil, false, f.updateErr
 	}
-	// the compare-and-swap of the real backend (upstream's insert statement
-	// since ca3c2d5): a row only when revision is the key's newest row. For a
-	// deleted key that is its delete row, so an update at that revision
-	// writes the key again (upstream issue k3s-io/kine#825).
-	newest := f.live()
-	if f.missing {
-		newest = f.tombstone
+	rev := f.put(key, value, revision, false)
+	if rev == 0 {
+		return f.seq, nil, false, nil
 	}
-	if revision != newest {
-		return 1, nil, false, nil
-	}
-	return 4, &KeyValue{Key: key}, true, nil
+	return rev, &KeyValue{Key: key, ModRevision: rev, Value: value}, true, nil
 }
 
 func (f *quotaFake) ListStream(context.Context, string, string, int64, int64, bool) ListResult {
@@ -479,11 +562,11 @@ func bytesOf(n int) []byte { return []byte(strings.Repeat("x", n)) }
 // TestKubehzP2Lanes: what passes while full (B481). A control key (a Lease,
 // the compaction key) may be created small or updated without growth; any
 // other existing key may be updated without growth; a new key, a growing
-// value and a large control create are refused. An update that finds no live
-// key is a create (it can write the key again, upstream issue
-// k3s-io/kine#825): refused unless it is a small control key, which reserves
-// key + value. An update at a newer compare revision than the key's takes
-// the update rules (see TestKubehzP2UpdateAtNewerRevision).
+// value and a large control create are refused. An update passes only at the
+// revision the quota read: at another one it is refused (an older one passes
+// with no charge, see TestKubehzP2UpdateAtNewerRevision). With no live key
+// that is the compare revision 0, a create: a small control key reserves
+// key + value. An update that writes is charged exactly its row.
 func TestKubehzP2Lanes(t *testing.T) {
 	ctx := context.Background()
 	const lease = "/registry/leases/kube-system/kube-controller-manager"
@@ -506,22 +589,25 @@ func TestKubehzP2Lanes(t *testing.T) {
 		{"finalizer removal", false, "/registry/pods/default/a", 2000, 1990, 1, false, true, true},
 		{"other update grows", false, "/registry/pods/default/a", 10, 100, 1, false, false, false},
 		{"newer compare revision, grows", false, "/registry/pods/default/a", 10, 1000, 2, false, false, false},
+		{"newer compare revision, no growth", false, "/registry/pods/default/a", 10, 10, 2, false, false, false},
 		{"no live key, at its delete revision", false, "/registry/pods/default/b", 0, 1000, 1, true, false, false},
-		{"small lease, no live key", false, "/registry/leases/default/gone", 0, 200, 1, true, true, true},
+		{"small lease, no live key, at its delete revision", false, "/registry/leases/default/gone", 0, 200, 1, true, false, false},
 		{"large lease, no live key", false, "/registry/leases/default/gone", 0, quotaControlMaxValue + 1, 1, true, false, false},
+		{"small lease, no row, compare 0", false, "/registry/leases/default/none", 0, 200, 0, true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// a missing key was deleted at the compare revision: the update
-			// writes it again
+			// a missing key was deleted at the compare revision (or, at 0,
+			// never existed): an update there writes it again
 			fake := &quotaFake{current: bytesOf(tc.current), missing: tc.missing, tombstone: tc.revision}
 			quota := fullQuota(t)
 			b := WithQuota(fake, quota)
 			before := quota.Pending()
 			var err error
+			var ok bool
 			if tc.create {
 				_, err = b.Create(ctx, tc.key, bytesOf(tc.value), 0)
 			} else {
-				_, _, _, err = b.Update(ctx, tc.key, bytesOf(tc.value), tc.revision, 0)
+				_, _, ok, err = b.Update(ctx, tc.key, bytesOf(tc.value), tc.revision, 0)
 			}
 			if tc.pass && err != nil {
 				t.Fatalf("refused: %v", err)
@@ -542,6 +628,9 @@ func TestKubehzP2Lanes(t *testing.T) {
 				if want := int64(len(tc.key) + tc.value + tc.current); quota.Pending()-before != want {
 					t.Fatalf("pending grew by %d, want %d", quota.Pending()-before, want)
 				}
+				if row := fake.stored.cost(tc.key); !ok || row != quota.Pending()-before {
+					t.Fatalf("written %v, the row holds %d bytes, reserved %d; want the row written and charged exactly", ok, row, quota.Pending()-before)
+				}
 			}
 		})
 	}
@@ -549,95 +638,128 @@ func TestKubehzP2Lanes(t *testing.T) {
 
 // TestKubehzP2UpdateAtDeleteRevision: since upstream ca3c2d5 an update at the
 // revision of a deleted key's delete row writes the key again with any value
-// (upstream issue k3s-io/kine#825). While full that is a create. A key that
-// is not a small control key is refused before it reaches the backend, as
-// often as the client deletes and updates, and reserves nothing. A small
-// control key passes in the control lane at a create's cost, key + value;
-// when its compare fails, it gives that cost back.
+// (upstream issue k3s-io/kine#825). While full, an update that finds no live
+// key passes only with the compare revision 0 (a create). So this update is
+// refused before it reaches the backend, for a Lease too, as often as the
+// client deletes and updates, and it reserves nothing. Below the limit it is
+// written, as upstream does. The fake keeps the real sequence: the update at
+// the delete revision 7 writes revision 8, and an update at 8 writes 9.
 func TestKubehzP2UpdateAtDeleteRevision(t *testing.T) {
 	ctx := context.Background()
 	const pod, lease, deleted = "/registry/pods/default/a", "/registry/leases/default/a", 7
 
-	t.Run("other key", func(t *testing.T) {
+	for _, key := range []string{pod, lease} {
+		t.Run("full, "+key, func(t *testing.T) {
+			fake := &quotaFake{missing: true, tombstone: deleted}
+			quota := fullQuota(t)
+			backend := WithQuota(fake, quota)
+			l := &LimitedServer{backend: backend}
+			before := quota.Pending()
+			for i := range 3 {
+				// the apiserver's update transaction at the delete revision
+				if _, err := l.Txn(ctx, putTxn(key, deleted)); !isNoSpace(err) {
+					t.Fatalf("update transaction %d at the delete revision: got %v, want %v", i, err, ErrNoSpace)
+				}
+			}
+			for _, n := range []int{200, 1 << 20} {
+				if _, _, _, err := backend.Update(ctx, key, bytesOf(n), deleted, 0); !isNoSpace(err) {
+					t.Fatalf("a %d-byte update at the delete revision: got %v, want %v", n, err, ErrNoSpace)
+				}
+			}
+			if len(fake.updates) != 0 || quota.Pending() != before {
+				t.Fatalf("updates that reached the backend %v, pending grew by %d; want none and 0", fake.updates, quota.Pending()-before)
+			}
+		})
+	}
+
+	t.Run("below the limit", func(t *testing.T) {
 		fake := &quotaFake{missing: true, tombstone: deleted}
-		quota := fullQuota(t)
+		quota := NewQuota(1 << 30)
 		backend := WithQuota(fake, quota)
-		l := &LimitedServer{backend: backend}
-		before := quota.Pending()
-		for i := range 3 {
-			// the apiserver's update transaction at the delete revision
-			if _, err := l.Txn(ctx, putTxn(pod, deleted)); !isNoSpace(err) {
-				t.Fatalf("update transaction %d at the delete revision: got %v, want %v", i, err, ErrNoSpace)
+		for _, compare := range []int64{deleted, deleted + 1} {
+			rev, _, ok, err := backend.Update(ctx, pod, bytesOf(10), compare, 0)
+			if err != nil || !ok || rev != compare+1 {
+				t.Fatalf("the update at revision %d: revision %d, written %v, %v; want revision %d written", compare, rev, ok, err, compare+1)
 			}
 		}
-		if _, _, _, err := backend.Update(ctx, pod, bytesOf(1<<20), deleted, 0); !isNoSpace(err) {
-			t.Fatalf("a 1 MiB update at the delete revision: got %v, want %v", err, ErrNoSpace)
-		}
-		if len(fake.updates) != 0 || quota.Pending() != before {
-			t.Fatalf("updates that reached the backend %v, pending grew by %d; want none and 0", fake.updates, quota.Pending()-before)
-		}
-	})
-
-	t.Run("small control key", func(t *testing.T) {
-		fake := &quotaFake{missing: true, tombstone: deleted}
-		quota := fullQuota(t)
-		backend := WithQuota(fake, quota)
-		before := quota.Pending()
-		if _, _, ok, err := backend.Update(ctx, lease, bytesOf(200), deleted, 0); err != nil || !ok {
-			t.Fatalf("a small Lease update at the delete revision: ok %v, %v; want it written", ok, err)
-		}
-		if want := int64(len(lease) + 200); quota.Pending()-before != want {
-			t.Fatalf("pending grew by %d, want %d (key + value, a create)", quota.Pending()-before, want)
-		}
-		before = quota.Pending()
-		if _, _, ok, err := backend.Update(ctx, lease, bytesOf(200), deleted+1, 0); err != nil || ok {
-			t.Fatalf("a Lease update at another revision: ok %v, %v; want a lost compare-and-swap", ok, err)
-		}
-		if quota.Pending() != before {
-			t.Fatalf("pending grew by %d after a lost compare-and-swap, want 0", quota.Pending()-before)
-		}
-		if len(fake.updates) != 2 {
-			t.Fatalf("updates that reached the backend: %v, want two", fake.updates)
+		if want := int64(2 * (len(pod) + 2*10)); quota.Pending() != want {
+			t.Fatalf("pending %d, want %d (key + 2 x value, twice)", quota.Pending(), want)
 		}
 	})
 }
 
-// TestKubehzP2UpdateAtNewerRevision: an update whose compare revision is
-// newer than the key's writes when another write lands at that revision
-// between the quota's read and the insert. If that write is the client's own
-// delete, the update writes the key again with any value (upstream issue
-// k3s-io/kine#825). So while full it takes the rules of an update of the
-// value it read: a value that grows past the slack is refused before the
-// backend, a small one passes at key + new + old. An update at an older
+// TestKubehzP2UpdateAtNewerRevision: while full, an update whose compare
+// revision is newer than the revision the quota read is refused before the
+// backend. Another write can land at that revision between the quota's read
+// and the insert. The insert then matches and copies its old value from that
+// write's row, not from the value the quota read. So a charge from the read
+// value can miss bytes, and the growth check can miss growth. Each subtest
+// lands one such write (the fake's hook) and fails when the update writes a
+// row that its reservation does not cover, grows the value past the slack,
+// or reaches the backend at all. An update at the revision read cannot be
+// fooled: when a write lands first, its compare fails. An update at an older
 // revision can never write: it reaches the backend and reserves nothing.
 func TestKubehzP2UpdateAtNewerRevision(t *testing.T) {
 	ctx := context.Background()
-	const pod = "/registry/pods/default/a"
-	// the key is live at revision 1 when the quota reads it; the client's
-	// own delete lands at revision 2 before the insert
-	deleteFirst := func(f *quotaFake) { f.missing, f.tombstone = true, 2 }
+	const pod, lease = "/registry/pods/default/a", "/registry/leases/default/a"
+	// lands writes value at the key's next revision before the insert
+	lands := func(value []byte, deleted bool) func(*quotaFake, string) {
+		return func(f *quotaFake, key string) {
+			r, _ := f.newest(key)
+			f.put(key, value, r.id, deleted)
+		}
+	}
 
-	t.Run("grows", func(t *testing.T) {
-		fake := &quotaFake{current: bytesOf(10), onUpdate: deleteFirst}
+	for _, tc := range []struct {
+		name    string
+		key     string
+		fake    *quotaFake
+		value   int
+		compare int64
+	}{
+		// read 10 bytes at revision 1; a 74-byte update lands at 2
+		{"an update lands at the compare revision", pod,
+			&quotaFake{current: bytesOf(10), onUpdate: lands(bytesOf(10+quotaGrowthSlack), false)}, 10, 2},
+		// no live Lease; a 4 KiB create lands at 7
+		{"a create lands at the compare revision", lease,
+			&quotaFake{missing: true, seq: 6, onUpdate: lands(bytesOf(quotaControlMaxValue), false)}, 200, 7},
+		// read 1000 bytes at revision 1; a shrink to 10 bytes lands at 2
+		{"a shrink lands at the compare revision", pod,
+			&quotaFake{current: bytesOf(1000), onUpdate: lands(bytesOf(10), false)}, 1000, 2},
+		// read 10 bytes at revision 1; the client's own delete lands at 2
+		{"a delete lands at the compare revision", pod,
+			&quotaFake{current: bytesOf(10), onUpdate: lands(nil, true)}, 10, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := tc.fake
+			quota := fullQuota(t)
+			before := quota.Pending()
+			_, _, ok, err := WithQuota(fake, quota).Update(ctx, tc.key, bytesOf(tc.value), tc.compare, 0)
+			if ok {
+				row := fake.stored.cost(tc.key)
+				if got := quota.Pending() - before; got < row {
+					t.Errorf("the update wrote a row of %d bytes and reserved %d: %d bytes not charged", row, got, row-got)
+				}
+				if grow := len(fake.stored.value) - len(fake.stored.old); grow > quotaGrowthSlack {
+					t.Errorf("the update grew the live value by %d bytes, past the slack of %d", grow, quotaGrowthSlack)
+				}
+			}
+			if !isNoSpace(err) || len(fake.updates) != 0 || quota.Pending() != before {
+				t.Fatalf("got %v, written %v, %d updates at the backend, pending grew by %d; want %v before the backend",
+					err, ok, len(fake.updates), quota.Pending()-before, ErrNoSpace)
+			}
+		})
+	}
+
+	t.Run("an update lands after the read, at the revision read", func(t *testing.T) {
+		fake := &quotaFake{current: bytesOf(10), onUpdate: lands(bytesOf(10+quotaGrowthSlack), false)}
 		quota := fullQuota(t)
 		before := quota.Pending()
-		if _, _, _, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(1<<20), 2, 0); !isNoSpace(err) {
-			t.Fatalf("a 1 MiB update at the next revision: got %v, want %v", err, ErrNoSpace)
+		if _, _, ok, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(10), 1, 0); err != nil || ok {
+			t.Fatalf("an update at the revision read: written %v, %v; want a lost compare-and-swap", ok, err)
 		}
-		if len(fake.updates) != 0 || quota.Pending() != before {
-			t.Fatalf("updates that reached the backend %v, pending grew by %d; want none and 0", fake.updates, quota.Pending()-before)
-		}
-	})
-
-	t.Run("no growth", func(t *testing.T) {
-		fake := &quotaFake{current: bytesOf(10), onUpdate: deleteFirst}
-		quota := fullQuota(t)
-		before := quota.Pending()
-		if _, _, ok, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(10), 2, 0); err != nil || !ok {
-			t.Fatalf("a small update at the next revision: ok %v, %v; want it written", ok, err)
-		}
-		if want := int64(len(pod) + 10 + 10); quota.Pending()-before != want {
-			t.Fatalf("pending grew by %d, want %d (key + new + old)", quota.Pending()-before, want)
+		if len(fake.updates) != 1 || quota.Pending() != before {
+			t.Fatalf("updates that reached the backend %v, pending grew by %d; want one and 0", fake.updates, quota.Pending()-before)
 		}
 	})
 
@@ -646,7 +768,7 @@ func TestKubehzP2UpdateAtNewerRevision(t *testing.T) {
 		quota := fullQuota(t)
 		before := quota.Pending()
 		if _, _, ok, err := WithQuota(fake, quota).Update(ctx, pod, bytesOf(1<<20), 2, 0); err != nil || ok {
-			t.Fatalf("an update at an older revision: ok %v, %v; want a lost compare-and-swap", ok, err)
+			t.Fatalf("an update at an older revision: written %v, %v; want a lost compare-and-swap", ok, err)
 		}
 		if len(fake.updates) != 1 || quota.Pending() != before {
 			t.Fatalf("updates that reached the backend %v, pending grew by %d; want one and 0", fake.updates, quota.Pending()-before)
@@ -666,13 +788,14 @@ func TestKubehzP2Ceiling(t *testing.T) {
 	cost := int64(len(lease) + 100 + 100)
 
 	quota.Observe(quota.Ceiling() - cost)
-	if _, _, _, err := b.Update(ctx, lease, bytesOf(100), 1, 0); err != nil {
+	rev, _, _, err := b.Update(ctx, lease, bytesOf(100), 1, 0)
+	if err != nil {
 		t.Fatalf("a lane write that ends on the ceiling: %v", err)
 	}
-	if _, _, _, err := b.Update(ctx, lease, bytesOf(100), 1, 0); !isNoSpace(err) {
+	if _, _, _, err := b.Update(ctx, lease, bytesOf(100), rev, 0); !isNoSpace(err) {
 		t.Fatalf("a lane write past the ceiling: got %v, want %v", err, ErrNoSpace)
 	}
-	if _, _, _, err := b.Delete(ctx, lease, 1); err != nil {
+	if _, _, _, err := b.Delete(ctx, lease, rev); err != nil {
 		t.Fatalf("a delete at the ceiling: %v", err)
 	}
 	if len(fake.updates) != 1 || len(fake.deletes) != 1 {
@@ -695,7 +818,7 @@ func TestKubehzP2LaneRate(t *testing.T) {
 	fake := &quotaFake{current: bytesOf(10)}
 	b := WithQuota(fake, fullQuota(t))
 	update := func(key string) error {
-		_, _, _, err := b.Update(ctx, key, bytesOf(10), 1, 0)
+		_, _, _, err := b.Update(ctx, key, bytesOf(10), fake.revOf(key), 0)
 		return err
 	}
 	for i := 0; i < 2; i++ {
