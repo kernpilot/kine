@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
+	"github.com/k3s-io/kine/pkg/query"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,13 +33,13 @@ type Backend interface {
 	Create(ctx context.Context, key string, value []byte, lease int64) (int64, error)
 	Delete(ctx context.Context, key string, revision int64) (int64, *KeyValue, bool, error)
 	List(ctx context.Context, key, end string, limit, revision int64, keysOnly bool) (int64, []*KeyValue, error)
+	ListStream(ctx context.Context, key, end string, limit, revision int64, keysOnly bool) ListResult
 	Count(ctx context.Context, key, end string, revision int64) (int64, int64, error)
 	Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *KeyValue, bool, error)
-	Watch(ctx context.Context, key, end string, revision int64) WatchResult
+	Watch(ctx context.Context, revision int64) WatchResult
 	DbSize(ctx context.Context) (int64, error)
 	CurrentRevision(ctx context.Context) (int64, error)
 	Compact(ctx context.Context, revision int64) (int64, error)
-	WaitForSyncTo(revision int64)
 }
 
 type Dialect interface {
@@ -47,15 +49,17 @@ type Dialect interface {
 	Count(ctx context.Context, key, end string, revision int64) (int64, int64, int64, error)
 	CurrentRevision(ctx context.Context) (int64, error)
 	After(ctx context.Context, key, end string, rev, limit int64) (*sql.Rows, error)
-	//nolint:revive
-	Insert(ctx context.Context, key string, create, delete bool, createRevision, previousRevision int64, ttl int64, value []byte) (int64, error)
+	PrepareAfter(ctx context.Context, limit int64) (*query.Stmt, error)
+	QueryAfter(ctx context.Context, stmt *query.Stmt, rev int64) (*sql.Rows, error)
+	Insert(ctx context.Context, key string, created, deleted bool, previousRevision int64, ttl int64, value []byte) (int64, error)
 	DeleteRevision(ctx context.Context, revision int64) error
 	GetCompactRevision(ctx context.Context) (int64, error)
 	SetCompactRevision(ctx context.Context, revision int64) error
-	Compact(ctx context.Context, revision int64) (int64, error)
+	Compact(ctx context.Context, from, to int64) (int64, error)
 	PostCompact(ctx context.Context) error
 	Fill(ctx context.Context, revision int64) error
 	IsFill(key string) bool
+	IsTxRetry(err error) bool
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (Transaction, error)
 	GetSize(ctx context.Context) (int64, error)
 	FillRetryDelay(ctx context.Context)
@@ -69,7 +73,8 @@ type Transaction interface {
 	MustRollback()
 	GetCompactRevision(ctx context.Context) (int64, error)
 	SetCompactRevision(ctx context.Context, revision int64) error
-	Compact(ctx context.Context, revision int64) (int64, error)
+	Compact(ctx context.Context, from, to int64) (int64, error)
+	Insert(ctx context.Context, key string, created, deleted bool, previousRevision int64, ttl int64, value []byte) (int64, error)
 	DeleteRevision(ctx context.Context, revision int64) error
 	CurrentRevision(ctx context.Context) (int64, error)
 }
@@ -83,7 +88,25 @@ type KeyValue struct {
 	Lease          int64
 }
 
-type Events []*Event
+type EventBatch struct {
+	Events     []*Event
+	CurrentRev int64
+}
+
+func (e EventBatch) After(rev int64) EventBatch {
+	events := e.Events
+	for len(events) > 0 && events[0] != nil && events[0].KV.ModRevision <= rev {
+		events = events[1:]
+	}
+	if len(events) != len(e.Events) {
+		return EventBatch{Events: events, CurrentRev: e.CurrentRev}
+	}
+	return e
+}
+
+func (e EventBatch) String() string {
+	return fmt.Sprintf("{current_rev:%d events:%v}", e.CurrentRev, e.Events)
+}
 
 type Event struct {
 	Delete bool
@@ -96,10 +119,26 @@ func (e *Event) InRange(key, end string) bool {
 	return e != nil && e.KV != nil && (key == "" || (end != "" && e.KV.Key >= key && e.KV.Key < end) || e.KV.Key == key)
 }
 
+func (e *Event) String() string {
+	op := "="
+	if e.Create {
+		op = "+"
+	} else if e.Delete {
+		op = "-"
+	}
+	return fmt.Sprintf("%s%s@%d", op, e.KV.Key, e.KV.ModRevision)
+}
+
 type WatchResult struct {
 	CurrentRevision int64
 	CompactRevision int64
-	Events          <-chan []*Event
+	Eventc          <-chan EventBatch
+	Errorc          <-chan error
+}
+
+type ListResult struct {
+	CurrentRevision int64
+	KVc             <-chan *KeyValue
 	Errorc          <-chan error
 }
 

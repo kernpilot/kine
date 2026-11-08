@@ -1,13 +1,15 @@
 package logstructured
 
 // KUBEHZ-PATCH P2 test: the TTL delete timeout (kubehz_ttl.go). A fake log,
-// no database. A TTL delete reads its key, then its insert stalls. While it
-// waits, the key gets two newer values and a compaction removes the row the
-// insert would conflict with (the relief has no --compact-min-retain floor).
-// The timeout must end the delete before the insert, report the context
-// error so the TTL loop tries again, and leave the newest value. With no
-// timeout the stalled insert passes its compare-and-swap and deletes the
-// newest value, so this test fails.
+// no database. A TTL delete inserts its delete row in one statement, which
+// compares the key's newest row with the revision the TTL loop holds
+// (upstream ca3c2d5). The statement stalls after that compare and before its
+// unique check. While it waits, the key gets two newer values and a
+// compaction removes the row the insert would conflict with (the relief has
+// no --compact-min-retain floor). The timeout must end the delete before the
+// insert, report the context error so the TTL loop tries again, and leave the
+// newest value. With no timeout the stalled insert passes its unique check
+// and deletes the newest value, so this test fails.
 
 import (
 	"context"
@@ -59,7 +61,7 @@ func TestKubehzP2TTLDeleteTimeout(t *testing.T) {
 	}
 	assertNewest(t, l, key, newest)
 
-	// The TTL loop tries again with the revision it read: the compare fails
+	// The TTL loop tries again with the revision it holds: the compare fails
 	// and nothing is deleted.
 	if _, _, deleted, err := b.Delete(context.Background(), key, read); deleted || err != nil {
 		t.Fatalf("the retry returned deleted=%v err=%v, want not deleted and no error", deleted, err)
@@ -114,10 +116,12 @@ func assertNewest(t *testing.T, l *LogStructured, key string, rev int64) {
 	}
 }
 
-// stallLog is an in-memory Log. Its first delete insert signals stalled and
-// waits for its context or for release. Inserts enforce the unique
-// (name, prev_revision) pair of the SQL schema, which is the
-// compare-and-swap of a delete.
+// stallLog is an in-memory Log. Append is upstream's insert statement: it
+// writes nothing (revision 0, no error) unless the key's newest row is the
+// event's previous revision (0 for no row), and the unique
+// (name, prev_revision) pair of the SQL schema refuses a second writer. The
+// first delete stalls between the compare (the statement's snapshot) and the
+// unique check, and waits for its context or for release.
 type stallLog struct {
 	mu      sync.Mutex
 	rows    []*server.Event
@@ -173,20 +177,32 @@ func (s *stallLog) latest(key string) *server.Event {
 	return last
 }
 
-func (s *stallLog) List(ctx context.Context, key, _ string, _, _ int64, includeDeletes, _ bool) (int64, server.Events, error) {
+func (s *stallLog) List(ctx context.Context, key, _ string, _, _ int64, includeDeletes, _ bool) (server.EventBatch, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, nil, err
+		return server.EventBatch{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	last := s.latest(key)
 	if last == nil || (last.Delete && !includeDeletes) {
-		return s.rev, nil, nil
+		return server.EventBatch{CurrentRev: s.rev}, nil
 	}
-	return s.rev, server.Events{last}, nil
+	return server.EventBatch{CurrentRev: s.rev, Events: []*server.Event{last}}, nil
 }
 
 func (s *stallLog) Append(ctx context.Context, event *server.Event) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	newest := int64(0)
+	if last := s.latest(event.KV.Key); last != nil {
+		newest = last.KV.ModRevision
+	}
+	s.mu.Unlock()
+	if newest != event.PrevKV.ModRevision {
+		return 0, nil
+	}
 	if event.Delete {
 		first := false
 		s.once.Do(func() { first = true; close(s.stalled) })
@@ -226,10 +242,12 @@ func (s *stallLog) CompactRevision(context.Context) (int64, error) { return 0, n
 func (s *stallLog) Count(context.Context, string, string, int64) (int64, int64, error) {
 	return 0, 0, errors.New("stallLog: Count is not used")
 }
-func (s *stallLog) After(context.Context, string, string, int64, int64) (int64, server.Events, error) {
-	return 0, nil, errors.New("stallLog: After is not used")
+func (s *stallLog) After(context.Context, string, string, int64, int64) (server.EventBatch, error) {
+	return server.EventBatch{}, errors.New("stallLog: After is not used")
 }
-func (s *stallLog) Watch(context.Context, string, string) <-chan server.Events { return nil }
-func (s *stallLog) DbSize(context.Context) (int64, error)                      { return 0, nil }
-func (s *stallLog) Compact(context.Context, int64) (int64, error)              { return 0, nil }
-func (s *stallLog) WaitForSyncTo(int64)                                        {}
+func (s *stallLog) ListStream(context.Context, string, string, int64, int64, bool, bool) server.ListResult {
+	return server.ListResult{}
+}
+func (s *stallLog) Watch(context.Context) <-chan server.EventBatch { return nil }
+func (s *stallLog) DbSize(context.Context) (int64, error)          { return 0, nil }
+func (s *stallLog) Compact(context.Context, int64) (int64, error)  { return 0, nil }

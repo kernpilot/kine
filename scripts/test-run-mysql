@@ -5,9 +5,14 @@ start-test() {
     local port=$(cat $TEST_DIR/databases/*/metadata/port)
     local pass=$(cat $TEST_DIR/databases/*/metadata/password)
     local image=$(cat $TEST_DIR/databases/*/metadata/image)
+    local db_status_command="--execute=status"
     # Starting with mariadb 11, you have to call to mariadb instead of mysql
     if [[ $image == *mariadb* ]]; then
        db_type="mariadb"
+    elif [[ $image == *mysql:9.7 ]]; then
+       # MySQL 9.7 treats "status" in --execute as SQL instead of a client command.
+       db_type="mysqladmin"
+       db_status_command="status"
     else
        db_type="mysql"
     fi
@@ -20,9 +25,10 @@ start-test() {
           --port=$port
           --user=root
           --password=$pass
-          --execute=status" \
+          $db_status_command" \
     timeout --foreground 1m bash -c "wait-for-db-connection"
     KINE_IMAGE=$IMAGE KINE_ENDPOINT="mysql://root:$pass@tcp($ip:$port)/kine" run-apiserver-tests
+    KINE_IMAGE=$IMAGE KINE_ENDPOINT="split://root:$pass@tcp($ip:$port)/kine?&driver=mysql" KINE_DATASTORE_POLL_INTERVAL=50ms run-apiserver-tests
     KINE_IMAGE=$IMAGE KINE_ENDPOINT="mysql://root:$pass@tcp($ip:$port)/kine" provision-kine
     local kine_url=$(cat $TEST_DIR/kine/*/metadata/url)
     K3S_DATASTORE_ENDPOINT=$kine_url provision-cluster
@@ -30,11 +36,12 @@ start-test() {
 export -f start-test
 
 VERSION_LIST="\
+    mysql 9.7
     mysql 8.4
-    mysql 8.0
+    mariadb 12.3
+    mariadb 11.8
     mariadb 11.4
-    mariadb 10.11
-    mariadb 10.6"
+    mariadb 10.11"
 
 while read ENGINE VERSION; do
     LABEL=$ENGINE-$VERSION DB_PASSWORD_ENV=MYSQL_ROOT_PASSWORD DB_IMAGE=docker.io/library/$ENGINE:$VERSION run-test

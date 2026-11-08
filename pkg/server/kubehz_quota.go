@@ -208,8 +208,8 @@ type SizeSource func(context.Context) (int64, error)
 // LiveSizer is an optional interface a backend, a log or a dialect can offer
 // when it can report live data bytes apart from the file size. It returns
 // nil when the layer underneath has no such figure, so a caller can fall
-// back without a probe query. It is asserted at the call site on purpose,
-// like RevisionNotify in P1, so the server.Backend interface stays upstream's.
+// back without a probe query. It is asserted at the call site on purpose, so
+// the server.Backend interface stays upstream's.
 type LiveSizer interface {
 	LiveSize() SizeSource
 }
@@ -499,7 +499,7 @@ func (q *Quota) Sample(ctx context.Context, live, physical SizeSource) error {
 func (q *Quota) sample(ctx context.Context, live, physical SizeSource, advance bool) error {
 	mark := q.committed.Load()
 	if physical != nil {
-		if size, err := query(ctx, physical); err != nil {
+		if size, err := querySize(ctx, physical); err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
@@ -509,7 +509,7 @@ func (q *Quota) sample(ctx context.Context, live, physical SizeSource, advance b
 			q.ObservePhysical(size)
 		}
 	}
-	size, err := query(ctx, live)
+	size, err := querySize(ctx, live)
 	if err != nil {
 		if ctx.Err() == nil {
 			metrics.QuotaSampleErrors.Inc()
@@ -535,7 +535,8 @@ func (q *Quota) sample(ctx context.Context, live, physical SizeSource, advance b
 // the store order; nil outside tests.
 var quotaSampleHook func()
 
-func query(ctx context.Context, src SizeSource) (int64, error) {
+// querySize reads one size under quotaQueryTimeout.
+func querySize(ctx context.Context, src SizeSource) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, quotaQueryTimeout)
 	defer cancel()
 	return src(ctx)

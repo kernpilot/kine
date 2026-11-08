@@ -103,7 +103,11 @@ func (f *quotaFake) Update(_ context.Context, key string, _ []byte, revision, _ 
 	return 4, &KeyValue{Key: key}, true, nil
 }
 
-func (f *quotaFake) Watch(context.Context, string, string, int64) WatchResult { return WatchResult{} }
+func (f *quotaFake) ListStream(context.Context, string, string, int64, int64, bool) ListResult {
+	return ListResult{}
+}
+
+func (f *quotaFake) Watch(context.Context, int64) WatchResult { return WatchResult{} }
 
 func (f *quotaFake) DbSize(context.Context) (int64, error) {
 	f.sizeReads.Add(1)
@@ -115,7 +119,6 @@ func (f *quotaFake) DbSize(context.Context) (int64, error) {
 
 func (f *quotaFake) CurrentRevision(context.Context) (int64, error) { return 1, nil }
 func (f *quotaFake) Compact(context.Context, int64) (int64, error)  { return 1, nil }
-func (f *quotaFake) WaitForSyncTo(int64)                            {}
 
 // compile-time check: the fake is a full Backend, so the wrapper's embedding
 // forwards every method it does not override.

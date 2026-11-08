@@ -1,13 +1,21 @@
 package query
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
+// LimitToken marks the position in a query where WithLimit should place the
+// row limit clause. It is written as a comment so that a query carrying it
+// remains valid SQL even if the limit is never applied.
+const LimitToken = "/* LIMIT */"
+
 var whitespace = regexp.MustCompile(`[\n\t ]+`)
+
 var params = regexp.MustCompile(`\?|\$[0-9]+`)
 
 // Named is a named SQL query string that formats nicely when stringed.
@@ -39,6 +47,21 @@ func (n *Named) Appendf(format string, a ...any) *Named {
 	return &Named{Name: n.Name, Query: n.Query + " " + fmt.Sprintf(format, a...)}
 }
 
+// WithLimit returns a copy of the named query with a row limit applied.
+// If limit is less than 1, the query is returned without modification; no
+// limit is applied. If the query contains a LimitToken placeholder, the
+// placeholder comment is replaced with the limit clause. If it does not, the
+// limit clause is appended.
+func (n *Named) WithLimit(limit int64) *Named {
+	if limit < 1 {
+		return n
+	}
+	if strings.Contains(n.Query, LimitToken) {
+		return &Named{Name: n.Name, Query: strings.Replace(n.Query, LimitToken, fmt.Sprintf("LIMIT %d", limit), 1)}
+	}
+	return n.Appendf("LIMIT %d", limit)
+}
+
 // String nicely formats the query and name for printing in logs.
 func (n *Named) String() string {
 	if n.Name == "" {
@@ -64,6 +87,24 @@ func (f *Filled) String() string {
 
 func (f *Filled) QueryString() string {
 	return fmt.Sprintf(params.ReplaceAllString(f.Query, "%v"), summarize(f.Args)...)
+}
+
+// Stmt is a wrapper around sql.Stmt that remembers what query it was prepared from
+type Stmt struct {
+	*Named
+	Conn *sql.Conn
+	Stmt *sql.Stmt
+}
+
+func (s *Stmt) Close() error {
+	var serr, cerr error
+	if s.Stmt != nil {
+		serr = s.Stmt.Close()
+	}
+	if s.Conn != nil {
+		cerr = s.Conn.Close()
+	}
+	return errors.Join(serr, cerr)
 }
 
 func Strip(s string) string {
