@@ -35,7 +35,7 @@ var (
 
 	QuotaRefused = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kine_quota_refused_total",
-		Help: "Puts refused with the no-space error, by reason: create, growth, rate, ceiling, read, revision.",
+		Help: "Puts refused with the no-space error, by reason: create, growth, rate, ceiling, read.",
 	}, []string{"reason"})
 
 	QuotaLaneWrites = prometheus.NewCounterVec(prometheus.CounterOpts{

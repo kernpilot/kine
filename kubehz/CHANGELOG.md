@@ -271,7 +271,9 @@ write can land at a compare revision that the quota did not read.
 the no-space error, where before its compare failed. An apiserver update of
 an object that another client deleted meanwhile then fails with a server
 error, where before it got "not found". A retry gets "not found" when the
-apiserver has seen the delete.
+apiserver has seen the delete. (Superseded by the last P2 fix entry below:
+such an update now gets a failed compare with no key, and the apiserver
+reports "not found".)
 
 **Tests.** The fake backend enforces the real contract: an update at the
 revision of a deleted key's delete row writes a row, at the next revision.
@@ -322,7 +324,9 @@ exact. With no live row, the update at 0 is a create (key + value, the
 create rules). The quota answers an update at an older revision itself, as
 a lost compare-and-swap, and the backend never sees it (see "Older
 revisions" below). Every other update is refused, with the reason
-`revision`. Below the limit nothing changes.
+`revision`. Below the limit nothing changes. (Superseded by the next entry:
+the quota answers those updates as a lost compare-and-swap too, and the
+reason `revision` is removed.)
 
 **Older revisions.** As first written (`3ffdb3c`), an update at an older
 revision went to the backend with no reservation, on the claim that it can
@@ -346,7 +350,7 @@ gets the same failed compare as before, so the apiserver's retry after a
 conflict works while full. The key in that answer is the one the quota
 read. While full, an update at a newer revision gets the no-space error,
 where before its compare failed (or, with `d31cd11`, it took the update
-rules).
+rules). (Superseded by the next entry: it gets a failed compare.)
 
 **Tests.** The fake backend keeps rows like the kine table: each write adds
 a row at the next revision, an update copies the old value from the row at
@@ -378,6 +382,73 @@ charged", "grew the live value by 990 bytes", and the delete).
 **Re-check** `go test -tags=test -race -run 'TestKubehzP2Lanes|TestKubehzP2UpdateAt|TestKubehzP2Ceiling|TestKubehzP2LaneRate' ./pkg/server/`
 (`TestKubehzP2UpdateAt` matches the delete, newer and older revision
 tests).
+
+### P2 fix — while full, an update at a revision the quota did not read gets a lost compare (upstream issue k3s-io/kine#825)
+
+Touches `admitUpdate` in `pkg/server/kubehz_quota.go` and its doc and file
+comments, the help text of `kine_quota_refused_total` (the reason
+`revision` is removed), `pkg/server/kubehz_quota_test.go`, and
+[MERGE-GUIDE.md](MERGE-GUIDE.md#p2), rule 2.
+
+**Why.** The two entries above refuse two updates while full with the
+no-space error: an update at a newer compare revision, and an update of a
+key with no live row at a revision above 0 (this includes upstream issue
+825, the update at a delete revision). The apiserver does not retry an
+error, so an update from a stale object fails with a server error while
+full. A lost compare-and-swap from the quota is as safe as a refusal: the
+backend sees nothing and writes nothing. It is also the answer that the
+client gets without the quota, when no other write lands first.
+
+**What.** While full, the quota answers every update whose compare revision
+is not the one it read as `LogStructured.Update` answers a lost
+compare-and-swap (`pkg/logstructured/logstructured.go:199-206`). That code
+reads the key with `l.get(ctx, key, 0, false, false)`. It returns
+`(rev, nil, false, err)` when it finds no live key, else
+`(rev, event.KV, false, nil)`. `get` returns a nil error when the key has
+no live row (`logstructured.go:73-74`), so with no live key the answer is
+`(rev, nil, false, nil)`, with no error. The quota's own read is
+`LogStructured.Get`: the same `get` call, and the same `adjustRevision`. Its
+revision and key (or no key) are the answer. This is also what
+`LogStructured.Update` did before upstream `ca3c2d5`, when it read the key
+before the insert (`(0, nil, false, nil)` with no live key, the revision
+then set to the current one, and `(rev, event.KV, false, nil)` at another
+revision). Nothing is reserved and no refusal is counted.
+`LimitedServer.update` (`pkg/server/update.go:54-81`) then answers the
+transaction with `Succeeded: false` and a range response with the key, or
+with no key. A failed read is still refused, with the reason `read`. No
+code uses the reason `revision` now, so it is removed from the code and
+from the help text of `kine_quota_refused_total`. It was added on this
+branch and was never released, so no alert or dashboard uses it.
+
+**Effect on clients.** Only while full. An update at a newer compare
+revision gets a failed compare with the key as read. An update of a key
+with no live row at a revision above 0 gets a failed compare with no key,
+and the apiserver reports "not found". The update at a deleted key's delete
+revision writes nothing while full. Below the limit it writes the key
+again, as upstream does. While full, the no-space error on an update now
+comes only from the update rules (growth, ceiling, rate) and from a failed
+read.
+
+**Tests.** `TestKubehzP2Lanes`: the five cases at a newer revision, or with
+no live key at a revision above 0, want a lost compare-and-swap: no error,
+not written, not at the backend, nothing reserved.
+`TestKubehzP2UpdateAtDeleteRevision` (the shape of upstream issue 825):
+while full, the update transaction at the delete revision gets
+`Succeeded: false`, the revision 7 and no key, three times. A 200-byte and a
+1 MiB update get `(7, nil, false, nil)`. The backend sees no update, nothing
+is reserved, and the newest row is still the delete row.
+`TestKubehzP2UpdateAtNewerRevision`: the four landing schedules want the
+revision and the key as read, and no update at the backend. A new
+subtest sends the update transaction and wants `Succeeded: false` with the
+key at revision 1. On the production code of `914880b`, 12 subtests fail
+with the no-space error. With the lost answer replaced by hand with a
+forward to the backend at no reservation, 14 subtests fail. The update
+transaction at the delete revision succeeds at revision 8 (the key is
+written again). The landing schedules write rows of 108, 4322, 1034 and
+34 bytes with 0 reserved, and both `TestKubehzP2UpdateAtOlderRevision`
+subtests fail.
+
+**Re-check** as for the entry above.
 
 ---
 

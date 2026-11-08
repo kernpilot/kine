@@ -53,13 +53,13 @@ package server
 //   row at the compare revision, and rows never change, so that row is the
 //   one the check read and the charge is exact. With no live key the update
 //   is a create (key + value, the create rules). The quota answers an update
-//   at an older revision itself, as a lost compare-and-swap with the key as
-//   read, and the backend never sees it: compaction can make an older row
-//   of a key the newest again, so the backend could write it with no charge.
-//   Every other update is refused. Another write can land at its compare
-//   revision before the insert (after a delete the update writes the key
-//   again, upstream issue k3s-io/kine#825), and its charge would come from a
-//   value the check did not read. An update
+//   at any other revision itself, as a lost compare-and-swap with the key as
+//   read (LogStructured.Update's answer), and the backend never sees it. At
+//   an older revision, compaction can make an older row of a key the newest
+//   again, so the backend could write it with no charge. At a newer revision,
+//   another write can land there before the insert (after a delete the
+//   update writes the key again, upstream issue k3s-io/kine#825), and the
+//   charge would come from a value the check did not read. An update
 //   below the limit that shrinks a value is charged less than it writes, by
 //   at most the old value: for that gap alone, the stored data can pass the
 //   figure by up to L while no good sample shows it, with no time bound
@@ -805,7 +805,8 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 			return 0, nil, false, ErrNoSpace
 		}
 		if lost != nil {
-			// the answer LogStructured.Update gives a lost compare-and-swap
+			// the answer LogStructured.Update gives a lost compare-and-swap:
+			// the revision, the live key or nil, not updated, no error
 			return lost.rev, lost.kv, false, nil
 		}
 	}
@@ -824,27 +825,30 @@ func (b *quotaBackend) Update(ctx context.Context, key string, value []byte, rev
 // compare revision, and it copies its old value from the row with that id.
 // Rows never change after the insert. So at the observed revision the row
 // written holds exactly the value read, or the compare fails. That is the
-// only update that passes with a charge. An update at an older revision gets
-// lost: the current revision and the key as read. Update returns them as
-// LogStructured.Update returns a lost compare-and-swap, and the server then
-// answers the transaction with succeeded = false and the key, so the
-// apiserver retries as after any conflict. The backend never sees that
-// update. Compaction can make an older row of a key the newest again: an
-// insert that started before a compaction can add a row whose
-// prev_revision the compaction removed, and when a later compaction removes
-// that row and its delete, the older row is the newest. At that revision the
-// backend would write with no charge. Every other update is refused
-// ("revision"). Another write can land at a newer
-// compare revision before the insert. The update then writes over a value
-// the check did not read, and after a delete it writes the key again (since
-// upstream ca3c2d5; upstream issue k3s-io/kine#825). With no live key, the
-// update at revision 0 is a create: the create rules (admitControlCreate) at
-// a create's cost, key + value. With a live key, the update passes when the
+// only update that passes with a charge. An update at any other revision
+// gets lost: the current revision and the key as read (nil: no live key).
+// Update returns them as LogStructured.Update returns a lost
+// compare-and-swap, and the server then answers the transaction with
+// succeeded = false and the key, if any, so the apiserver retries as after
+// any conflict (or, with no key, reports it not found). The backend never
+// sees that update. At an older revision, compaction can make an older row
+// of a key the newest again: an insert that started before a compaction can
+// add a row whose prev_revision the compaction removed, and when a later
+// compaction removes that row and its delete, the older row is the newest.
+// At that revision the backend would write with no charge. At a newer
+// revision, another write can land there before the insert. The update then
+// writes over a value the check did not read, and after a delete it writes
+// the key again (since upstream ca3c2d5; upstream issue k3s-io/kine#825).
+// That includes an update at the revision of a deleted key's delete row (the
+// observed revision is 0 then). With no live key, the update at revision 0 is
+// a create: the create rules (admitControlCreate) at a create's cost, key +
+// value. With a live key, the update passes when the
 // value does not grow by more than quotaGrowthSlack, the figure with its
 // exact cost (key + new + old) stays within its lane's cap (control: the
 // ceiling; cleanup: the ceiling less quotaControlReserve), and its lane's
 // bucket has room. The reservation settles like any update's. It returns the
-// reserved cost and "" when it passes, else the refusal reason.
+// reserved cost and "" when it passes, the lost answer, or else the refusal
+// reason.
 func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte, revision int64) (int64, string, *lostCompare) {
 	rev, cur, err := b.Backend.Get(ctx, key, 0, false)
 	if err != nil {
@@ -854,11 +858,8 @@ func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte
 	if cur != nil {
 		observed = cur.ModRevision
 	}
-	if revision < observed {
-		return 0, "", &lostCompare{rev: rev, kv: cur}
-	}
 	if revision != observed {
-		return 0, "revision", nil
+		return 0, "", &lostCompare{rev: rev, kv: cur}
 	}
 	if cur == nil {
 		cost := int64(len(key) + len(value))
@@ -897,9 +898,9 @@ func (b *quotaBackend) admitUpdate(ctx context.Context, key string, value []byte
 	return cost, "", nil
 }
 
-// lostCompare is admitUpdate's answer to an update at an older compare
-// revision: the revision and the key (nil: no live key) as the quota read
-// them.
+// lostCompare is admitUpdate's answer to an update at a compare revision
+// other than the one it read: the revision and the key (nil: no live key) as
+// the quota read them.
 type lostCompare struct {
 	rev int64
 	kv  *KeyValue
