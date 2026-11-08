@@ -206,6 +206,13 @@ over a network link, where each write takes one more round-trip time.
 With upstream's line its three phases fail on PostgreSQL 18.4, each with
 `context deadline exceeded` (after 5, 5 and 10 s).
 
+**Fake.** The fake driver checks the compare before the insert takes an id
+(an insert that does not match takes none), sees all rows of the statement
+(committed and its own), and enforces kine's unique index on (name,
+prev_revision) besides `kine_pkey`. Not tested: a retry that runs out of
+attempts. Upstream's linear backoff makes the 20 attempts take about 19 s.
+Its rollback is `Append`'s, and it is not changed by P6.
+
 **Re-check** `go test -tags=test -race -run TestKubehzP6 ./pkg/drivers/generic/`,
 and with `KINE_TEST_PGSQL_DSN` set,
 `go test -tags=test -v -run TestKubehzP6Postgres ./pkg/drivers/pgsql/`.

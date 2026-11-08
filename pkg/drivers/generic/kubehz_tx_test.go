@@ -31,11 +31,14 @@ import (
 //   - a failed statement aborts its transaction: every later statement fails
 //     with 25P02 until ROLLBACK or ROLLBACK TO SAVEPOINT, and COMMIT then
 //     rolls back and fails;
-//   - the id sequence moves for every insert, also for one that fails;
+//   - the insert writes only when the newest row of its key (among all
+//     rows it can see) has the compare revision, as upstream's insert
+//     statement; an insert that does not match takes no id;
+//   - an insert that matches takes the next id from the sequence, also when
+//     it then fails;
 //   - an insert whose id exists fails with a unique violation of kine_pkey
-//     (a gap fill took that id);
-//   - the insert writes only when the newest row of its key has the compare
-//     revision, as upstream's insert statement;
+//     (a gap fill took that id), and one whose (name, prev_revision) exists
+//     fails with a unique violation of kine_name_prev_revision_uindex;
 //   - the rows of a transaction show to other connections after its commit.
 //
 // gate, when set, holds the first gate BEGINs until gate BEGINs arrived, so
@@ -54,6 +57,7 @@ type pgFake struct {
 
 type fakeRow struct {
 	name    string
+	prev    int64
 	deleted bool
 }
 
@@ -224,44 +228,50 @@ func (c *fakeConn) insert(args []driver.NamedValue) (int64, bool, error) {
 	}
 	key, okKey := args[1].Value.(string)
 	deleted, okDeleted := args[3].Value.(int64)
+	prev, okPrev := args[4].Value.(int64)
 	compare, okCompare := args[8].Value.(int64)
-	if !okKey || !okDeleted || !okCompare {
+	if !okKey || !okDeleted || !okPrev || !okCompare {
 		return 0, false, fmt.Errorf("pgFake: unexpected insert arguments %v", args)
 	}
-
-	f.seq++
-	id := f.seq
 	f.inserts = append(f.inserts, tx != nil)
 
-	visible := func(id int64) (fakeRow, bool) {
-		if r, ok := f.rows[id]; ok {
-			return r, true
-		}
-		if tx != nil {
-			for _, p := range tx.pending {
-				if p.id == id {
-					return p.row, true
-				}
-			}
-		}
-		return fakeRow{}, false
+	// the rows this statement sees: the committed ones and its own
+	visible := map[int64]fakeRow{}
+	for id, r := range f.rows {
+		visible[id] = r
 	}
-	if _, taken := visible(id); taken {
+	if tx != nil {
+		for _, p := range tx.pending {
+			visible[p.id] = p.row
+		}
+	}
+	abort := func(constraint string) error {
 		if tx != nil {
 			tx.aborted = true
 		}
-		return 0, false, pgError(pgerrcode.UniqueViolation, "kine_pkey", `duplicate key value violates unique constraint "kine_pkey"`)
+		return pgError(pgerrcode.UniqueViolation, constraint, `duplicate key value violates unique constraint "`+constraint+`"`)
 	}
+
 	var newest int64
-	for i := int64(1); i < id; i++ {
-		if r, ok := visible(i); ok && r.name == key {
-			newest = i
+	for id, r := range visible {
+		if r.name == key && id > newest {
+			newest = id
 		}
 	}
 	if newest != compare {
 		return 0, false, nil
 	}
-	row := fakeRow{name: key, deleted: deleted != 0}
+	f.seq++
+	id := f.seq
+	if _, taken := visible[id]; taken {
+		return 0, false, abort("kine_pkey")
+	}
+	for _, r := range visible {
+		if r.name == key && r.prev == prev {
+			return 0, false, abort("kine_name_prev_revision_uindex")
+		}
+	}
+	row := fakeRow{name: key, prev: prev, deleted: deleted != 0}
 	if tx != nil {
 		tx.pending = append(tx.pending, pendingRow{id: id, row: row})
 	} else {
