@@ -12,6 +12,31 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+Nothing yet.
+
+---
+
+## Released `v0.17.5-kubehz.1` on upstream `v0.17.5` (`f82bd25`); release commit `4780507`
+
+Image `ghcr.io/kernpilot/kine:v0.17.5-kubehz.1`, index digest
+
+```
+sha256:b1867214ddfda096a1741fe277ac2878e2ec4145c8347f552fc3109acd9f3810
+```
+
+(linux/amd64 + linux/arm64; read back from GHCR on 2026-11-08). The moving
+`kubehz` tag points at the same digest. `publish-kubehz.yml` built and
+signed it: keyless cosign signature, buildkit provenance and SBOM in the
+index, and an attested SPDX SBOM. The run's own verify gate passed (run
+`42533521321`, identity `publish-kubehz.yml@refs/tags/v0.17.5-kubehz.1`).
+Consumers pin the digest above (`KUBEHZ_EXTCP_KINE_IMAGE`).
+
+This is the first release on upstream `v0.17.5`. It carries:
+- PR #14: the sync with upstream `v0.17.5` as a merge commit (below).
+- PR #15: the merge guide after the sync, and `UPSTREAM.md`.
+- PR #16: P6 (a write holds one pool connection) and the P2 fixes for an
+  update while full (below).
+
 ### Sync with upstream `v0.17.5` (`f82bd25`)
 
 Upstream released `v0.17.5` on 2026-11-05. It is the newest release tag.
