@@ -5,9 +5,16 @@ package pgsql
 // instead of passing on an empty -run.
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/k3s-io/kine/pkg/drivers/generic"
+	"github.com/k3s-io/kine/pkg/server"
 )
 
 func TestKubehzP1RecordIsMonotonic(t *testing.T) {
@@ -112,3 +119,116 @@ func TestKubehzP1ReconnectBackoff(t *testing.T) {
 		t.Fatalf("after a healthy session: delay = %s, want %s", got, reconnectFloor)
 	}
 }
+
+// TestKubehzP1BeginTxWraps: since upstream ca3c2d5 (v0.17.5) every write
+// inserts in a transaction (SQLLog.Append), so the dialect's BeginTx must hand
+// out the recording transaction. A rebase that loses it keeps the other P1
+// tests green and turns P1 off. A connector with no SQL is enough: BeginTx
+// only begins.
+func TestKubehzP1BeginTxWraps(t *testing.T) {
+	db := sql.OpenDB(beginOnlyConnector{})
+	t.Cleanup(func() { _ = db.Close() })
+	d := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	tx, err := d.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.MustRollback()
+	nt, ok := tx.(*notifyingTx)
+	if !ok {
+		t.Fatalf("BeginTx returned %T, want *notifyingTx: committed writes would never reach the notifier", tx)
+	}
+	if nt.notifier != &d.notifier {
+		t.Fatal("the transaction records into another notifier than the dialect's")
+	}
+}
+
+// TestKubehzP1RecordsOnCommit: a transaction records its highest inserted
+// revision after a successful commit, and nothing when the row is not there
+// for another instance to poll.
+func TestKubehzP1RecordsOnCommit(t *testing.T) {
+	errInsert, errCommit := errors.New("insert failed"), errors.New("commit failed")
+	cases := []struct {
+		name    string
+		tx      *revTx
+		inserts int
+		end     func(*notifyingTx) error
+		want    int64
+	}{
+		{"commit records the highest insert", &revTx{next: 10}, 2, (*notifyingTx).Commit, 12},
+		{"MustCommit records", &revTx{next: 10}, 1, func(t *notifyingTx) error { t.MustCommit(); return nil }, 11},
+		{"rollback records nothing", &revTx{next: 10}, 1, (*notifyingTx).Rollback, 0},
+		{"a failed commit records nothing", &revTx{next: 10, commitErr: errCommit}, 1, (*notifyingTx).Commit, 0},
+		{"a failed insert records nothing", &revTx{next: 10, insertErr: errInsert}, 1, (*notifyingTx).Commit, 0},
+		{"a failed compare (revision 0) records nothing", &revTx{noRow: true}, 1, (*notifyingTx).Commit, 0},
+		{"no insert records nothing", &revTx{next: 10}, 0, (*notifyingTx).Commit, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var n revisionNotifier
+			nt := &notifyingTx{Transaction: tc.tx, notifier: &n}
+			for range tc.inserts {
+				_, _ = nt.Insert(context.Background(), "/k", false, false, 0, 0, nil)
+			}
+			_ = tc.end(nt)
+			if got := n.latest.Load(); got != tc.want {
+				t.Fatalf("latest = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// revTx is a server.Transaction whose Insert hands out the next revision.
+// Only Insert and the ends of a transaction are used.
+type revTx struct {
+	server.Transaction
+	next      int64
+	noRow     bool
+	insertErr error
+	commitErr error
+}
+
+func (r *revTx) Insert(context.Context, string, bool, bool, int64, int64, []byte) (int64, error) {
+	if r.insertErr != nil {
+		return 0, r.insertErr
+	}
+	if r.noRow {
+		return 0, nil
+	}
+	r.next++
+	return r.next, nil
+}
+func (r *revTx) Commit() error   { return r.commitErr }
+func (r *revTx) Rollback() error { return nil }
+func (r *revTx) MustCommit() {
+	if r.commitErr != nil {
+		panic(r.commitErr) // upstream's Tx ends the process here
+	}
+}
+
+// beginOnlyConnector opens connections that can begin, commit and roll back,
+// and nothing else.
+type beginOnlyConnector struct{}
+
+func (beginOnlyConnector) Connect(context.Context) (driver.Conn, error) { return beginOnlyConn{}, nil }
+func (beginOnlyConnector) Driver() driver.Driver                        { return beginOnlyDriver{} }
+
+type beginOnlyDriver struct{}
+
+func (beginOnlyDriver) Open(string) (driver.Conn, error) { return beginOnlyConn{}, nil }
+
+type beginOnlyConn struct{}
+
+func (beginOnlyConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("beginOnlyConn: no SQL")
+}
+func (beginOnlyConn) Close() error              { return nil }
+func (beginOnlyConn) Begin() (driver.Tx, error) { return beginOnlyTx{}, nil }
+func (beginOnlyConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return beginOnlyTx{}, nil
+}
+
+type beginOnlyTx struct{}
+
+func (beginOnlyTx) Commit() error   { return nil }
+func (beginOnlyTx) Rollback() error { return nil }

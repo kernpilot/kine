@@ -22,12 +22,12 @@ func (d *liveDialect) LiveSize() server.SizeSource {
 }
 
 func TestKubehzP2LiveSizeChain(t *testing.T) {
-	plain := logstructured.New(New(&wakeDialect{}, 0, 0, 0, 0, 0, 0))
+	plain := logstructured.New(newTestLog(&wakeDialect{}, 0))
 	if src := server.LiveSizeOf(plain); src != nil {
 		t.Fatal("a dialect without LiveSize yielded a source through the chain")
 	}
 
-	withLive := logstructured.New(New(&liveDialect{}, 0, 0, 0, 0, 0, 0))
+	withLive := logstructured.New(newTestLog(&liveDialect{}, 0))
 	src := server.LiveSizeOf(withLive)
 	if src == nil {
 		t.Fatal("the dialect's LiveSize did not reach the top of the chain")

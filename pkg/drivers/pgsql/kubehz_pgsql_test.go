@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/server"
@@ -394,6 +395,41 @@ func TestKubehzP2RefreshKeepsTrailingPages(t *testing.T) {
 	}
 }
 
+// TestKubehzP1PostgresNotify: a write through the backend New returns, the
+// production path, announces its revision on RevisionChannel. Since upstream
+// ca3c2d5 (v0.17.5) every write inserts in a transaction; a rebase that loses
+// that path keeps the hermetic P1 tests green and turns P1 off without an
+// error. unit.yml runs this with the TestKubehzP1 tests, against its
+// PostgreSQL service.
+func TestKubehzP1PostgresNotify(t *testing.T) {
+	ctx, backend, _ := kubehzPostgres(t)
+	conn, err := pgx.Connect(ctx, os.Getenv("KINE_TEST_PGSQL_DSN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	if _, err := conn.Exec(ctx, "LISTEN "+RevisionChannel); err != nil {
+		t.Fatal(err)
+	}
+
+	key := fmt.Sprintf("/kubehz/p1/%d", time.Now().UnixNano())
+	rev, err := backend.Create(ctx, key, []byte("v"), 0)
+	if err != nil || rev <= 0 {
+		t.Fatalf("Create %s: revision %d, %v", key, rev, err)
+	}
+	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for {
+		n, err := conn.WaitForNotification(wctx)
+		if err != nil {
+			t.Fatalf("no notification at or above revision %d within 5 s (%v): committed writes do not reach the notifier", rev, err)
+		}
+		if got, ok := parseRevision(n.Payload); ok && got >= rev {
+			return
+		}
+	}
+}
+
 // kubehzPostgres opens the PostgreSQL in KINE_TEST_PGSQL_DSN through the
 // driver (which creates the table and sets its storage parameters) and as a
 // plain connection. It skips the test when the variable is unset.
@@ -423,6 +459,7 @@ func kubehzPostgres(t *testing.T) (context.Context, server.Backend, *sql.DB) {
 		CompactMinRetain:     1000,
 		CompactBatchSize:     1000,
 		PollBatchSize:        500,
+		PollInterval:         time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -38,6 +38,14 @@ type SQLLog struct {
 	compactBatchSize      int64
 	pollInterval          time.Duration
 	pollBatchSize         int64
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: the revision up to which the poll loop has sent every event to
+	//   its watchers. The quota's relief (kubehz_relief.go) never compacts
+	//   past it. Upstream had this field up to v0.17.0 (for WaitForSyncTo)
+	//   and removed it in v0.17.1; the fork keeps it for the relief only.
+	// CONFLICT: keep the field and its one Store at the top of the poll loop.
+	polledRev atomic.Int64
+	// KUBEHZ-PATCH P2 END
 }
 
 func New(d server.Dialect, wg *sync.WaitGroup, cfg *drivers.Config) *SQLLog {
@@ -588,6 +596,9 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 	// KUBEHZ-PATCH P1 END (declaration; the select arm below is part of it)
 
 	for {
+		// KUBEHZ-PATCH P2 — see the polledRev field. Every event up to
+		// pollRevision was sent (fill rows are not sent, and need not be).
+		s.polledRev.Store(pollRevision)
 		if waitForMore {
 			select {
 			case <-s.ctx.Done():

@@ -196,8 +196,8 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	return true, logstructured.New(sqllog.New(backend, wg, cfg)), nil
 }
 
-// KUBEHZ-PATCH P1 (types) BEGIN — the notifyingDialect type and its methods,
-// down to the END marker after RevisionNotify. setup, createDBIfNotExist,
+// KUBEHZ-PATCH P1 (types) BEGIN — the notifyingDialect and notifyingTx types
+// and their methods, down to the END marker after RevisionNotify. setup, createDBIfNotExist,
 // prepareConfig and init below that marker are upstream's; take upstream's
 // side there.
 // notifyingDialect adds cross-instance revision wake-ups to the generic
@@ -209,16 +209,64 @@ type notifyingDialect struct {
 	notifier revisionNotifier
 }
 
-// Insert records the new revision for the coalescing notifier, then returns
-// unchanged. The recording is a single atomic compare-and-swap; the NOTIFY
-// itself happens on another goroutine and another connection, so the write
-// path never pays for it.
-func (n *notifyingDialect) Insert(ctx context.Context, key string, create, del bool, createRevision, previousRevision, ttl int64, value []byte) (int64, error) {
-	rev, err := n.Generic.Insert(ctx, key, create, del, createRevision, previousRevision, ttl, value)
+// BeginTx wraps upstream's transaction so that a committed insert records its
+// revision for the coalescing notifier. Since upstream ca3c2d5 (v0.17.5) every
+// write goes through SQLLog.Append, which inserts in a transaction and then
+// commits; the dialect's own Insert below has no caller there. The recording
+// is a single atomic compare-and-swap after the commit; the NOTIFY itself
+// happens on another goroutine and another connection, so the write path
+// never pays for it.
+func (n *notifyingDialect) BeginTx(ctx context.Context, opts *sql.TxOptions) (server.Transaction, error) {
+	t, err := n.Generic.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &notifyingTx{Transaction: t, notifier: &n.notifier}, nil
+}
+
+// Insert records the new revision for the notifier, then returns unchanged.
+// Kept for a direct insert through the dialect; see BeginTx for the path
+// upstream uses.
+func (n *notifyingDialect) Insert(ctx context.Context, key string, created, deleted bool, previousRevision, ttl int64, value []byte) (int64, error) {
+	rev, err := n.Generic.Insert(ctx, key, created, deleted, previousRevision, ttl, value)
 	if err == nil && rev > 0 {
 		n.notifier.record(rev)
 	}
 	return rev, err
+}
+
+// notifyingTx holds the highest revision the transaction inserted and records
+// it when the commit succeeds. A rolled back transaction records nothing: the
+// row is not there for another instance to poll.
+type notifyingTx struct {
+	server.Transaction
+	notifier *revisionNotifier
+	rev      int64
+}
+
+func (t *notifyingTx) Insert(ctx context.Context, key string, created, deleted bool, previousRevision, ttl int64, value []byte) (int64, error) {
+	rev, err := t.Transaction.Insert(ctx, key, created, deleted, previousRevision, ttl, value)
+	if err == nil && rev > t.rev {
+		t.rev = rev
+	}
+	return rev, err
+}
+
+func (t *notifyingTx) Commit() error {
+	err := t.Transaction.Commit()
+	if err == nil && t.rev > 0 {
+		t.notifier.record(t.rev)
+	}
+	return err
+}
+
+// MustCommit ends the process when the commit fails (upstream's Tx), so a
+// return means the commit succeeded.
+func (t *notifyingTx) MustCommit() {
+	t.Transaction.MustCommit()
+	if t.rev > 0 {
+		t.notifier.record(t.rev)
+	}
 }
 
 // RevisionNotify satisfies the optional interface the poll loop looks for.
