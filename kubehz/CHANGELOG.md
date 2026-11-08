@@ -12,7 +12,93 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
-Nothing yet.
+### Rebase onto upstream `v0.17.5` (`f82bd25`)
+
+Upstream released `v0.17.5` on 2026-11-05. It is the newest release tag.
+On 2026-11-08 upstream master was at the same commit. The fork was on
+`v0.17.0` (`6fb95f5`), so 85 upstream commits are new.
+
+**Method.** A `git rebase` of the 27 fork commits from `6fb95f5` onto
+`v0.17.5`. Each commit stays one commit with its markers. Two commits
+follow: one that carries P1, P2 and P3 onto the new interfaces, and one
+fix to `benchmarks/verify-patches.sh`. Upstream `afd69e2` (the `kubernetes`
+pin in `Dockerfile.test`) is in `v0.17.5`, so the copy that PR #11 took
+became empty and dropped. `Dockerfile.test` is now equal to upstream.
+
+**Conflicts** (original commit, file, resolution):
+- `02bd318` (P1), `pkg/drivers/pgsql/pgsql.go`, the end of `New`: keep the
+  notifier wrapper, remove the `dialect.Migrate` call (upstream `89a57ad`
+  removed migrations), and call `sqllog.New(backend, wg, cfg)`.
+- `02bd318` (P1), `pkg/logstructured/sqllog/sql.go`, the start of the poll
+  loop: keep upstream's `POLL START` trace line and the `external` block.
+- `5a0298b` and `a390482`, `pkg/drivers/pgsql/pgsql.go`: the marker blocks
+  next to the removed `Migrate` call. Keep the fork side without `Migrate`.
+- `0ccb433`, `7c8a4f7` and `37f39d3`, `go.mod` and `go.sum`: keep the
+  upstream side. Upstream is at or above every floor these commits set.
+  `37f39d3` keeps `golang.org/x/time` as a direct dependency.
+
+All other commits applied with no conflict.
+
+**Upstream changes that touch the patches.**
+- `ca3c2d5` (Optimize create/update/delete txn): every write now goes
+  through `SQLLog.Append`, which runs `BeginTx`, `Transaction.Insert` and
+  `Commit`. The insert statement itself compares the newest revision of
+  the key. `Dialect.Insert` has no caller. P1 recorded the revision in
+  `Dialect.Insert`, so a plain rebase builds and passes every hermetic P1
+  test, but never sends a NOTIFY. The P1 wrapper now also wraps `BeginTx`.
+  Its transaction keeps the highest inserted revision and records it after
+  a successful commit. P2's TTL delete timeout stays: a statement that stops
+  after its snapshot can still delete a newer value after a relief pass.
+- `22ab6ec` (Check max sent revision instead of using WaitForSyncTo): it
+  removed `SQLLog.polledRev`. The P2 relief needs that revision, so it is a
+  marked P2 field again, stored at the top of each poll iteration.
+- `6a267d5`: the broadcaster's `Subscribe` is not exported. The relief
+  starts the poller through `SQLLog.Watch`.
+- `80f2963`: `Transaction.Compact` takes both bounds. The relief compacts
+  `(compactRev, batch]`.
+- `3425d74`: `--datastore-poll-interval` (default 1 s). The P1 fallback
+  ticker is this interval. Test configurations must set it, because zero
+  is refused.
+- `pkg/server` imports package `query` now. The P2 size-query helper is
+  `querySize`.
+
+**Markers.** 54 before (49 in code), 57 after (52 in code). Every earlier
+marker is still there. The 3 new P2 markers hold the `polledRev` field and
+its store.
+
+**Gates** (Go 1.26.9). `go build ./...` and `go vet ./...` with
+`CGO_ENABLED=1` and `0`. `go test -cover -tags=test -count=1 ./...` with
+`CGO_ENABLED=1` and `0`. The P1, P2 and P3 tests with `-race` against
+PostgreSQL 17.11 and 18.6. golangci-lint v2.10.1: 0 issues.
+`SKIP_LINT=1 ./scripts/validate`. `go mod tidy` changes nothing. The main
+module has grpc v1.85.0, `golang.org/x/net` v0.61.0, `golang.org/x/text`
+v0.43.0 and otel v1.46.0. Five mutations of the new P1 recording path each
+fail a test.
+
+**P1 measurement: open finding.** `verify-patches.sh` on the new base:
+stock p50 707.0 / p99 708.6 ms, patched p50 17.6 / p99 720.2 ms. The p99
+check fails (1.0x). The same `run-cross.sh` run (PostgreSQL 18, 4 writers
+at 1/s, 16 watchers, 60 s), p50 / p95 / p99 in ms:
+
+| run | `v0.17.0-kubehz.4` | this rebase |
+|---|---|---|
+| 1 | 21.4 / 42.3 / 718.8 | 17.6 / 718.9 / 720.2 |
+| 2 | 37.4 / 497.9 / 718.9 | 19.1 / 719.0 / 720.2 |
+| 3 | 19.6 / 21.0 / 39.4 | 19.0 / 29.3 / 719.8 |
+| traced, 30 s | 16.7 / 26.8 / 27.1 | 20.5 / 30.8 / 730.3 |
+
+The P1 path works: p50 is near 20 ms and the PostgreSQL test sees the
+NOTIFY. The tail comes from the limit in MERGE-GUIDE.md#p1: a lower
+revision that commits last in a burst leaves a gap that only the ticker
+closes. In the traced runs instance B saw 5 gaps (2 failed fills) on
+`v0.17.0-kubehz.4` and 16 gaps (7 failed fills) on this rebase. The
+separate `COMMIT` round trip of `ca3c2d5` makes such commits more
+frequent. The released fork has the same tail, less often. A fix changes
+the P1 design and is not part of this rebase.
+
+**`verify-patches.sh`.** The P1 result files are tracked. When a run
+failed, the script read the recorded figures and passed. It now removes
+the files first, so a failed run gives `NaN` and exit 1.
 
 ---
 

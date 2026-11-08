@@ -11,6 +11,11 @@ patches exist.
 | `upstream-master` | a pristine mirror of `k3s-io/kine` master, kept on `origin`. Never edit it. |
 | `main` | `upstream-master` plus the patches below, plus `kubehz/` and `benchmarks/`. |
 
+**Current base.** `main` is on upstream `v0.17.5` (`f82bd25`), the newest
+release tag on 2026-11-08. Upstream master was at the same commit. Rebase
+onto a release tag: when master is ahead of the newest tag, run
+`git rebase <tag>` in place of `git rebase upstream-master` below.
+
 A clone has only `origin` (this fork). The recipe below works from a fresh
 clone; skip the lines you already have.
 
@@ -72,15 +77,20 @@ nothing on another. Re-run, do not assume.
 
 **Files** `pkg/drivers/pgsql/notify.go` (new, conflict-free),
 `pkg/drivers/pgsql/pgsql.go` (the `notifyingDialect` wrapper at the end of
-`New`), `pkg/logstructured/sqllog/sql.go` (the `external` channel and its
-`select` arm in `SQLLog.poll`).
+`New`, and its `BeginTx`, which hands out a `notifyingTx` that records the
+revision after the commit), `pkg/logstructured/sqllog/sql.go` (the
+`external` channel and its `select` arm in `SQLLog.poll`).
 
 **Tests** `pkg/drivers/pgsql/kubehz_notify_test.go` (`record`, payload
-parsing, the non-blocking forward, the reconnect backoff) and
-`pkg/logstructured/sqllog/kubehz_notify_test.go` (a fake dialect proving the
-`case <-external:` arm wakes `poll`). Both are hermetic; `unit.yml` fails
-when a `TestKubehzP1*` test is missing from either package, so dropping the
-patch means deleting the tests in the same commit.
+parsing, the non-blocking forward, the reconnect backoff, `BeginTx` hands
+out the recording transaction, a revision is recorded only after a
+successful commit) and `pkg/logstructured/sqllog/kubehz_notify_test.go` (a
+fake dialect proving the `case <-external:` arm wakes `poll`). Both are
+hermetic. `TestKubehzP1PostgresNotify` in
+`pkg/drivers/pgsql/kubehz_pgsql_test.go` writes through the backend `New`
+returns and waits for the NOTIFY on the PostgreSQL service of `unit.yml`.
+`unit.yml` fails when a `TestKubehzP1*` test is missing from either
+package, so dropping the patch means deleting the tests in the same commit.
 
 **Problem.** kine signals its own poll loop in-process on every insert, so a
 single instance wakes its watchers in milliseconds. That signal does not cross a
@@ -88,6 +98,11 @@ process boundary. With two kine instances on one database, a watcher on the
 instance that did not receive the write waits for its 1 second fallback ticker.
 Measured: p50 **715 ms**, p99 **716 ms**, against 18/21 ms on the writing
 instance. Multi-replica kine is what Kamaji and k0smotron deploy.
+
+Since v0.17.5 the fallback ticker is `--datastore-poll-interval` (default
+1 s, upstream 3425d74). A lower value also shortens the cross-instance
+wait, but every kine then runs one poll query per interval while idle. P1
+wakes the poll in about 20 ms without that cost.
 
 **Approach.** A notification carries no data — it only means "poll now", and
 that poll drains everything waiting. So one notification per interval is worth
@@ -116,9 +131,26 @@ silently, which is far worse than being late.
 **If it conflicts.** Keep upstream's `select{}` shape and re-add the
 `case <-external:` arm. `RevisionNotify()` is deliberately an *optional
 interface* asserted at the call site, not a method on `server.Dialect`, so the
-sqlite, mysql and nats drivers never see it — preserve that. If the dialect
-plumbing changes beyond easy repair, drop P1: it is a latency optimisation, not
-a correctness fix.
+sqlite, mysql and nats drivers never see it — preserve that. The revision
+must be recorded on the path that commits writes. Up to v0.17.0 that was
+`Dialect.Insert`. Since v0.17.5 every write goes through `SQLLog.Append`:
+`BeginTx`, `Transaction.Insert`, `Commit` (upstream ca3c2d5). If upstream
+moves the writes again, move the recording with them. The hermetic tests
+do not see a write path that skips the recording;
+`TestKubehzP1PostgresNotify` does. If the dialect plumbing changes beyond
+easy repair, drop P1: it is a latency optimisation, not a correctness fix.
+
+**Known limit (measured 2026-11-08).** The notifier announces the highest
+revision it recorded, and only once. With concurrent writers a lower
+revision can commit after a higher one. The other instance can then poll
+in between, find a gap, fail to fill it (the row is already there,
+uncommitted) and wait for its ticker, when that lower commit is the last
+of a burst. `run-cross.sh` produces exactly this: its 4 writers write at
+the same instant each second. p50 stays near 20 ms, but p99 reached the
+ticker in 2 of 4 runs on `v0.17.0-kubehz.4` and in 4 of 4 runs on
+v0.17.5, where the separate `COMMIT` round trip makes such commits about
+3 times as frequent. `verify-patches.sh` checks p99 and then fails. See
+the CHANGELOG entry for the figures.
 
 **Re-verify** `benchmarks/run-cross.sh` (two kine instances, one database).
 
@@ -134,7 +166,9 @@ seams), `pkg/server/kv.go` (two log conditions),
 delete timeout field, and the TTL loop start: upstream's
 `go ttl.Run(ctx, l)` is `go ttlRun(ctx, l.ttlBackend())`, so the `ttl`
 import moved to `kubehz_ttl.go`) and `pkg/logstructured/sqllog/sql.go` (one
-forwarding method), and `go.mod` (`golang.org/x/time` is a direct
+forwarding method, and the `polledRev` field with its one store at the top
+of the poll loop: upstream removed the field in v0.17.1 and the relief
+needs it), and `go.mod` (`golang.org/x/time` is a direct
 dependency now). Tests `pkg/server/kubehz_quota_test.go`,
 `pkg/app/kubehz_quota_test.go`, `pkg/endpoint/kubehz_quota_test.go` (a
 real kine on sqlite through `Listen`, the B481 relief end to end),
@@ -431,10 +465,12 @@ to `DbSize`. Re-add them wherever `DbSize` lands. If upstream changes
 `Backend` so that puts no longer go through `Create`/`Update`, move the
 checks to whatever the new write methods are. The tests on a fake backend
 show which calls must be refused and which must pass. If upstream changes
-the poll loop's `polledRev`, the broadcaster's `Subscribe` (the relief
-starts the poller with it) or the transaction methods the relief uses
-(`CurrentRevision`, `GetCompactRevision`, `Compact`, `SetCompactRevision`),
-re-check `kubehz_relief.go` against the new contract. If upstream changes
+the poll loop, keep the `polledRev` store at the top of each iteration: it
+must only ever hold a revision whose events were sent. If upstream changes
+`SQLLog.Watch` (the relief starts the poller with it) or the transaction
+methods the relief uses (`CurrentRevision`, `GetCompactRevision`,
+`Compact(from, to)`, `SetCompactRevision`), re-check `kubehz_relief.go`
+against the new contract. If upstream changes
 `ErrKeyExists` or how an update reports a lost compare-and-swap, re-check
 which errors `quotaBackend` settles as written. If the PostgreSQL
 statistics flush intervals change (`PGSTAT_IDLE_INTERVAL`, 10 s), re-check
