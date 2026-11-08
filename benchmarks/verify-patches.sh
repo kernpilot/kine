@@ -39,6 +39,10 @@ say "P1 — cross-instance watch wake-up"
 note "recorded: stock p50 715.7ms / p99 716.6ms  ->  patched p50 20.0ms / p99 21.3ms"
 note "measuring (2 kine instances, one database, 4 writers @ 1/s, 60s)..."
 
+# The result files are tracked. Remove them first: a run that fails writes
+# none, and the check below must then read nothing instead of the last
+# recorded figures.
+rm -f results/verify-p1-upstream.json results/verify-p1-patched.json
 KINE_BIN="$ROOT/kine-upstream" ./run-cross.sh verify-p1-upstream 60s 4 16 1 >/dev/null 2>&1
 KINE_BIN="$ROOT/kine-patched"  ./run-cross.sh verify-p1-patched  60s 4 16 1 >/dev/null 2>&1
 
