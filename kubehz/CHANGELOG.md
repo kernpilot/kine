@@ -12,43 +12,52 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
-### Rebase onto upstream `v0.17.5` (`f82bd25`)
+### Sync with upstream `v0.17.5` (`f82bd25`)
 
 Upstream released `v0.17.5` on 2026-11-05. It is the newest release tag.
 On 2026-11-08 upstream master was at the same commit. The fork was on
 `v0.17.0` (`6fb95f5`), so 85 upstream commits are new.
 
-**Method.** A `git rebase` of the 27 fork commits from `6fb95f5` onto
-`v0.17.5`. Each commit stays one commit with its markers. Two commits
-follow: one that carries P1, P2 and P3 onto the new interfaces, and one
-fix to `benchmarks/verify-patches.sh`. Upstream `afd69e2` (the `kubernetes`
-pin in `Dockerfile.test`) is in `v0.17.5`, so the copy that PR #11 took
-became empty and dropped. `Dockerfile.test` is now equal to upstream.
+**How it lands.** The ruleset on `main` refuses a force push, so the sync
+is a merge (MERGE-GUIDE.md, "The model"). Branch `sync/v0.17.5` has one
+merge commit. Its parents are `main` (`f0dab20`) and `v0.17.5`. Branch
+`rebase/v0.17.5` has the same tree as a replay of the 27 fork commits onto
+`v0.17.5`, one commit per fork commit, for review. Its last commits carry
+the patches onto the new interfaces and drop P1 (below). The merge commit
+takes that tree, so `git diff rebase/v0.17.5 sync/v0.17.5` is empty. The
+sync must land as a merge commit. A squash loses the upstream ancestry.
 
-**Conflicts** (original commit, file, resolution):
+**Conflicts.** The merge of `v0.17.5` into `main` conflicts in `go.mod`,
+`go.sum`, `pkg/drivers/pgsql/pgsql.go` and `pkg/logstructured/sqllog/sql.go`.
+The replay found them commit by commit (original commit, file,
+resolution):
 - `02bd318` (P1), `pkg/drivers/pgsql/pgsql.go`, the end of `New`: keep the
-  notifier wrapper, remove the `dialect.Migrate` call (upstream `89a57ad`
-  removed migrations), and call `sqllog.New(backend, wg, cfg)`.
+  wrapper, remove the `dialect.Migrate` call (upstream `89a57ad` removed
+  migrations), and call `sqllog.New(backend, wg, cfg)`.
 - `02bd318` (P1), `pkg/logstructured/sqllog/sql.go`, the start of the poll
-  loop: keep upstream's `POLL START` trace line and the `external` block.
+  loop: keep upstream's `POLL START` trace line and the P1 block.
 - `5a0298b` and `a390482`, `pkg/drivers/pgsql/pgsql.go`: the marker blocks
   next to the removed `Migrate` call. Keep the fork side without `Migrate`.
 - `0ccb433`, `7c8a4f7` and `37f39d3`, `go.mod` and `go.sum`: keep the
   upstream side. Upstream is at or above every floor these commits set.
   `37f39d3` keeps `golang.org/x/time` as a direct dependency.
 
-All other commits applied with no conflict.
+All other commits applied with no conflict. Upstream `afd69e2` (the
+`kubernetes` pin in `Dockerfile.test`) is in `v0.17.5`, so the copy that
+PR 11 took became empty and dropped. `Dockerfile.test` and `go.sum` are
+now equal to upstream. `go.mod` differs only in `golang.org/x/time`, which
+is direct. The main module has grpc v1.85.0, `golang.org/x/net` v0.61.0,
+`golang.org/x/text` v0.43.0 and otel v1.46.0, above every floor.
 
 **Upstream changes that touch the patches.**
 - `ca3c2d5` (Optimize create/update/delete txn): every write now goes
   through `SQLLog.Append`, which runs `BeginTx`, `Transaction.Insert` and
   `Commit`. The insert statement itself compares the newest revision of
-  the key. `Dialect.Insert` has no caller. P1 recorded the revision in
-  `Dialect.Insert`, so a plain rebase builds and passes every hermetic P1
-  test, but never sends a NOTIFY. The P1 wrapper now also wraps `BeginTx`.
-  Its transaction keeps the highest inserted revision and records it after
-  a successful commit. P2's TTL delete timeout stays: a statement that stops
-  after its snapshot can still delete a newer value after a relief pass.
+  the key. `Dialect.Insert` has no caller. P1 recorded each revision in
+  `Dialect.Insert`, so a plain replay builds and passes every hermetic P1
+  test, but never sends a NOTIFY (see "P1 dropped"). P2's TTL delete
+  timeout stays: a statement that stops after its snapshot can still
+  delete a newer value after a relief pass.
 - `22ab6ec` (Check max sent revision instead of using WaitForSyncTo): it
   removed `SQLLog.polledRev`. The P2 relief needs that revision, so it is a
   marked P2 field again, stored at the top of each poll iteration.
@@ -56,49 +65,95 @@ All other commits applied with no conflict.
   starts the poller through `SQLLog.Watch`.
 - `80f2963`: `Transaction.Compact` takes both bounds. The relief compacts
   `(compactRev, batch]`.
-- `3425d74`: `--datastore-poll-interval` (default 1 s). The P1 fallback
-  ticker is this interval. Test configurations must set it, because zero
-  is refused.
+- `3425d74`: `--datastore-poll-interval` (default 1 s). Test configurations
+  must set it, because zero is refused.
 - `pkg/server` imports package `query` now. The P2 size-query helper is
   `querySize`.
 
-**Markers.** 54 before (49 in code), 57 after (52 in code). Every earlier
-marker is still there. The 3 new P2 markers hold the `polledRev` field and
-its store.
+**Markers.** `main` has 49 in code, 9 of them P1. This tree has 46 in
+code, none P1. The six new ones are P2: the `polledRev` field (BEGIN, END)
+and its store, the `quotaDialect` return in `pgsql.New` (BEGIN, END), and
+the header of `kubehz_dialect_test.go`.
 
-**Gates** (Go 1.26.9). `go build ./...` and `go vet ./...` with
-`CGO_ENABLED=1` and `0`. `go test -cover -tags=test -count=1 ./...` with
-`CGO_ENABLED=1` and `0`. The P1, P2 and P3 tests with `-race` against
-PostgreSQL 17.11 and 18.6. golangci-lint v2.10.1: 0 issues.
-`SKIP_LINT=1 ./scripts/validate`. `go mod tidy` changes nothing. The main
-module has grpc v1.85.0, `golang.org/x/net` v0.61.0, `golang.org/x/text`
-v0.43.0 and otel v1.46.0. Five mutations of the new P1 recording path each
-fail a test.
+**Gates** (Go 1.26.9, on this tree). `go build ./...`, `go vet ./...` and
+`go vet -tags=test ./...`, each with `CGO_ENABLED=1` and `0`.
+`go test -cover -tags=test -count=1 ./...` with `CGO_ENABLED=1` and `0`:
+11 packages ok, none failed. The P2 and P3 tests with `-race` (`-run
+'TestKubehzP2|TestKubehzP3'` over `pkg/drivers/pgsql`, `pkg/server`,
+`pkg/app`, `pkg/endpoint`, `pkg/logstructured` and its `sqllog`) against
+PostgreSQL 17.11 and 18.6: 92 passed and 0 skipped on each, live-size
+ratio 1.006. golangci-lint v2.10.1: 0 issues.
+`SKIP_LINT=1 ./scripts/validate` passes. `go mod tidy -diff` shows no
+change. The four `benchmarks/*` modules build and vet.
+`benchmarks/verify-patches.sh` on PostgreSQL 18.6 passes (ratio 1.006).
+Mutation: with the plain dialect in `pgsql.New`,
+`TestKubehzP2P3Postgres` fails.
 
-**P1 measurement: open finding.** `verify-patches.sh` on the new base:
-stock p50 707.0 / p99 708.6 ms, patched p50 17.6 / p99 720.2 ms. The p99
-check fails (1.0x). The same `run-cross.sh` run (PostgreSQL 18, 4 writers
-at 1/s, 16 watchers, 60 s), p50 / p95 / p99 in ms:
+**`verify-patches.sh`.** It now runs `TestKubehzP2P3Postgres` against
+`kine-bench-pg` and prints the P2 live-size ratio next to the recorded
+one. The P1 measurement went with P1. While P1 was measured, a failed run
+passed on the figures of an earlier run, because the result files are
+tracked. `703beb2` on `rebase/v0.17.5` fixed that before the drop.
 
-| run | `v0.17.0-kubehz.4` | this rebase |
-|---|---|---|
-| 1 | 21.4 / 42.3 / 718.8 | 17.6 / 718.9 / 720.2 |
-| 2 | 37.4 / 497.9 / 718.9 | 19.1 / 719.0 / 720.2 |
-| 3 | 19.6 / 21.0 / 39.4 | 19.0 / 29.3 / 719.8 |
-| traced, 30 s | 16.7 / 26.8 / 27.1 | 20.5 / 30.8 / 730.3 |
+### P1 dropped — cross-instance watch wake-up
 
-The P1 path works: p50 is near 20 ms and the PostgreSQL test sees the
-NOTIFY. The tail comes from the limit in MERGE-GUIDE.md#p1: a lower
-revision that commits last in a burst leaves a gap that only the ticker
-closes. In the traced runs instance B saw 5 gaps (2 failed fills) on
-`v0.17.0-kubehz.4` and 16 gaps (7 failed fills) on this rebase. The
-separate `COMMIT` round trip of `ca3c2d5` makes such commits more
-frequent. The released fork has the same tail, less often. A fix changes
-the P1 design and is not part of this rebase.
+Owner decision on 2026-11-08, under MERGE-GUIDE rules 4 ("when in doubt,
+drop the patch") and 5 ("re-measure before believing").
 
-**`verify-patches.sh`.** The P1 result files are tracked. When a run
-failed, the script read the recorded figures and passed. It now removes
-the files first, so a failed run gives `NaN` and exit 1.
+**Why.**
+- No product runs more than one kine on one database. The KKP-lite kine
+  has one replica, the extCP HA tier is shelved, and managed state is one
+  kine per tenant.
+- On v0.17.5 the p99 claim does not reproduce. `run-cross.sh`, PostgreSQL
+  18, 2 kine instances, 4 writers at 1/s, 16 watchers, 60 s. The stock
+  binary gave p50 707.0 / p99 708.6 ms. p50 / p95 / p99 in ms:
+
+  | run | `v0.17.0-kubehz.4` (`fdd57ca`) | P1 ported to v0.17.5 |
+  |---|---|---|
+  | 1 | 21.4 / 42.3 / 718.8 | 17.6 / 718.9 / 720.2 |
+  | 2 | 37.4 / 497.9 / 718.9 | 19.1 / 719.0 / 720.2 |
+  | 3 | 19.6 / 21.0 / 39.4 | 19.0 / 29.3 / 719.8 |
+  | traced, 30 s | 16.7 / 26.8 / 27.1 | 20.5 / 30.8 / 730.3 |
+
+  p50 stays near 20 ms against 709 ms, but p99 is 720 ms against 709 ms.
+  The notifier sends only the highest revision. With concurrent writers a
+  lower revision can commit after a higher one; the other instance then
+  finds a gap it cannot fill, and when that commit is the last of a burst
+  it waits for its ticker. The traced runs had 5 gaps (2 failed fills) on
+  `v0.17.0-kubehz.4` and 16 gaps (7 failed fills) on v0.17.5, where the
+  separate `COMMIT` round trip of `ca3c2d5` makes such commits more
+  frequent.
+- `ca3c2d5` moved every write to a path that P1 did not see. P1 needed a
+  port, and a replay without it stopped P1 with no error.
+
+**Removed.** `pkg/drivers/pgsql/notify.go`; the notifier wiring and the
+`notifyingDialect` and `notifyingTx` types in `pkg/drivers/pgsql/pgsql.go`;
+the `external` channel and its `select` arm in `SQLLog.poll`; the P1 tests
+(both `kubehz_notify_test.go` files and `TestKubehzP1PostgresNotify`); the
+P1 step in `unit.yml`; and the P1 measurement in `verify-patches.sh`.
+`pkg/logstructured/sqllog/sql.go` is upstream's again, except for the P2
+lines.
+
+**What P2 kept.** P2's dialect methods (`LiveSize`, `StatsOwed`,
+`RefreshStats`) were on `notifyingDialect`. They are on `quotaDialect` now
+(`pkg/drivers/pgsql/kubehz_quota.go`), which only embeds
+`*generic.Generic`. `pgsql.New` hands it to `sqllog.New` in a P2 marker
+block. `TestKubehzP2P3Postgres` fails when `New` hands over the plain
+dialect. The hermetic sqllog P2 tests embedded the P1 fake dialect. It is
+`fakeDialect` in `pkg/logstructured/sqllog/kubehz_dialect_test.go` now,
+with the same behaviour.
+
+**Effect.** With two kine instances on one database, a watcher on the
+instance that did not get the write waits for its poll ticker again: up
+to `--datastore-poll-interval` (default 1 s). That is upstream's
+behaviour.
+
+**Archive.** Branch `archive/p1-port-v0.17.5` (`0f83a48`) has P1 ported to
+v0.17.5 with its tests. There it passed build, vet, the tests with and
+without cgo, `-race` on PostgreSQL 17.11 and 18.6, and golangci-lint. The
+last release with P1 is `v0.17.0-kubehz.4` (`fdd57ca`). The per-row
+trigger that the P1 sections below reject (write throughput −96.8 %) stays
+rejected.
 
 ---
 
