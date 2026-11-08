@@ -129,7 +129,7 @@ func (t *Tx) Insert(ctx context.Context, key string, created, deleted bool, prev
 		return res.LastInsertId()
 	}
 
-	// KUBEHZ-PATCH P4 BEGIN — see kubehz/CHANGELOG.md, P4; upstream issue k3s-io/kine#824
+	// KUBEHZ-PATCH P6 BEGIN — see kubehz/CHANGELOG.md, P6; upstream issue k3s-io/kine#824
 	// INTENT: the RETURNING insert (PostgreSQL) runs in this transaction, on
 	//   its connection. Upstream passes t.d.queryRow, the pool: then a write
 	//   holds two connections, and max-open concurrent writes wait for each
@@ -139,9 +139,9 @@ func (t *Tx) Insert(ctx context.Context, key string, created, deleted bool, prev
 	//   transaction on any error (25P02), so insertAtSavepoint rolls back to a
 	//   savepoint before each retry.
 	// CONFLICT: if upstream runs this insert in the transaction and keeps the
-	//   retry working, take upstream's side and drop P4.
+	//   retry working, take upstream's side and drop P6.
 	return t.insertAtSavepoint(ctx, cols...)
-	// KUBEHZ-PATCH P4 END
+	// KUBEHZ-PATCH P6 END
 }
 
 func (t *Tx) query(ctx context.Context, sql *query.Named, args ...any) (result *sql.Rows, err error) {

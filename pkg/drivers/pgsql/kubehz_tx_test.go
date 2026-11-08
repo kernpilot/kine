@@ -1,8 +1,8 @@
 package pgsql
 
-// KUBEHZ-PATCH P4 test against a real PostgreSQL (upstream issue
+// KUBEHZ-PATCH P6 test against a real PostgreSQL (upstream issue
 // k3s-io/kine#824). Gated on KINE_TEST_PGSQL_DSN, like kubehz_pgsql_test.go.
-// It uses its own database, kine_kubehz_p4_test, so the P2 measurements do
+// It uses its own database, kine_kubehz_p6_test, so the P2 measurements do
 // not see its rows. The hermetic tests are in
 // pkg/drivers/generic/kubehz_tx_test.go.
 
@@ -22,12 +22,12 @@ import (
 	"github.com/k3s-io/kine/pkg/server"
 )
 
-// TestKubehzP4Postgres: on a pool of one connection a create, an update and a
+// TestKubehzP6Postgres: on a pool of one connection a create, an update and a
 // delete each complete; a create whose id a gap fill took first is retried in
 // its transaction and gets the next id; and 32 creates on a pool of 4 all
 // complete. Upstream's insert took a second pool connection, so with one
 // connection every write waited until its context ended.
-func TestKubehzP4Postgres(t *testing.T) {
+func TestKubehzP6Postgres(t *testing.T) {
 	dsn := os.Getenv("KINE_TEST_PGSQL_DSN")
 	if dsn == "" {
 		t.Skip("KINE_TEST_PGSQL_DSN is not set; this test needs a PostgreSQL")
@@ -36,7 +36,7 @@ func TestKubehzP4Postgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("KINE_TEST_PGSQL_DSN: %v", err)
 	}
-	u.Path = "/kine_kubehz_p4_test"
+	u.Path = "/kine_kubehz_p6_test"
 	// New() takes the DSN without its scheme (see kubehzPostgres)
 	source := strings.TrimPrefix(u.String(), u.Scheme+"://")
 
@@ -87,7 +87,7 @@ func TestKubehzP4Postgres(t *testing.T) {
 
 	t.Run("max-open 1", func(t *testing.T) {
 		backend, _ := open(t, 1)
-		key := "/kubehz/p4/one/" + run
+		key := "/kubehz/p6/one/" + run
 		if _, err := backend.Create(within(5*time.Second), key, []byte("v"), 0); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -122,7 +122,7 @@ func TestKubehzP4Postgres(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		key := "/kubehz/p4/retry/" + run
+		key := "/kubehz/p6/retry/" + run
 		if _, err := backend.Create(within(5*time.Second), key, []byte("v"), 0); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -141,7 +141,7 @@ func TestKubehzP4Postgres(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				key := fmt.Sprintf("/kubehz/p4/many/%s/%d", run, i)
+				key := fmt.Sprintf("/kubehz/p6/many/%s/%d", run, i)
 				if _, err := backend.Create(within(10*time.Second), key, []byte("v"), 0); err != nil {
 					errs <- fmt.Errorf("create %s: %w", key, err)
 				}
@@ -153,7 +153,7 @@ func TestKubehzP4Postgres(t *testing.T) {
 			t.Error(err)
 		}
 		for i := range writers {
-			liveAt(t, backend, fmt.Sprintf("/kubehz/p4/many/%s/%d", run, i))
+			liveAt(t, backend, fmt.Sprintf("/kubehz/p6/many/%s/%d", run, i))
 		}
 		t.Logf("%d creates on a pool of 4 took %s", writers, time.Since(start).Round(time.Millisecond))
 	})

@@ -155,16 +155,17 @@ last release with P1 is `v0.17.0-kubehz.4` (`fdd57ca`). The per-row
 trigger that the P1 sections below reject (write throughput −96.8 %) stays
 rejected.
 
-### P4 — a write holds one pool connection (upstream issue k3s-io/kine#824)
+### P6 — a write holds one pool connection (upstream issue k3s-io/kine#824)
 
 Adds `pkg/drivers/generic/kubehz_tx.go`. Touches `Tx.Insert` in
 `pkg/drivers/generic/tx.go` (the `return` of the RETURNING branch, in a
 marker block). Tests `pkg/drivers/generic/kubehz_tx_test.go` (hermetic) and
 `pkg/drivers/pgsql/kubehz_tx_test.go` (a real PostgreSQL, gated on
-`KINE_TEST_PGSQL_DSN`, in its own database `kine_kubehz_p4_test`).
-`unit.yml` fails when the P4 tests are missing or when the PostgreSQL one
-skips. MERGE-GUIDE.md has no P4 section yet; this entry is the record until
-it has one.
+`KINE_TEST_PGSQL_DSN`, in its own database `kine_kubehz_p6_test`).
+`unit.yml` fails when the P6 tests are missing or when the PostgreSQL one
+skips. MERGE-GUIDE.md has no P6 section yet; this entry is the record until
+it has one. The id is P6 because the open fork PR kernpilot/kine#9
+(`feat/managed-state-kine`) takes P4 and P5.
 
 **Why.** Since upstream `ca3c2d5`, `SQLLog.Append` opens a READ COMMITTED
 transaction and calls `Transaction.Insert`. On the drivers without
@@ -196,33 +197,33 @@ sends a statement with no arguments in one round trip) and one subtransaction
 per write. One subtransaction per transaction stays far below PostgreSQL's
 cache of 64 per backend, so there is no overflow. On a PostgreSQL 18.4 in
 docker on a loaded host, 3000 sequential creates took 7.5 and 14.5 ms per
-write with P4, and 10.4 and 14.6 ms with upstream's line (two runs each,
+write with P6, and 10.4 and 14.6 ms with upstream's line (two runs each,
 taken in turn). The commit's flush to disk is most of that time, and the
 extra round trip did not show above the noise. Not measured: a database
 over a network link, where each write takes one more round-trip time.
 
-**Measured.** `TestKubehzP4Postgres` passes on PostgreSQL 18.4 and 17.11.
+**Measured.** `TestKubehzP6Postgres` passes on PostgreSQL 18.4 and 17.11.
 With upstream's line its three phases fail on PostgreSQL 18.4, each with
 `context deadline exceeded` (after 5, 5 and 10 s).
 
-**Re-check** `go test -tags=test -race -run TestKubehzP4 ./pkg/drivers/generic/`,
+**Re-check** `go test -tags=test -race -run TestKubehzP6 ./pkg/drivers/generic/`,
 and with `KINE_TEST_PGSQL_DSN` set,
-`go test -tags=test -v -run TestKubehzP4Postgres ./pkg/drivers/pgsql/`.
+`go test -tags=test -v -run TestKubehzP6Postgres ./pkg/drivers/pgsql/`.
 Mutations: with upstream's line (the pool's `queryRow`),
-`TestKubehzP4OneConnection` (both pool sizes), `TestKubehzP4ConcurrentWrites`
-and `TestKubehzP4RetryInTransaction` fail, and so do the three phases of
-`TestKubehzP4Postgres`. With the plain switch (the transaction's
-`queryRow`, no savepoint), `TestKubehzP4RetryInTransaction` fails with
-25P02, and the `kine_pkey` phase of `TestKubehzP4Postgres` finds no key
+`TestKubehzP6OneConnection` (both pool sizes), `TestKubehzP6ConcurrentWrites`
+and `TestKubehzP6RetryInTransaction` fail, and so do the three phases of
+`TestKubehzP6Postgres`. With the plain switch (the transaction's
+`queryRow`, no savepoint), `TestKubehzP6RetryInTransaction` fails with
+25P02, and the `kine_pkey` phase of `TestKubehzP6Postgres` finds no key
 after the create (`LogStructured.Create` reports a failed insert as
 revision 0 with no error, so the test reads the key back).
-`TestKubehzP4LastInsertIDInTransaction` passes on all three: the MySQL and
+`TestKubehzP6LastInsertIDInTransaction` passes on all three: the MySQL and
 SQLite branch did not change.
 
 **If it conflicts.** If upstream runs this insert in the transaction and
 keeps the `kine_pkey` retry working (a savepoint, a restart of the
-transaction, or a retry in `Append`), take upstream's side and drop P4, with
-its tests. Then `TestKubehzP4Postgres` is the check that upstream's fix holds
+transaction, or a retry in `Append`), take upstream's side and drop P6, with
+its tests. Then `TestKubehzP6Postgres` is the check that upstream's fix holds
 on a pool of one connection.
 
 ### P2 fix — an update with no live key is a create while full (upstream issue k3s-io/kine#825)
@@ -1140,7 +1141,7 @@ be demonstrated). Those ids now belong to other patches: P2 is the size limit
 and P3 the storage parameters, above. Neither hazard has an upstream issue.
 
 **What the fork carries** (2026-11-08): P2 (the size limit,
-`--quota-bytes`), P3 (the storage parameters on the kine table) and P4 (one
+`--quota-bytes`), P3 (the storage parameters on the kine table) and P6 (one
 pool connection per write). P1 was dropped in the `v0.17.5` sync (see "P1
 dropped" above). The `KUBEHZ-PATCH` markers in the code are the record: grep
 them to find every patch.

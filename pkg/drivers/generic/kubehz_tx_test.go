@@ -1,6 +1,6 @@
 package generic_test
 
-// KUBEHZ-PATCH P4 tests: a write holds one pool connection, and the kine_pkey
+// KUBEHZ-PATCH P6 tests: a write holds one pool connection, and the kine_pkey
 // retry works inside the write's transaction (upstream issue
 // k3s-io/kine#824). Hermetic: SQLLog.Append on generic's dialect over a fake
 // database/sql driver that keeps the PostgreSQL rules the fix rests on.
@@ -27,7 +27,7 @@ import (
 	"github.com/k3s-io/kine/pkg/server"
 )
 
-// pgFake is a database/sql driver with the PostgreSQL rules P4 rests on:
+// pgFake is a database/sql driver with the PostgreSQL rules P6 rests on:
 //   - a failed statement aborts its transaction: every later statement fails
 //     with 25P02 until ROLLBACK or ROLLBACK TO SAVEPOINT, and COMMIT then
 //     rolls back and fails;
@@ -361,11 +361,11 @@ func inTransaction(t *testing.T, f *pgFake) {
 	}
 }
 
-// TestKubehzP4OneConnection: a create and an update each complete on a pool
+// TestKubehzP6OneConnection: a create and an update each complete on a pool
 // of one connection, and on a pool of two they use one connection: the
 // insert runs inside the write's transaction. Upstream's insert went to the
 // pool, so with one connection every write waited until its context ended.
-func TestKubehzP4OneConnection(t *testing.T) {
+func TestKubehzP6OneConnection(t *testing.T) {
 	for _, maxOpen := range []int{1, 2} {
 		t.Run(fmt.Sprintf("max-open %d", maxOpen), func(t *testing.T) {
 			f := newPgFake(0)
@@ -382,11 +382,11 @@ func TestKubehzP4OneConnection(t *testing.T) {
 	}
 }
 
-// TestKubehzP4ConcurrentWrites: 16 writes on a pool of 4. The fake holds the
+// TestKubehzP6ConcurrentWrites: 16 writes on a pool of 4. The fake holds the
 // first 4 BEGINs until all 4 arrived, so 4 transactions hold every
 // connection at once. Each write must still complete: it needs no second
 // connection.
-func TestKubehzP4ConcurrentWrites(t *testing.T) {
+func TestKubehzP6ConcurrentWrites(t *testing.T) {
 	const pool, writers = 4, 16
 	f := newPgFake(pool)
 	log := fakeLog(t, f, pool, false)
@@ -412,12 +412,12 @@ func TestKubehzP4ConcurrentWrites(t *testing.T) {
 	inTransaction(t, f)
 }
 
-// TestKubehzP4RetryInTransaction: the insert's id is taken (a gap fill got it
+// TestKubehzP6RetryInTransaction: the insert's id is taken (a gap fill got it
 // first), so the first attempt fails with a unique violation of kine_pkey
 // and aborts the transaction. The retry rolls back to the savepoint, gets the
 // next id and writes, in the same transaction. A retry without the savepoint
 // fails with 25P02.
-func TestKubehzP4RetryInTransaction(t *testing.T) {
+func TestKubehzP6RetryInTransaction(t *testing.T) {
 	f := newPgFake(0)
 	f.rows[1] = fakeRow{name: "gap-1", deleted: true}
 	log := fakeLog(t, f, 1, false)
@@ -436,11 +436,11 @@ func TestKubehzP4RetryInTransaction(t *testing.T) {
 	}
 }
 
-// TestKubehzP4LastInsertIDInTransaction: the LastInsertID drivers (MySQL,
-// SQLite) keep upstream's path. Their insert ran in the transaction before P4
+// TestKubehzP6LastInsertIDInTransaction: the LastInsertID drivers (MySQL,
+// SQLite) keep upstream's path. Their insert ran in the transaction before P6
 // too; this pins that it still does, on a pool of one connection, with no
 // savepoint.
-func TestKubehzP4LastInsertIDInTransaction(t *testing.T) {
+func TestKubehzP6LastInsertIDInTransaction(t *testing.T) {
 	f := newPgFake(0)
 	log := fakeLog(t, f, 1, true)
 	rev := appendWithin(t, log, 2*time.Second, create("/l"))

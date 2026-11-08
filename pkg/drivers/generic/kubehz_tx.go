@@ -1,6 +1,6 @@
 package generic
 
-// KUBEHZ-PATCH P4 — this whole file is ours; see kubehz/CHANGELOG.md, P4, and
+// KUBEHZ-PATCH P6 — this whole file is ours; see kubehz/CHANGELOG.md, P6, and
 // upstream issue k3s-io/kine#824. Tx.Insert calls it for the drivers without
 // LastInsertID (PostgreSQL, CockroachDB).
 
