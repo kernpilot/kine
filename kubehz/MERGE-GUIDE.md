@@ -189,8 +189,23 @@ which only feeds a gauge. The rules:
    token buckets: the control lane (`/registry/leases/`,
    `/registry/masterleases/` and kine's stand-in for the apiserver's
    compaction key, values up to 4 KiB, 100/s) and the cleanup lane (every
-   other key, 20/s and 4 MiB/s). An update that cannot write (no such key,
-   a stale compare revision) passes without a charge.
+   other key, 20/s and 4 MiB/s). An update passes only when its compare
+   revision is the revision that the check read (0 when the key has no live
+   row). The insert copies the old value from the row at the compare
+   revision, and rows do not change after the insert. So that row holds the
+   value that the check read, and the charge is exact. With no live row,
+   such an update is a create: key + value, under the create rules. The
+   check answers an update at any other revision itself, as a lost
+   compare-and-swap with the revision and the key as read (no key when it
+   has no live row). That is the answer `LogStructured.Update` gives, with
+   no error. The backend does not see the update. The apiserver then
+   retries as after any conflict, or reports a key with no live row as not
+   found. At an older revision, a compaction can make an older row of a key
+   the newest again, so the backend could write such an update with no
+   charge. At a newer revision, another write can land there before the
+   insert, and after a delete the update writes the key again (upstream
+   issue k3s-io/kine#825). That includes an update at the revision of a
+   deleted key's delete row.
 3. The ceiling is `2 × limit + 64 MiB`: a lane write passes only while
    figure + its cost stays at or below its lane's cap. Control creates stop
    at `limit + 16 MiB` (new Leases while full are few, so many are a fault
