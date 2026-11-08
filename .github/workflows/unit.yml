@@ -53,27 +53,16 @@ jobs:
       env:
         CGO_ENABLED: "0"
 
-    # kubehz fork: the P1 tests (kubehz/MERGE-GUIDE.md#p1) are hermetic and
+    # kubehz fork: the P2 tests (kubehz/MERGE-GUIDE.md#p2). The hermetic ones
     # already ran above. This step makes their ABSENCE a failure: a rebase
     # that drops a test file would otherwise pass on an empty -run.
-    - name: kubehz P1 tests exist and pass
-      run: |
-        set -euo pipefail
-        for pkg in ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/; do
-          # Capture first: `grep -q` in a pipe can exit before `go` finishes
-          # writing, and pipefail would then report a false failure.
-          names=$(go test -tags=test -list 'TestKubehzP1' "$pkg")
-          grep -q '^TestKubehzP1' <<<"$names" \
-            || { echo "::error::no TestKubehzP1* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }
-        done
-        go test -tags=test -count=1 -race -run 'TestKubehzP1' ./pkg/drivers/pgsql/ ./pkg/logstructured/sqllog/
-
-    # kubehz fork: same guard for the P2 tests (kubehz/MERGE-GUIDE.md#p2).
     - name: kubehz P2 tests exist and pass
       run: |
         set -euo pipefail
         pkgs="./pkg/server/ ./pkg/app/ ./pkg/endpoint/ ./pkg/drivers/pgsql/ ./pkg/logstructured/ ./pkg/logstructured/sqllog/"
         for pkg in $pkgs; do
+          # Capture first: `grep -q` in a pipe can exit before `go` finishes
+          # writing, and pipefail would then report a false failure.
           names=$(go test -tags=test -list 'TestKubehzP2' "$pkg")
           grep -q '^TestKubehzP2' <<<"$names" \
             || { echo "::error::no TestKubehzP2* test in $pkg (see kubehz/MERGE-GUIDE.md)"; exit 1; }

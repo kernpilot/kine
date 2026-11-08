@@ -567,34 +567,6 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 	}()
 
 	logrus.Tracef("POLL START interval=%s", s.pollInterval)
-
-	// KUBEHZ-PATCH P1 BEGIN — cross-instance watch wake-up
-	//   see kubehz/MERGE-GUIDE.md#p1 · justified by benchmarks/README.md (E1)
-	// INTENT   the poll loop must also wake on a revision announced by ANOTHER
-	//          kine process, not only on its own in-process notify.
-	// INVARIANT the 1 s fallback ticker MUST remain. NOTIFY is not durable: a
-	//          reconnecting listener cannot replay what it missed, so the
-	//          channel may only make a poll happen sooner, never replace it.
-	// CONFLICT  keep upstream's select{} shape and re-add the `case <-external:`
-	//          arm. If a driver no longer exposes RevisionNotify, DROP this
-	//          patch — it is an optimisation, not a correctness fix — and note
-	//          the removal in kubehz/CHANGELOG.md.
-	//
-	// A driver may offer cross-instance revision wake-ups (PostgreSQL
-	// LISTEN/NOTIFY). s.notify below is in-process only, so on a multi-replica
-	// deployment a watcher on the instance that did not receive the write waits
-	// for the ticker above — up to a full second.
-	//
-	// The ticker is NOT replaced by this. Notifications fire on COMMIT and are
-	// not durable, so a listener that reconnects has no way to replay what it
-	// missed. This channel only makes a poll happen sooner; the ticker is what
-	// guarantees it happens at all.
-	var external <-chan int64
-	if n, ok := s.d.(interface{ RevisionNotify() <-chan int64 }); ok {
-		external = n.RevisionNotify()
-	}
-	// KUBEHZ-PATCH P1 END (declaration; the select arm below is part of it)
-
 	for {
 		// KUBEHZ-PATCH P2 — see the polledRev field. Every event up to
 		// pollRevision was sent (fill rows are not sent, and need not be).
@@ -604,17 +576,6 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 			case <-s.ctx.Done():
 				return
 			case check := <-s.notify:
-				if check <= pollRevision {
-					continue
-				}
-			// KUBEHZ-PATCH P1 (select arm) — see the block above. The
-			// driver closes the channel on shutdown; a closed channel is
-			// always ready, so drop it instead of spinning on it.
-			case check, ok := <-external:
-				if !ok {
-					external = nil
-					continue
-				}
 				if check <= pollRevision {
 					continue
 				}

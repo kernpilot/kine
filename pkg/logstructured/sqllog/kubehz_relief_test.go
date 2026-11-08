@@ -34,7 +34,7 @@ type reliefCtxKey struct{}
 
 // reliefDialect hands out reliefTx transactions over one shared state.
 type reliefDialect struct {
-	wakeDialect
+	fakeDialect
 	current      int64 // MAX(id)
 	compactRev   int64 // the committed compact revision
 	failAt       int64 // Compact to this revision fails; 0 = never

@@ -178,101 +178,14 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	}
 	// KUBEHZ-PATCH P2 END
 
-	// KUBEHZ-PATCH P1 BEGIN — wire the cross-instance notifier
-	//   see kubehz/MERGE-GUIDE.md#p1
-	// CONFLICT if upstream changes what New() returns, keep upstream's return
-	//          value and wrap it here; the only requirement is that the object
-	//          handed to sqllog.New() also satisfies RevisionNotify().
-	//
-	// Wrap the dialect so the poll loop can be woken by another kine instance's
-	// writes. Only PostgreSQL offers this; every other driver keeps the plain
-	// dialect and its ticker, which is why this is an optional interface rather
-	// than a method on server.Dialect.
-	backend := &notifyingDialect{
-		Generic: dialect,
-		revs:    startRevisionListener(ctx, wg, config),
-	}
-	backend.notifier.run(ctx, wg, config)
-	return true, logstructured.New(sqllog.New(backend, wg, cfg)), nil
+	// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
+	// INTENT: sqllog.New gets the quotaDialect wrapper (kubehz_quota.go), which
+	//   adds the live-data figure and the statistics refresh to upstream's
+	//   dialect. With the plain dialect the quota measures the physical size.
+	// CONFLICT: keep upstream's return value and wrap the dialect here.
+	return true, logstructured.New(sqllog.New(&quotaDialect{Generic: dialect}, wg, cfg)), nil
+	// KUBEHZ-PATCH P2 END
 }
-
-// KUBEHZ-PATCH P1 (types) BEGIN — the notifyingDialect and notifyingTx types
-// and their methods, down to the END marker after RevisionNotify. setup, createDBIfNotExist,
-// prepareConfig and init below that marker are upstream's; take upstream's
-// side there.
-// notifyingDialect adds cross-instance revision wake-ups to the generic
-// dialect. It changes nothing about how data is read or written — the channel
-// is a hint that a poll is worth doing now rather than at the next tick.
-type notifyingDialect struct {
-	*generic.Generic
-	revs     <-chan int64
-	notifier revisionNotifier
-}
-
-// BeginTx wraps upstream's transaction so that a committed insert records its
-// revision for the coalescing notifier. Since upstream ca3c2d5 (v0.17.5) every
-// write goes through SQLLog.Append, which inserts in a transaction and then
-// commits; the dialect's own Insert below has no caller there. The recording
-// is a single atomic compare-and-swap after the commit; the NOTIFY itself
-// happens on another goroutine and another connection, so the write path
-// never pays for it.
-func (n *notifyingDialect) BeginTx(ctx context.Context, opts *sql.TxOptions) (server.Transaction, error) {
-	t, err := n.Generic.BeginTx(ctx, opts)
-	if err != nil {
-		return nil, err
-	}
-	return &notifyingTx{Transaction: t, notifier: &n.notifier}, nil
-}
-
-// Insert records the new revision for the notifier, then returns unchanged.
-// Kept for a direct insert through the dialect; see BeginTx for the path
-// upstream uses.
-func (n *notifyingDialect) Insert(ctx context.Context, key string, created, deleted bool, previousRevision, ttl int64, value []byte) (int64, error) {
-	rev, err := n.Generic.Insert(ctx, key, created, deleted, previousRevision, ttl, value)
-	if err == nil && rev > 0 {
-		n.notifier.record(rev)
-	}
-	return rev, err
-}
-
-// notifyingTx holds the highest revision the transaction inserted and records
-// it when the commit succeeds. A rolled back transaction records nothing: the
-// row is not there for another instance to poll.
-type notifyingTx struct {
-	server.Transaction
-	notifier *revisionNotifier
-	rev      int64
-}
-
-func (t *notifyingTx) Insert(ctx context.Context, key string, created, deleted bool, previousRevision, ttl int64, value []byte) (int64, error) {
-	rev, err := t.Transaction.Insert(ctx, key, created, deleted, previousRevision, ttl, value)
-	if err == nil && rev > t.rev {
-		t.rev = rev
-	}
-	return rev, err
-}
-
-func (t *notifyingTx) Commit() error {
-	err := t.Transaction.Commit()
-	if err == nil && t.rev > 0 {
-		t.notifier.record(t.rev)
-	}
-	return err
-}
-
-// MustCommit ends the process when the commit fails (upstream's Tx), so a
-// return means the commit succeeded.
-func (t *notifyingTx) MustCommit() {
-	t.Transaction.MustCommit()
-	if t.rev > 0 {
-		t.notifier.record(t.rev)
-	}
-}
-
-// RevisionNotify satisfies the optional interface the poll loop looks for.
-func (n *notifyingDialect) RevisionNotify() <-chan int64 { return n.revs }
-
-// KUBEHZ-PATCH P1 END
 
 func setup(db *sql.DB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")

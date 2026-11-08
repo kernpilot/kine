@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/server"
@@ -152,7 +151,7 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Logf("the delete's counters landed after %s", time.Since(start).Truncate(time.Millisecond))
-	refresher := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	refresher := &quotaDialect{Generic: &generic.Generic{DB: db}}
 	if err := refresher.RefreshStats(ctx); err != nil {
 		t.Fatalf("RefreshStats: %v", err)
 	}
@@ -378,7 +377,7 @@ func TestKubehzP2RefreshKeepsTrailingPages(t *testing.T) {
 		return size
 	}
 	before := heapBytes()
-	refresher := &notifyingDialect{Generic: &generic.Generic{DB: db}}
+	refresher := &quotaDialect{Generic: &generic.Generic{DB: db}}
 	if err := refresher.RefreshStats(ctx); err != nil {
 		t.Fatalf("RefreshStats: %v", err)
 	}
@@ -392,41 +391,6 @@ func TestKubehzP2RefreshKeepsTrailingPages(t *testing.T) {
 	}
 	if after := heapBytes(); after >= before {
 		t.Fatalf("the control VACUUM left the heap at %d bytes (it was %d): the test made no empty trailing pages", after, before)
-	}
-}
-
-// TestKubehzP1PostgresNotify: a write through the backend New returns, the
-// production path, announces its revision on RevisionChannel. Since upstream
-// ca3c2d5 (v0.17.5) every write inserts in a transaction; a rebase that loses
-// that path keeps the hermetic P1 tests green and turns P1 off without an
-// error. unit.yml runs this with the TestKubehzP1 tests, against its
-// PostgreSQL service.
-func TestKubehzP1PostgresNotify(t *testing.T) {
-	ctx, backend, _ := kubehzPostgres(t)
-	conn, err := pgx.Connect(ctx, os.Getenv("KINE_TEST_PGSQL_DSN"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = conn.Close(context.Background()) })
-	if _, err := conn.Exec(ctx, "LISTEN "+RevisionChannel); err != nil {
-		t.Fatal(err)
-	}
-
-	key := fmt.Sprintf("/kubehz/p1/%d", time.Now().UnixNano())
-	rev, err := backend.Create(ctx, key, []byte("v"), 0)
-	if err != nil || rev <= 0 {
-		t.Fatalf("Create %s: revision %d, %v", key, rev, err)
-	}
-	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	for {
-		n, err := conn.WaitForNotification(wctx)
-		if err != nil {
-			t.Fatalf("no notification at or above revision %d within 5 s (%v): committed writes do not reach the notifier", rev, err)
-		}
-		if got, ok := parseRevision(n.Payload); ok && got >= rev {
-			return
-		}
 	}
 }
 

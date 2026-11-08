@@ -14,7 +14,7 @@ import (
 )
 
 type liveDialect struct {
-	wakeDialect
+	fakeDialect
 }
 
 func (d *liveDialect) LiveSize() server.SizeSource {
@@ -22,7 +22,7 @@ func (d *liveDialect) LiveSize() server.SizeSource {
 }
 
 func TestKubehzP2LiveSizeChain(t *testing.T) {
-	plain := logstructured.New(newTestLog(&wakeDialect{}, 0))
+	plain := logstructured.New(newTestLog(&fakeDialect{}, 0))
 	if src := server.LiveSizeOf(plain); src != nil {
 		t.Fatal("a dialect without LiveSize yielded a source through the chain")
 	}

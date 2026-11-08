@@ -208,8 +208,8 @@ type SizeSource func(context.Context) (int64, error)
 // LiveSizer is an optional interface a backend, a log or a dialect can offer
 // when it can report live data bytes apart from the file size. It returns
 // nil when the layer underneath has no such figure, so a caller can fall
-// back without a probe query. It is asserted at the call site on purpose,
-// like RevisionNotify in P1, so the server.Backend interface stays upstream's.
+// back without a probe query. It is asserted at the call site on purpose, so
+// the server.Backend interface stays upstream's.
 type LiveSizer interface {
 	LiveSize() SizeSource
 }

@@ -12,9 +12,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
 )
+
+// quotaDialect is the dialect New hands to sqllog.New: upstream's generic
+// dialect plus the quota's methods below (LiveSize, StatsOwed,
+// RefreshStats). It embeds *generic.Generic, so every upstream method is
+// unchanged. Up to v0.17.0-kubehz.4 these methods were on P1's
+// notifyingDialect. P1 was dropped on 2026-11-08.
+type quotaDialect struct {
+	*generic.Generic
+}
 
 // kubehzStatementTimeout bounds every startup statement the fork adds (the
 // statistics check, ANALYZE, the reloptions read and ALTER). An
@@ -84,7 +94,7 @@ const statsExistSQL = `
 	)`
 
 // compile-time check: the dialect handed to sqllog.New offers a live figure.
-var _ server.LiveSizer = (*notifyingDialect)(nil)
+var _ server.LiveSizer = (*quotaDialect)(nil)
 
 // statsCountersSQL reads, for the kine table and its TOAST relation, the
 // cumulative insert counters, the catalog row counts and the vacuum counts
@@ -123,11 +133,11 @@ var errVacuumSkipped = errors.New("the VACUUM skipped the kine table or its TOAS
 // and RefreshStats. A map here keeps the dialect's struct (pgsql.go) as
 // upstream has it. Entries are never removed: kine opens one dialect per
 // process, so this holds one; a process that opened many would keep them.
-var statsWatches sync.Map // *notifyingDialect -> *statsWatch
+var statsWatches sync.Map // *quotaDialect -> *statsWatch
 
 // LiveSize implements server.LiveSizer. Each call returns a source with its
 // own reset watch; the quota's sampler is its only caller.
-func (d *notifyingDialect) LiveSize() server.SizeSource {
+func (d *quotaDialect) LiveSize() server.SizeSource {
 	w := &statsWatch{d: d, heapIns: -1}
 	statsWatches.Store(d, w)
 	return w.liveSize
@@ -135,7 +145,7 @@ func (d *notifyingDialect) LiveSize() server.SizeSource {
 
 // StatsOwed implements server.StatsRefresher: the newest source saw a reset
 // that no VACUUM settled yet.
-func (d *notifyingDialect) StatsOwed() bool {
+func (d *quotaDialect) StatsOwed() bool {
 	w, ok := statsWatches.Load(d)
 	return ok && w.(*statsWatch).owed.Load()
 }
@@ -155,7 +165,7 @@ func (d *notifyingDialect) StatsOwed() bool {
 // schedules the refresh with the rest of its maintenance, so that no VACUUM
 // overlaps or closely follows the relief's deletes.
 type statsWatch struct {
-	d                 *notifyingDialect
+	d                 *quotaDialect
 	heapIns, toastIns int64       // -1 before the first sample; sampler goroutine only
 	heapVac, toastVac int64       // sampler goroutine only (RefreshStats runs there too)
 	owed              atomic.Bool // a reset was seen and no VACUUM ran since
@@ -208,7 +218,7 @@ func (w *statsWatch) liveSize(ctx context.Context) (int64, error) {
 
 // compile-time check: the dialect refreshes the statistics when the quota
 // schedules it (after the relief's deletes settled, or after a reset).
-var _ server.StatsRefresher = (*notifyingDialect)(nil)
+var _ server.StatsRefresher = (*quotaDialect)(nil)
 
 // RefreshStats runs VACUUM (ANALYZE) on the kine table when the quota asks
 // (after its relief deleted rows, or after a statistics reset): ANALYZE for
@@ -224,7 +234,7 @@ var _ server.StatsRefresher = (*notifyingDialect)(nil)
 // errVacuumSkipped and the caller tries again later. VACUUM cannot run in a
 // transaction, so this is a plain statement under ctx. Both options need
 // PostgreSQL 12 or later.
-func (d *notifyingDialect) RefreshStats(ctx context.Context) error {
+func (d *quotaDialect) RefreshStats(ctx context.Context) error {
 	heapBefore, toastBefore, _, err := vacuumCounts(ctx, d.DB)
 	if err != nil {
 		return err
