@@ -219,12 +219,35 @@ func New() *cli.App {
 		// KUBEHZ-PATCH P2 BEGIN — see kubehz/MERGE-GUIDE.md#p2
 		&cli.Int64Flag{
 			Name:        "quota-bytes",
-			Usage:       "Maximum live data in bytes. At or above it, a new key gets the etcd no-space error until live data is smaller again. Reads, deletes, watches and compaction continue, and so do rate-limited updates that do not grow a value (Leases, finalizer removal) and small Lease creates, up to twice the limit plus 64 MiB. While at the limit kine compacts its history by itself. On PostgreSQL live data is estimated from the table statistics; other drivers use their database size. 0 means no limit. Default is 0.",
+			Usage:       "Maximum live data in bytes. At or above it, a new key gets the etcd no-space error until live data is smaller again. Reads, deletes, watches and compaction continue, and so do rate-limited updates that do not grow a value (Leases, finalizer removal) and small Lease creates, up to twice the limit plus 64 MiB. While at the limit kine compacts its history by itself. Three failed live-size reads in a row count as the limit until a read succeeds. On PostgreSQL live data is estimated from the table statistics; other drivers use their database size. 0 means no limit. Default is 0.",
 			Destination: &config.QuotaBytes,
 			Value:       0,
 			EnvVars:     []string{"KINE_QUOTA_BYTES"},
 		},
 		// KUBEHZ-PATCH P2 END
+		// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+		&cli.DurationFlag{
+			Name:        "listen-handshake-timeout",
+			Usage:       "Time a new client connection has for the TLS handshake and the HTTP/2 preface; then kine closes it. 0 keeps gRPC's default of 120s. Default is 0.",
+			Destination: &config.ListenHandshakeTimeout,
+			Value:       0,
+			EnvVars:     []string{"KINE_LISTEN_HANDSHAKE_TIMEOUT"},
+		},
+		&cli.IntFlag{
+			Name:        "listen-max-connections",
+			Usage:       "Maximum open client connections, also those still in their handshake. Kine closes a connection over the limit before its handshake. With --listen-max-pending-handshakes, only connections whose handshake ended count, and kine closes one over the limit after its handshake. 0 means no limit. Default is 0.",
+			Destination: &config.ListenMaxConnections,
+			Value:       0,
+			EnvVars:     []string{"KINE_LISTEN_MAX_CONNECTIONS"},
+		},
+		&cli.IntFlag{
+			Name:        "listen-max-pending-handshakes",
+			Usage:       "Maximum client connections in their TLS handshake. Kine closes a connection over it before its handshake. A connection whose handshake ended counts against --listen-max-connections instead, so stalled handshakes cannot take those slots. Needs --cert-file and --key-file. 0 means off. Default is 0.",
+			Destination: &config.ListenMaxPendingHandshakes,
+			Value:       0,
+			EnvVars:     []string{"KINE_LISTEN_MAX_PENDING_HANDSHAKES"},
+		},
+		// KUBEHZ-PATCH P5 END
 		&cli.StringFlag{
 			Name:        "peer-bind-address",
 			Usage:       "gRPC listen address (host:port) for the t4 peer WAL-streaming server. Empty means single-node mode. Example: 0.0.0.0:3380.",

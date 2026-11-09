@@ -18,7 +18,7 @@ path moves slowly: issue #63 on connection pooling has been open since
 2020-11-18, and #596, proposing schema and pool changes, since 2026-02-15.
 Waiting for a merge is not a plan for PostgreSQL-specific work.
 
-The fork is deliberately narrow. It carries two patches, P2 and P3. P1
+The fork is deliberately narrow. It carries five patches, P2 to P6. P1
 (the cross-instance watch wake-up) was dropped on 2026-11-08: see
 CHANGELOG.md. Its last version is on branch `archive/p1-port-v0.17.5`.
 
@@ -43,11 +43,30 @@ P3 (storage parameters on the kine table) adds
 its CockroachDB probe) and `New()` in `pkg/drivers/pgsql/pgsql.go`. The
 `CREATE TABLE` statement stays upstream's.
 
+P4 (a counter of failed TLS handshakes on the client listener, by reason)
+adds `pkg/endpoint/kubehz_tls.go` and `pkg/metrics/kubehz_tls.go`, and
+carries one marker-wrapped line in `grpcServer` in
+`pkg/endpoint/endpoint.go`.
+
+P5 (`--listen-handshake-timeout`, `--listen-max-connections` and
+`--listen-max-pending-handshakes`, all off by default) adds
+`pkg/endpoint/kubehz_listen.go`, `pkg/endpoint/kubehz_listen_linux.go` and
+`pkg/endpoint/kubehz_listen_other.go`, and carries marker-wrapped edits in
+`pkg/app/app.go` (the flags) and `pkg/endpoint/endpoint.go` (the config
+fields, the check, the listener wrap, the gRPC option and the credentials
+wrap of the pending budget). It makes
+`golang.org/x/sys` a direct dependency in `go.mod`.
+
+P6 (a write holds one pool connection, upstream issue k3s-io/kine#824)
+adds `pkg/drivers/generic/kubehz_tx.go` and carries one marker-wrapped edit
+in `Tx.Insert` in `pkg/drivers/generic/tx.go`.
+
 Beside those source files, the fork carries its own tests (every
 `kubehz_*_test.go`. One runs against the PostgreSQL service `unit.yml`
-provides), two workflow files (`unit.yml` gains a step per patch and that
-service, `publish-kubehz.yml` is ours), a few `.gitignore` lines, and the
-`kubehz/` and `benchmarks/` directories. Nothing else differs from
+provides, on 17 and 18), two workflow files (`unit.yml` gains a step per
+patch, that service and its matrix, `publish-kubehz.yml` is ours), a few
+`.gitignore` lines, and the `kubehz/` and `benchmarks/` directories.
+Nothing else differs from
 upstream. The check, from the repository root, is
 
 ```bash
@@ -59,15 +78,22 @@ which must list exactly these files:
 ```
 go.mod
 pkg/app/app.go
+pkg/drivers/generic/kubehz_tx.go
+pkg/drivers/generic/tx.go
 pkg/drivers/pgsql/kubehz_quota.go
 pkg/drivers/pgsql/kubehz_reloptions.go
 pkg/drivers/pgsql/pgsql.go
 pkg/endpoint/endpoint.go
+pkg/endpoint/kubehz_listen.go
+pkg/endpoint/kubehz_listen_linux.go
+pkg/endpoint/kubehz_listen_other.go
+pkg/endpoint/kubehz_tls.go
 pkg/logstructured/kubehz_ttl.go
 pkg/logstructured/logstructured.go
 pkg/logstructured/sqllog/kubehz_relief.go
 pkg/logstructured/sqllog/sql.go
 pkg/metrics/kubehz_quota.go
+pkg/metrics/kubehz_tls.go
 pkg/server/kubehz_quota.go
 pkg/server/kv.go
 ```

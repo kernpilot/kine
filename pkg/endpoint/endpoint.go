@@ -61,6 +61,18 @@ type Config struct {
 	// QuotaBytes is the database size limit in bytes. 0 means no limit.
 	QuotaBytes int64
 	// KUBEHZ-PATCH P2 END
+	// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+	// ListenHandshakeTimeout is the time a new client connection has for
+	// the TLS handshake and the HTTP/2 preface. 0 keeps gRPC's default.
+	ListenHandshakeTimeout time.Duration
+	// ListenMaxConnections is the most open client connections. 0 means no
+	// limit.
+	ListenMaxConnections int
+	// ListenMaxPendingHandshakes is the most client connections in their TLS
+	// handshake. Above 0, ListenMaxConnections counts only connections whose
+	// handshake ended. 0 means off. It needs TLS.
+	ListenMaxPendingHandshakes int
+	// KUBEHZ-PATCH P5 END
 }
 
 type ETCDConfig struct {
@@ -70,6 +82,11 @@ type ETCDConfig struct {
 }
 
 func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
+	// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+	if err := checkListenLimits(config); err != nil {
+		return ETCDConfig{}, err
+	}
+	// KUBEHZ-PATCH P5 END
 	wg := waitGroup(config)
 	bctx, bcancel := context.WithCancel(context.Background())
 	defer func() {
@@ -199,6 +216,9 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 	if err != nil {
 		return ETCDConfig{}, fmt.Errorf("creating listener: %w", err)
 	}
+	// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+	listener = limitConnections(listener, config.ListenMaxConnections, config.ListenMaxPendingHandshakes, embed.DefaultGRPCKeepAliveTimeout)
+	// KUBEHZ-PATCH P5 END
 
 	wg.Add(1)
 	go func() {
@@ -308,6 +328,11 @@ func grpcServer(config Config) (*grpc.Server, error) {
 		grpc.MaxRecvMsgSize(int(embed.DefaultMaxRequestBytes) + grpcOverheadBytes),
 		grpc.MaxSendMsgSize(maxSendBytes),
 	}
+	// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+	if config.ListenHandshakeTimeout > 0 {
+		gopts = append(gopts, grpc.ConnectionTimeout(config.ListenHandshakeTimeout))
+	}
+	// KUBEHZ-PATCH P5 END
 
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		gopts = append(gopts,
@@ -322,6 +347,21 @@ func grpcServer(config Config) (*grpc.Server, error) {
 			return nil, err
 		}
 		creds := credentials.NewTLS(tlsConfig)
+		// KUBEHZ-PATCH P4 BEGIN — see kubehz/MERGE-GUIDE.md#p4
+		// INTENT: count the failed TLS handshakes of this listener by reason
+		//   (kine_tls_handshake_failures_total). What is accepted or refused
+		//   stays upstream's.
+		// CONFLICT: keep the wrap between credentials.NewTLS and grpc.Creds.
+		creds = countHandshakeFailures(creds, config.MetricsRegisterer)
+		// KUBEHZ-PATCH P4 END
+		// KUBEHZ-PATCH P5 BEGIN — see kubehz/MERGE-GUIDE.md#p5
+		// After a handshake that succeeded, a connection moves from the
+		// pending budget to the connection limit. Outside P4's wrap, so P4
+		// counts the TLS result and P5 its own refusals.
+		if config.ListenMaxPendingHandshakes > 0 {
+			creds = admitHandshakes{TransportCredentials: creds}
+		}
+		// KUBEHZ-PATCH P5 END
 		gopts = append(gopts, grpc.Creds(creds))
 	}
 
