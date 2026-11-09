@@ -45,17 +45,24 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 	}
 
 	// P2: 200 rows, 64 KB of random bytes each, so every value is stored
-	// out of line in TOAST and compresses to nothing
-	if _, err := db.ExecContext(ctx, "TRUNCATE kine"); err != nil {
+	// out of line in TOAST and compresses to nothing. One session writes
+	// them and runs the VACUUM, so that its counters can be flushed between.
+	session, err := db.Conn(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := session.ExecContext(ctx, "TRUNCATE kine"); err != nil {
+		t.Fatal(err)
+	}
+	flushStats(t, session)
+	heapBefore, toastBefore := insertCounters(t, db)
 	const rows, valueBytes = 200, 64 << 10
 	for i := range rows {
 		value := make([]byte, valueBytes)
 		if _, err := rand.Read(value); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.ExecContext(ctx,
+		if _, err := session.ExecContext(ctx,
 			`INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease, value, old_value)
 			 VALUES ($1, 1, 0, 0, 0, 0, $2, $3)`,
 			fmt.Sprintf("/kubehz/p2/%d", i), value, []byte{},
@@ -63,9 +70,25 @@ func TestKubehzP2P3Postgres(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// VACUUM sets n_live_tup to an absolute value. Insert counters that
+	// reach the shared statistics after it count their rows twice, until the
+	// next VACUUM for the TOAST table. A busy session sends its counters at
+	// most once a second, so the inserts of about the last second are still
+	// in the session here. On a loaded host the VACUUM ends more than a
+	// second after that send, the session sends them at its end, and the
+	// first reading is high (it read 1.318). Otherwise they arrive about
+	// 10 s later, after the first reading, and the test passed by timing
+	// only. Flush them first.
+	flushStats(t, session)
+	if h, tt := insertCounters(t, db); h-heapBefore < rows || tt-toastBefore < rows*toastChunks(valueBytes) {
+		t.Fatalf("before the VACUUM the statistics show %d heap and %d TOAST inserts, want %d and %d: the rest would count twice", h-heapBefore, tt-toastBefore, rows, rows*toastChunks(valueBytes))
+	}
 	// VACUUM reports live tuples for the heap and its TOAST table at once;
 	// ANALYZE records the inline widths. This is what autovacuum does later.
-	if _, err := db.ExecContext(ctx, "VACUUM ANALYZE kine"); err != nil {
+	if _, err := session.ExecContext(ctx, "VACUUM ANALYZE kine"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
 	var want int64
@@ -504,6 +527,31 @@ func deleteCounters(t *testing.T, db *sql.DB) (heap, toast int64) {
 	return heap, toast
 }
 
+// flushStats sends the session's pending statistics counters to the shared
+// statistics before the statement returns (PostgreSQL 15 or later): the
+// server flushes them at the end of the statement, before it answers.
+func flushStats(t *testing.T, session *sql.Conn) {
+	t.Helper()
+	if _, err := session.ExecContext(context.Background(), "SELECT pg_stat_force_next_flush()"); err != nil {
+		t.Fatalf("pg_stat_force_next_flush (PostgreSQL 15 or later): %v", err)
+	}
+}
+
+// insertCounters reads the cumulative insert counters of the kine table and
+// of its TOAST relation.
+func insertCounters(t *testing.T, db *sql.DB) (heap, toast int64) {
+	t.Helper()
+	if err := db.QueryRow(`
+		SELECT s.n_tup_ins, t.n_tup_ins
+		FROM pg_class AS c
+		JOIN pg_stat_all_tables AS s ON s.relid = c.oid
+		JOIN pg_stat_all_tables AS t ON t.relid = c.reltoastrelid
+		WHERE c.oid = 'kine'::regclass`).Scan(&heap, &toast); err != nil {
+		t.Fatal(err)
+	}
+	return heap, toast
+}
+
 // waitInserts waits until the kine table's insert counter shows at least n
 // rows: a backend sends its counters to the shared statistics with a lag.
 func waitInserts(t *testing.T, db *sql.DB, n int64) {
@@ -529,20 +577,32 @@ func toastChunks(valueBytes int) int64 {
 	return int64((valueBytes + toastChunkBytes - 1) / toastChunkBytes)
 }
 
-// insertRandom inserts n rows of size random bytes, named prefix + from..from+n-1.
+// insertRandom inserts n rows of size random bytes, named prefix + from..from+n-1,
+// in one session, and flushes its counters: none of them reach the shared
+// statistics after a later VACUUM or reset.
 func insertRandom(t *testing.T, db *sql.DB, prefix string, from, n, size int) {
 	t.Helper()
+	session, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+	before, _ := insertCounters(t, db)
 	for i := from; i < from+n; i++ {
 		value := make([]byte, size)
 		if _, err := rand.Read(value); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(
+		if _, err := session.ExecContext(context.Background(),
 			`INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease, value, old_value)
 			 VALUES ($1, 1, 0, 0, 0, 0, $2, $3)`,
 			fmt.Sprintf("%s%d", prefix, i), value, []byte{},
 		); err != nil {
 			t.Fatal(err)
 		}
+	}
+	flushStats(t, session)
+	if after, _ := insertCounters(t, db); after-before < int64(n) {
+		t.Fatalf("after the flush the statistics show %d of the %d inserts", after-before, n)
 	}
 }
