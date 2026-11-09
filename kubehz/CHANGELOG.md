@@ -233,6 +233,75 @@ whole job once per image of a matrix, `postgres:17.11` and
 job name carries the image (`Unit Tests (postgres:18.4)`). No branch rule
 requires the old name.
 
+### P2 test — the PostgreSQL phase no longer passes by timing
+
+Touches `pkg/drivers/pgsql/kubehz_pgsql_test.go` only. No product code
+changes.
+
+**Why.** `TestKubehzP2P3Postgres` failed once in a full-suite run without
+cgo on PostgreSQL 18.4: the estimate for 200 TOAST rows read 1.318 of the
+actual size for the whole 45 s wait (the band is 0.9 to 1.3). The excess
+was exactly 2,046 TOAST rows, that is 62 values of 33 chunks each.
+
+**Cause.** A VACUUM sets `n_live_tup` to an absolute value. A backend sends
+its counters to the shared statistics at most once a second, so the
+inserting session still held the counters of about its last second of
+inserts when the VACUUM ran. Counters that arrive after the VACUUM count
+their rows a second time, and the TOAST row count stays that high until
+the next VACUUM. The test passed only because those counters usually
+arrived about 10 s later (the idle flush), after its first reading. When
+the VACUUM ended more than a second after the session's last send, as on
+a loaded host, the session sent them at the end of the VACUUM, before
+the first reading.
+
+**Measured** with a probe on a table like `kine`: 200 inserts of 64 KiB
+in one session, then `VACUUM ANALYZE`, on PostgreSQL 17.11 and 18.4, with
+autovacuum on and off, 3 runs per case (n is the number of inserts whose
+counters had not arrived when the VACUUM ran):
+
+| case | n | right after the VACUUM | after the session sent its counters |
+|---|---|---|---|
+| the order of the test | 12 to 81 | exact: heap 200, TOAST 6,600 | heap 200 + n, TOAST 6,600 + 33 n |
+| the VACUUM 1.1 s after the last insert | 9 to 88 | already 200 + n and 6,600 + 33 n | the same |
+| the VACUUM in another session | 0 to 95 | exact | 200 + n and 6,600 + 33 n |
+| the counters flushed before the VACUUM | 0 (57 to 92 before the flush) | exact | exact |
+
+So the drift is not measurement noise. It is a real bias of the
+estimate, and it reads high: the quota refuses early, it does not
+overshoot. The band of the test stays at 0.9 to 1.3, and the estimate
+stays as it is (MERGE-GUIDE.md P2 item 6 now describes the bias).
+
+**Fix.** The first phase writes its 200 rows and runs the VACUUM in one
+session. Before the VACUUM it flushes the session's counters with
+`pg_stat_force_next_flush()` (PostgreSQL 15 or later) and checks that the
+statistics show every insert. `insertRandom` also writes in one session,
+flushes, and checks. So the two readings after "rows written after the
+last VACUUM" no longer wait about 9 s for the idle flush, and none of
+those counters can arrive after a later reset or VACUUM.
+
+**Tests**, each 3 runs on PostgreSQL 17.11 and 18.4:
+- the fixed test: passes, the first reading is 1.006 after 8 ms. The
+  test takes about 7 s instead of about 25 s, because no reading waits
+  for the idle flush any more. Every other reading is 1.006 (inline rows
+  1.056) at once.
+- the fixed test with a pause of 1.1 s before the VACUUM, as on a loaded
+  host: passes at 1.006.
+- the old first phase (no flush, no check) with the same pause: the
+  first reading is high in 6 of 6 runs. On 17.11 it read 1.318 and 1.313
+  for the whole 45 s wait (fail) and 1.298 (pass, just in the band); on
+  18.4 it read 1.378 (fail), and in two runs it came back to 1.006 after
+  5 s and 11 s (pass: only a VACUUM resets the count, so presumably an
+  autovacuum ran in the wait).
+- mutation, no flush before the VACUUM: fails 6 of 6 at the check (the
+  statistics showed 125 to 198 of the 200 heap inserts).
+- mutation, `insertRandom` without its flush: fails 6 of 6 at its check
+  (the statistics showed 0 to 97 of the 100 inserts).
+- the fixed test on PostgreSQL 16 (what `unit.yml` on `main` runs), with
+  and without the pause: passes, 1.006.
+
+**Re-check** with a PostgreSQL 15 or later in `KINE_TEST_PGSQL_DSN`:
+`go test -tags=test -count=1 -v -run TestKubehzP2P3Postgres ./pkg/drivers/pgsql/`.
+
 ---
 
 ## Released `v0.17.5-kubehz.1` on upstream `v0.17.5` (`f82bd25`); release commit `4780507`
