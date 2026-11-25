@@ -12,6 +12,24 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ## Unreleased
 
+### Toolchain and otel — Go 1.26.11 by digest, otel v1.47.0
+
+**Why.** `v0.17.5-kubehz.1` was built while the floating `golang:1.26` tag
+was 1.26.10, which has GO-2026-6859 (a crash of an HTTP/1 server in
+`net/http`, fixed in 1.26.11). otel v1.46.0 has GHSA-q7gw-24fr-5p69, fixed
+in v1.47.0. kine pulls in otel through etcd; no code of this fork calls
+the affected part.
+
+**What.** The `infra` stage of `Dockerfile`, which the published image is
+built from, names `golang:1.26.11-alpine3.23` by digest
+(`KUBEHZ-PATCH toolchain`). The other stages and the `go` line of `go.mod`
+stay with upstream. `go.mod` has the six otel modules at v1.47.0, plus
+`otel/log`, `genproto` and their sums. At the next sync, take the upstream
+side of `go.mod` when upstream is at or above v1.47.0.
+
+**Check.** `go mod tidy -diff` is empty, and `go test -tags=test ./...`
+passes with `CGO_ENABLED=1` and with `0`. The PostgreSQL steps run in CI.
+
 ### P5 — a handshake timeout and connection limits on the client listener
 
 Adds `pkg/endpoint/kubehz_listen.go`, `pkg/endpoint/kubehz_listen_linux.go`
