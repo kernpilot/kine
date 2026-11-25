@@ -711,13 +711,13 @@ wrapper instead, and clear it once the transport is up
 
 **Re-verify** `go test -tags=test -race -run TestKubehzP5 ./pkg/endpoint/ ./pkg/app/`.
 
-### toolchain — the builder image is pinned
+### toolchain: the builder image is pinned
 
-**File** `Dockerfile`, the `infra` stage (marker-wrapped). The published
-image is built from this stage, so a named Go patch release is in the
-history of each release. At a sync, keep a digest pin at or above the Go
-version upstream names. Move it when a Go patch release fixes the standard
-library; nothing moves it for you.
+**File** `Dockerfile`, the `infra` stage (marker-wrapped). This
+stage builds the published image, so each release has a named Go patch
+release. At a sync, keep a digest pin at or above the Go version of
+upstream. No bot moves this pin: move it when a Go patch release fixes the
+standard library.
 
 ## Patches considered and deliberately NOT taken
 
