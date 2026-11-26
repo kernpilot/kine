@@ -22,7 +22,12 @@ jobs:
     - name: Lint
       uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
       with:
-        version: v2.10
+        # KUBEHZ-PATCH lint BEGIN
+        # INTENT: the pinned golangci-lint reads the export data of the Go
+        # that CI uses (v2.10 cannot read that of Go 1.27.4).
+        # .golangci.yml carries the exclusions this version needs.
+        version: v2.15.0
+        # KUBEHZ-PATCH lint END
         skip-cache: true
 
     - name: Validate

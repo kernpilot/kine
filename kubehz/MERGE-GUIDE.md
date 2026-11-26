@@ -719,6 +719,21 @@ release. At a sync, keep a digest pin at or above the Go version of
 upstream. No bot moves this pin: move it when a Go patch release fixes the
 standard library.
 
+### lint: the golangci-lint pin and its exclusions
+
+**Files** `.github/workflows/pr.yml` (the `version:` of the lint step) and
+`.golangci.yml` (one `exclusions.rules` block), both marker-wrapped. The
+pin is v2.15.0, which reads the export data of Go 1.27.4. The block hides
+what that revive reports and upstream's config does not: see the entry in
+[CHANGELOG.md](CHANGELOG.md). Each rule names its scope.
+
+**If it conflicts.** When upstream pins a golangci-lint at or above the
+fork's pin, take upstream's pin. Then run that version over the tree
+with `--max-same-issues=0 --max-issues-per-linter=0`, and keep only the
+rules that still hide a finding. A rule that hides nothing is a hole for
+the next finding: remove it. If upstream fixes or excludes the same
+findings itself, drop the block.
+
 ## Patches considered and deliberately NOT taken
 
 Recorded so nobody spends the effort twice. Each was measured.
