@@ -1,5 +1,9 @@
 
-FROM golang:1.26-alpine3.23 AS infra
+# KUBEHZ-PATCH toolchain BEGIN
+# INTENT: the published image is built with a named Go patch release. The
+# floating tag built the last release with 1.26.10 (GO-2026-6859).
+FROM golang:1.26.11-alpine3.23@sha256:23f198931d4bd83b4f5a613bd75656257ae8bf832dcbc2db80e1050b5219ca2a AS infra
+# KUBEHZ-PATCH toolchain END
 ARG ARCH=amd64
 
 RUN apk -U add bash coreutils git gcc musl-dev vim less curl wget ca-certificates
