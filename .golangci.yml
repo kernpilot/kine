@@ -52,8 +52,9 @@ linters:
     rules:
       # Upstream code: a Close of database/sql (std-error-handling already
       # exempts .*Close for errcheck) and strings.Builder.WriteString,
-      # which always returns nil.
+      # which always returns nil. The kubehz_* files stay checked.
       - linters: [revive]
+        path-except: kubehz_
         text: '^unhandled-error: Unhandled error in call to function (database/sql\.(DB|Rows|Stmt)\.Close|database/sql/driver\.Conn\.Close|strings\.Builder\.WriteString)$'
       # Upstream's test helper.
       - linters: [revive]
@@ -62,7 +63,7 @@ linters:
       # The name of upstream's package pkg/util.
       - linters: [revive]
         path: pkg/util/
-        text: '^package-naming:'
+        text: '^package-naming: don.t use "util" because'
       # A style rule. The fork's files use a multi-line init statement,
       # as in `if err := raw.Control(func(fd uintptr) {...}); err != nil`.
       - linters: [revive]

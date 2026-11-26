@@ -732,7 +732,13 @@ fork's pin, take upstream's pin. Then run that version over the tree
 with `--max-same-issues=0 --max-issues-per-linter=0`, and keep only the
 rules that still hide a finding. A rule that hides nothing is a hole for
 the next finding: remove it. If upstream fixes or excludes the same
-findings itself, drop the block.
+findings itself, drop the block. If upstream adds its own
+`exclusions.rules`, put both into one list: a second `rules:` key makes
+the file fail to load.
+
+**Re-verify** with the pinned version:
+`golangci-lint run --max-same-issues=0 --max-issues-per-linter=0 ./...`
+finds 0 issues, and `golangci-lint config verify` passes.
 
 ## Patches considered and deliberately NOT taken
 

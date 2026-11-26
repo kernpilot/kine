@@ -14,18 +14,25 @@ Format: each patch has a stable id (`P1`, `P2`, …) that also appears as a
 
 ### Lint: golangci-lint v2.15.0
 
-**Why.** golangci-lint v2.10 cannot read the export data that Go 1.27.4
-writes, so a Go 1.27 step would fail the lint. v2.15.0 reads it. Also,
-with the `go.mod` of the toolchain entry below, v2.10.1 reports 8
+**Why.** golangci-lint v2.10.1 is built on golang.org/x/tools v0.42.0.
+The export data that Go 1.27.4 writes needs x/tools v0.50.0 or later:
+golangci-lint v2.13.2 (x/tools v0.49.0) fails the typecheck of every
+package on Go 1.27.4 (measured in another Go module, 2026-11-25). So a Go
+1.27 step would fail the lint. v2.15.0 is built on x/tools v0.52.0.
+
+Also, with the `go.mod` of the toolchain entry below, v2.10.1 reports 8
 `unhandled-error` findings in upstream code. With the `go.mod` before that
 entry, it reports none (the same binary and Go version, the same code).
+The likely cause: revive type-checks each package itself, drops the
+errors of that check, and skips a call that has no type.
 
 **What.** `pr.yml` pins v2.15.0 (`KUBEHZ-PATCH lint`). `.golangci.yml`
 gets one marker-wrapped `exclusions.rules` block for what the revive of
 v2.15.0 reports, 23 findings in all:
 - `unhandled-error` on a `Close` of `database/sql` and on
-  `strings.Builder.WriteString` (upstream code, 7 findings), and on
-  `os.Chmod` in `pkg/testserver/test_server.go` (1).
+  `strings.Builder.WriteString` (upstream code, 7 findings; the `kubehz_*`
+  files stay checked), and on `os.Chmod` in
+  `pkg/testserver/test_server.go` (1).
 - `package-naming` on upstream's `pkg/util` (1).
 - `multiline-if-init`, a style rule (14 findings, all in the fork's
   `kubehz_*` files).
